@@ -1,0 +1,42 @@
+# Deep overrides of happo.yaml; all other algorithm behavior is reused.
+device:
+  cuda: false
+  torch_threads: 1
+train:
+  n_rollout_threads: 1  # One sampled year = exactly one training episode.
+  episode_length: 365  # Reallocated to 365/366 for each sampled calendar year.
+  use_valuenorm: true
+  use_linear_lr_decay: false
+  use_proper_time_limits: true
+model:
+  hidden_sizes: [128, 128]
+  activation_func: tanh
+  use_feature_normalization: false
+  use_recurrent_policy: false
+  use_naive_recurrent_policy: false
+  lr: 0.0003
+  critic_lr: 0.0003
+  action_distribution: beta
+algo:
+  gamma: 1.0
+  gae_lambda: 0.95
+  share_param: false
+  fixed_order: false
+  ppo_epoch: 5
+  critic_epoch: 5
+  actor_num_mini_batch: 1  # Keep all days; same update count in leap/non-leap years.
+  critic_num_mini_batch: 1
+  use_clipped_value_loss: false
+  use_huber_loss: false
+  max_grad_norm: 0.5
+  entropy_coef: 0.001
+  normalize_shared_advantages: true
+  mask_inactive_factors: true
+experiment:
+  validation_years: [2020, 2021, 2022, 2023, 2024]
+  test_years: [1998, 1999, 1970, 1997, 2006]
+  test_labels: [extremely_wet, wet, normal, dry, extremely_dry]
+  episode_mode: random_training_year
+  episodes: 400  # Independent uniform year draws with replacement, per seed.
+  eval_interval: 10
+  seeds: [1, 2, 3, 4, 5]

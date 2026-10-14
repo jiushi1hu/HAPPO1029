@@ -1,0 +1,15 @@
+# Approved physical assumptions; source CSVs remain unchanged.
+reservoir_ids: [WDD, BHT, XLD, XJB, THR]
+level_bounds_m:
+  WDD: [945, 975]
+  BHT: [765, 825]
+  XLD: [540, 600]
+  XJB: [370, 380]
+  THR: [145, 175]
+efficiency: 0.90
+water_density_kg_m3: 1000.0
+gravity_m_s2: 9.81
+timestep_seconds: 86400.0
+release_mapping: quadratic
+state_type: EP
+terminal_storage_mode: initial
