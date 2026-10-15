@@ -48,7 +48,7 @@ class ReleaseFractionTests(unittest.TestCase):
 
     def test_actor_sampling_evaluation_ratios_and_gradients_are_consistent(self):
         cfg,_=load_configuration()
-        args={**cfg['model'],**cfg['algo'],'beta_action_coordinate':'release_fraction'}
+        args={**cfg['model'],**cfg['algo'],'action_distribution':'beta','beta_action_coordinate':'release_fraction'}
         layer=ACTLayer(Box(0.,1.,(1,),dtype=np.float32),4,'orthogonal_',.01,args)
         obs=torch.zeros(200,4)
         u,old=layer(obs);new,entropy,dist=layer.evaluate_actions(obs,u)
@@ -65,7 +65,7 @@ class ReleaseFractionTests(unittest.TestCase):
         from harl.envs.cascade_reservoir.diagnostics import before_update, after_update
         from harl.runners.cascade_reservoir_runner import CascadeReservoirRunner
         cfg, physical = load_configuration()
-        cfg['model'].update(hidden_sizes=[16,16],beta_action_coordinate='release_fraction')
+        cfg['model'].update(hidden_sizes=[16,16],action_distribution='beta',beta_action_coordinate='release_fraction')
         cfg['algo'].update(ppo_epoch=1,critic_epoch=1)
         data = CascadeData(Path(__file__).resolve().parents[1]/'data/cascade_reservoir_new',physical,cfg['experiment'])
         outcomes = []

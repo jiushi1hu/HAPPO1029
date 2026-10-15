@@ -38,6 +38,8 @@ def main():
     parser.add_argument("--data-dir", type=Path, default=ROOT / "data/cascade_reservoir_new")
     parser.add_argument("--episodes", type=int)
     parser.add_argument("--eval-interval", type=int)
+    parser.add_argument('--action-distribution', choices=['categorical', 'beta'], help='Default: categorical discrete indices')
+    parser.add_argument('--action-bins', type=int, help='Number of discrete choices per reservoir (default: 200)')
     parser.add_argument("--beta-concentration-offset", type=float, help="Increase Beta concentration without changing the deterministic action function; 0 adds no concentration")
     parser.add_argument("--beta-action-coordinate", choices=['control','release_fraction'], help="Beta over normalized controls or over their squared release fractions")
     parser.add_argument("--seeds", nargs="+", type=int)
@@ -51,6 +53,15 @@ def main():
     parser.add_argument("--skip-final-test", action="store_true", help="Skip typical-year tests during diagnostic tuning")
     args = parser.parse_args()
     config, physical = load_configuration()
+    if args.action_distribution is not None:
+        config['model']['action_distribution'] = args.action_distribution
+    if args.action_bins is not None:
+        if args.action_bins < 2:
+            parser.error('action-bins must be >= 2')
+        config['model']['action_bins'] = args.action_bins
+    if config['model']['action_distribution'] != 'beta' and (
+            args.beta_action_coordinate is not None or args.beta_concentration_offset is not None):
+        parser.error('Beta-specific options require --action-distribution beta')
     if args.beta_action_coordinate is not None:
         config['model']['beta_action_coordinate'] = args.beta_action_coordinate
     if args.beta_concentration_offset is not None:
@@ -79,8 +90,10 @@ def main():
         test_years=dict(zip(data.test_labels, data.test_years)),
         episodes_per_seed=exp["episodes"], episode_days="365/366", release_mapping="quadratic",
         reference_energy_MWh=physics.reference_energy,
-        beta_concentration_offset=config["model"].get("beta_concentration_offset", 0.),
-        beta_action_coordinate=config['model'].get('beta_action_coordinate','control'),
+        action_distribution=config['model']['action_distribution'],
+        action_bins=config['model']['action_bins'] if config['model']['action_distribution'] == 'categorical' else None,
+        beta_concentration_offset=config["model"].get("beta_concentration_offset", 0.) if config['model']['action_distribution'] == 'beta' else None,
+        beta_action_coordinate=config['model'].get('beta_action_coordinate','control') if config['model']['action_distribution'] == 'beta' else None,
         gae_lambda=config["algo"]["gae_lambda"],
         result_storage="memory only"), indent=2), flush=True)
     if args.check_data_only:

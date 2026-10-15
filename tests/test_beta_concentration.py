@@ -33,7 +33,7 @@ class ConcentrationTests(unittest.TestCase):
 
     def test_controlled_density_is_used_for_sampling_and_ratio(self):
         cfg,_=load_configuration()
-        args={**cfg['model'],**cfg['algo'],'beta_concentration_offset':98.}
+        args={**cfg['model'],**cfg['algo'],'action_distribution':'beta','beta_concentration_offset':98.}
         layer=ACTLayer(Box(0.,1.,(1,),dtype=np.float32),4,'orthogonal_',.01,args)
         x=torch.zeros(100,4)
         actions,old=layer(x)
@@ -57,6 +57,7 @@ class ConcentrationTests(unittest.TestCase):
         from harl.envs.cascade_reservoir.data_loader import CascadeData
         from harl.runners.cascade_reservoir_runner import CascadeReservoirRunner
         cfg,physical=load_configuration()
+        cfg['model']['action_distribution']='beta'
         cfg['algo']['gae_lambda']=1.
         cfg['model']['hidden_sizes']=[16,16]
         cfg['model']['beta_concentration_offset']=98.

@@ -80,6 +80,92 @@ class ActionRewardTests(unittest.TestCase):
         self.assertGreater(two['reward'],one['reward'])
 
 
+class DiscreteActionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.config, cls.physical = load_configuration()
+        cls.data = CascadeData(ROOT/'data/cascade_reservoir_new',cls.physical,cls.config['experiment'])
+
+    def test_all_200_indices_quadratic_mapping_and_inverse(self):
+        self.assertEqual(self.config['model']['action_distribution'],'categorical')
+        self.assertEqual(self.config['model']['action_bins'],200)
+        env = CascadeReservoirEnv(self.data,self.physical,start_year=1965,action_bins=200)
+        self.assertTrue(all(space.n == 200 for space in env.action_space))
+        storage = .5*(self.data.vmin+self.data.vmax)
+        releases = []
+        for index in range(200):
+            u = env.normalize_actions(np.full(5,index))
+            np.testing.assert_array_equal(u,np.full(5,index/199.))
+            row = env.physics.transition(storage,np.zeros(5),u)
+            np.testing.assert_allclose(row['release'],row['low']+(row['high']-row['low'])*(index/199.)**2)
+            np.testing.assert_array_equal(env.actions_from_releases(row['release'],row['low'],row['high']),
+                                          np.full(5,index))
+            releases.append(row['release'][0])
+        self.assertTrue(np.all(np.diff(releases)>0))
+        zero = np.zeros(5)
+        np.testing.assert_array_equal(env.actions_from_releases(zero,zero,zero),zero)
+        # Inverse quantization is in normalized control coordinates.
+        np.testing.assert_array_equal(env.actions_from_releases(np.full(5,(20.2/199.)**2),zero,np.ones(5)),
+                                      np.full(5,20))
+
+    def test_invalid_indices_fail_without_state_mutation(self):
+        for count in (0,1,2.5,True):
+            with self.assertRaises(ValueError):
+                CascadeReservoirEnv(self.data,self.physical,start_year=1965,action_bins=count)
+        env = CascadeReservoirEnv(self.data,self.physical,start_year=1965,action_bins=200)
+        before = env.storage.copy()
+        for index in (-1,200,.5,float('nan'),float('inf')):
+            with self.assertRaises(ValueError):
+                env.step(np.full(5,index))
+            np.testing.assert_array_equal(env.storage,before)
+            self.assertEqual(env.index,env.start)
+
+    def test_categorical_rollout_update_and_frozen_evaluation(self):
+        from harl.envs.cascade_reservoir.diagnostics import before_update, after_update
+        from harl.envs.cascade_reservoir.evaluation import evaluate_policy
+        from harl.models.base.distributions import FixedCategorical
+        r = CascadeReservoirRunner(self.data,self.physical,copy.deepcopy(self.config),1)
+        for year in (1965,1968):
+            r.collect_episode(year)
+            self.assertEqual(r.length,365 if year==1965 else 366)
+            for actor,b in zip(r.actor,r.actor_buffer):
+                self.assertEqual(b.available_actions.shape,(r.length+1,1,200))
+                self.assertTrue(np.all(b.actions==np.floor(b.actions)))
+                self.assertTrue(np.all((b.actions>=0)&(b.actions<200)))
+                lp,_,dist = actor.evaluate_actions(b.obs[:-1,0],b.rnn_states[0],b.actions[:,0],
+                                                    b.masks[:-1,0],b.available_actions[:-1,0])
+                self.assertIsInstance(dist,FixedCategorical)
+                self.assertEqual(dist.probs.shape,(r.length,200))
+                # Density is for the chosen index, not for i/199 or the release.
+                manual = dist.probs.gather(1,torch.from_numpy(b.actions[:,0]).long()).log()
+                torch.testing.assert_close(lp,manual,atol=1e-6,rtol=1e-6)
+                active = b.active_masks[:-1,0,0]>0
+                np.testing.assert_allclose(np.exp(lp.detach().numpy()[active]-b.action_log_probs[:,0][active]),
+                                           1.,atol=1e-5,rtol=0)
+                np.testing.assert_array_equal(b.actions[:,0][~active],0)
+                np.testing.assert_array_equal(b.action_log_probs[:,0][~active],0)
+                actions,_ = actor.act(b.obs[:1,0],b.rnn_states[0],b.masks[:1,0],deterministic=True)
+                np.testing.assert_array_equal(actions.detach().numpy(),dist.probs[:1].argmax(-1,keepdim=True).numpy())
+            before = before_update(r)
+            r.prep_training();r.train()
+            report = after_update(r,before)
+            for item in report['actors']:
+                self.assertGreater(item['parameter_delta_l2'],0)
+                self.assertTrue(np.isfinite(item['policy_kl']))
+                self.assertLess(item['ratio_max'],10.)
+                self.assertTrue(0<=item['expected_sampled_mapping_fraction']<=1)
+            np.testing.assert_allclose(r.envs[0].storage,self.data.initial_storage(year),atol=1e-3,rtol=0)
+            self.assertLess(r.last_rollout['max_balance_residual_m3'],1e-3)
+        state = [{k:v.clone() for k,v in a.actor.state_dict().items()} for a in r.actor]
+        a = evaluate_policy(r.actor,self.data,self.physical,2024,1,0,0,diagnostics=True)
+        b = evaluate_policy(r.actor,self.data,self.physical,2024,1,0,0,diagnostics=True)
+        self.assertEqual(a,b)
+        for actor,weights in zip(r.actor,state):
+            for key,value in weights.items():
+                torch.testing.assert_close(actor.actor.state_dict()[key],value,rtol=0,atol=0)
+        self.assertTrue(all(0<=v<=1 for v in a['mean_u']))
+
+
 class TerminalStorageTests(unittest.TestCase):
     def env(self, mode='initial', external=None):
         data,config,storage=fixture()
@@ -144,6 +230,7 @@ class RolloutActionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.config,cls.physical=load_configuration()
+        cls.config['model']['action_distribution']='beta'
         cls.config['model']['hidden_sizes']=[16,16]
         cls.config['algo']['ppo_epoch']=cls.config['algo']['critic_epoch']=1
         cls.data=CascadeData(ROOT/'data/cascade_reservoir_new',cls.physical,cls.config['experiment'])

@@ -1,7 +1,7 @@
 """Full-state reservoir simulation with explicit calendar bounds and reset."""
 import calendar
 import numpy as np
-from gym.spaces import Box
+from gym.spaces import Box, Discrete
 from harl.envs.cascade_reservoir.reservoir_physics import ReservoirPhysics
 from harl.envs.cascade_reservoir.terminal_storage import TerminalReleaseBounds
 
@@ -9,7 +9,7 @@ from harl.envs.cascade_reservoir.terminal_storage import TerminalReleaseBounds
 class CascadeReservoirEnv:
     n_agents = 5
 
-    def __init__(self, data, config, end_year=None, start_year=None):
+    def __init__(self, data, config, end_year=None, start_year=None, action_bins=None):
         self.data = data
         self.physics = ReservoirPhysics(data, config)
         self.terminal_storage_mode = config.get('terminal_storage_mode', 'free')
@@ -25,7 +25,12 @@ class CascadeReservoirEnv:
         self.time_scale_days = 366  # Fixed annual scale, including leap days.
         self.observation_space = [Box(-np.inf, np.inf, (18,), dtype=np.float32) for _ in range(5)]
         self.share_observation_space = self.observation_space
-        self.action_space = [Box(0., 1., (1,), dtype=np.float32) for _ in range(5)]
+        if action_bins is not None and (isinstance(action_bins, bool) or
+                not isinstance(action_bins, (int, np.integer)) or action_bins < 2):
+            raise ValueError('action_bins must be an integer >= 2')
+        self.action_bins = action_bins
+        self.action_space = [Discrete(action_bins) if action_bins is not None else
+                            Box(0., 1., (1,), dtype=np.float32) for _ in range(5)]
         self.reset()
 
     def reset(self):
@@ -53,18 +58,50 @@ class CascadeReservoirEnv:
         obs = np.repeat(self.observation()[None, :], 5, axis=0)
         return obs, obs.copy(), None
 
+    def normalize_actions(self, actions):
+        actions = np.asarray(actions, dtype=np.float64)
+        if actions.shape not in ((5,), (5,1)) or not np.isfinite(actions).all():
+            raise ValueError('Five finite scalar actions required')
+        actions = actions.reshape(5)
+        if self.action_bins is None:
+            if ((actions < 0.) | (actions > 1.)).any():
+                raise ValueError('Normalized actions must lie in [0, 1]')
+            return actions
+        if ((actions != np.floor(actions)) | (actions < 0) | (actions >= self.action_bins)).any():
+            raise ValueError('Discrete actions must be integer indices in [0, action_bins-1]')
+        return actions / (self.action_bins-1)
+
+    def actions_from_releases(self, releases, low, high):
+        """Invert given feasible bounds; round to nearest normalized grid index.
+
+        Off-grid releases are quantized in u, not in m3/s. A collapsed interval
+        has canonical index zero (or control .5 for the continuous interface).
+        """
+        releases, low, high = [np.asarray(x, dtype=np.float64) for x in (releases, low, high)]
+        if any(x.shape != (5,) or not np.isfinite(x).all() for x in (releases, low, high)):
+            raise ValueError('Expected finite five-vectors for release bounds')
+        if ((high < low) | (releases < low) | (releases > high)).any():
+            raise ValueError('Release outside feasible bounds')
+        active = high-low > 1e-8
+        u = np.full(5, .5)
+        u[active] = np.sqrt((releases[active]-low[active])/(high[active]-low[active]))
+        if self.action_bins is None:
+            return u
+        return np.where(active, np.rint(u*(self.action_bins-1)), 0).astype(np.int64)
+
     def step(self, actions):
         if self.index >= self.stop:
             raise RuntimeError("Episode finished; reset explicitly")
         actions = np.asarray(actions)
         if actions.shape not in [(5,), (5, 1)]:
-            raise ValueError("Five scalar normalized actions required")
+            raise ValueError("Five scalar actions required")
+        normalized = self.normalize_actions(actions)
         try:
             terminal_bounds = None
             if self.terminal_storage_target is not None:
                 terminal_bounds = TerminalReleaseBounds(self.data, self.physics.dt, self.storage,
                     self.data.external[self.index:self.stop], self.terminal_storage_target)
-            result = self.physics.transition(self.storage, self.data.external[self.index], actions.reshape(5),
+            result = self.physics.transition(self.storage, self.data.external[self.index], normalized,
                                              terminal_bounds=terminal_bounds)
         except RuntimeError as exc:
             raise type(exc)('{}; date={} storage_m3={} actions={} target_m3={}'.format(
@@ -75,6 +112,10 @@ class CascadeReservoirEnv:
             if (np.abs(result['storage_end']-self.terminal_storage_target) > tolerance).any():
                 raise AssertionError('Terminal storage target violation')
         result["date"] = self.data.dates[self.index].isoformat()
+        result['normalized_actions'] = result['actions'].copy()
+        if self.action_bins is not None:
+            # Forced actions have no policy contribution; zero is a valid placeholder index.
+            result['actions'] = np.where(result['controls'] > 0, actions.reshape(5), 0).astype(np.int64)
         result["levels_end"] = self.data.levels(result["storage_end"])
         self.last_transition = result
         self.storage = result["storage_end"].copy()

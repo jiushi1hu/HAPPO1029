@@ -39,8 +39,21 @@ class DiagnosticTests(unittest.TestCase):
             if enabled:
                 report=after_update(r,captured)
                 self.assertEqual(len(report['actors']),5)
-                for a in report['actors']:
-                    self.assertGreater(a['expected_sampled_mapping_fraction'],a['eval_mapping_fraction'])
+                for i,a in enumerate(report['actors']):
+                    self.assertTrue(0. <= a['expected_sampled_mapping_fraction'] <= 1.)
+                    self.assertTrue(0. <= a['eval_mapping_fraction'] <= 1.)
+                    b=r.actor_buffer[i]
+                    with torch.no_grad():
+                        _,_,dist=r.actor[i].evaluate_actions(b.obs[:-1,0],b.rnn_states[0],
+                            b.actions[:,0],b.masks[:-1,0])
+                        active=b.active_masks[:-1,0,0]>0
+                        probs=dist.probs[active].numpy()
+                        grid=np.arange(200)/199.
+                        self.assertAlmostEqual(a['expected_sampled_mapping_fraction'],
+                            float((probs*grid**2).sum(-1).mean()),places=6)
+                        self.assertAlmostEqual(a['mean_u'],float((probs*grid).sum(-1).mean()),places=6)
+                        self.assertAlmostEqual(a['eval_mapping_fraction'],
+                            float(np.mean((probs.argmax(-1)/199.)**2)),places=6)
                     self.assertGreater(a['parameter_delta_l2'],0.)
                     self.assertEqual(a['unchanged_parameter_tensors'],[])
                     self.assertEqual(a['missing_gradient_tensors'],[])

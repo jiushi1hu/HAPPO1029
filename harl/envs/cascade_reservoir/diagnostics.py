@@ -54,6 +54,8 @@ def actor_distribution(actor, buffer):
     _, _, dist = actor.evaluate_actions(
         buffer.obs[:-1].reshape(-1, buffer.obs.shape[-1]), buffer.rnn_states[0],
         buffer.actions.reshape(-1, 1), buffer.masks[:-1].reshape(-1, 1))
+    if isinstance(dist, torch.distributions.Categorical):
+        return type(dist)(logits=dist.logits.clone())
     return type(dist)(dist.concentration1.clone(), dist.concentration0.clone())
 
 
@@ -103,24 +105,33 @@ def after_update(runner, before):
         if not active.any():
             result['actors'].append(dict(agent=i, active_samples=0, **update)); continue
         action = torch.from_numpy(buffer.actions.reshape(-1,1))
-        log_ratio = (new.log_prob(action)-old.log_prob(action))[active]
+        log_ratio = (new.log_probs(action)-old.log_probs(action))[active]
         ratio = log_ratio.exp()
         kl = torch.distributions.kl_divergence(old,new)[active]
-        mean, variance = new.mean[active], new.variance[active]
+        categorical = isinstance(new, torch.distributions.Categorical)
+        if categorical:
+            grid = torch.linspace(0., 1., new.probs.shape[-1])
+            mean = (new.probs[active]*grid).sum(-1, keepdim=True)
+            second = (new.probs[active]*grid.square()).sum(-1, keepdim=True)
+            variance = (second-mean.square()).clamp_min(0.)
+            deterministic = new.mode()[active].float()/(new.probs.shape[-1]-1)
+        else:
+            mean, variance = new.mean[active], new.variance[active]
+            deterministic = new.mode()[active]
         require_finite('actor {} ratios'.format(i), ratio.cpu().numpy())
         require_finite('actor {} KL'.format(i), kl.cpu().numpy())
-        sampled = action[active]
+        sampled = action[active]/(new.probs.shape[-1]-1) if categorical else action[active]
         result['actors'].append(dict(agent=i, active_samples=int(active.sum()),
             **update,
             entropy=float(new.entropy()[active].mean()),
             sampled_action_mean=float(sampled.mean()),
             sampled_action_std=float(sampled.std(unbiased=False)),
             sampled_boundary_fraction=float(((sampled<=.01)|(sampled>=.99)).float().mean()),
-            beta_kl=float(kl.mean().clamp(min=0)),
+            policy_kl=float(kl.mean().clamp(min=0)),
             ratio_min=float(ratio.min()),ratio_max=float(ratio.max()),
             clip_fraction=float(((ratio<1.-actor.clip_param)|(ratio>1.+actor.clip_param)).float().mean()),
             mean_u=float(mean.mean()),std_u=float(variance.sqrt().mean()),
-            eval_mapping_fraction=float((new.mode()[active]**2).mean()),
+            eval_mapping_fraction=float((deterministic**2).mean()),
             expected_sampled_mapping_fraction=float((mean**2+variance).mean())))
     return result
 
@@ -138,7 +149,7 @@ def print_update_window(runner, window=10):
         gae_explained_variance_post=avg('critic_gae_post','explained_variance'),
         predicted_start_return_TWh=float(np.mean([r['predicted_start_return_TWh'] for r in rows])),
         realized_sampled_return_TWh=float(np.mean([r['realized_sampled_return_TWh'] for r in rows])),
-        max_actor_beta_kl=max((a['beta_kl'] for a in active),default=0.),
+        max_actor_policy_kl=max((a['policy_kl'] for a in active),default=0.),
         mean_actor_clip_fraction=float(np.mean([a['clip_fraction'] for a in active])) if active else 0.,
         ratio_min=min((a['ratio_min'] for a in active),default=1.),
         ratio_max=max((a['ratio_max'] for a in active),default=1.),
@@ -158,7 +169,7 @@ def print_update_window(runner, window=10):
 
 
 def validation_report(runner, deterministic_rows):
-    """Compare deployed mean actions with sampled policy, preserving RNG state."""
+    """Compare deterministic actions with sampled policy, preserving RNG state."""
     repeats=int(runner.algo_args['experiment'].get('diagnostic_stochastic_repeats',3))
     samples=[]
     for repeat in range(repeats):

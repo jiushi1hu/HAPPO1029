@@ -47,8 +47,10 @@ class CascadeReservoirRunner(OnPolicyHARunner):
     """
 
     def __init__(self, data, physical_config, algo_args, seed):
-        if algo_args["model"].get("action_distribution") != "beta":
-            raise ValueError("Cascade normalized controls require the bounded Beta action distribution")
+        distribution = algo_args['model'].get('action_distribution')
+        if distribution not in ('beta', 'categorical'):
+            raise ValueError('Cascade controls require beta or categorical actions')
+        self.action_bins = algo_args['model'].get('action_bins', 200) if distribution == 'categorical' else None
         for key in ("use_policy_active_masks", "mask_inactive_factors"):
             if not algo_args["algo"].get(key, False):
                 raise ValueError("Forced cascade actions require " + key)
@@ -82,7 +84,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
             if self.length * self.n_envs % algo_args["algo"][key]:
                 raise ValueError("Choose minibatch count dividing rollout size; avoid dropping samples")
         self.envs = [CascadeReservoirEnv(data, physical_config, start_year=self.training_years[0],
-                                       end_year=self.training_years[0])]
+                                       end_year=self.training_years[0], action_bins=self.action_bins)]
         env = self.envs[0]
         network_args = {**algo_args["model"], **algo_args["algo"]}
         self.actor = [HAPPO(network_args, env.observation_space[i], env.action_space[i], self.device) for i in range(5)]
@@ -122,7 +124,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         self.algo_args = configure_calendar(self.requested_args, self.data, year)
         self.length = self.algo_args["train"]["episode_length"]
         self.envs = [CascadeReservoirEnv(self.data, self.physical_config,
-                                       start_year=year, end_year=year)]
+                                       start_year=year, end_year=year, action_bins=self.action_bins)]
         self._allocate_buffers()
         self.prep_rollout()
         obs = np.stack([env.observation() for env in self.envs])
