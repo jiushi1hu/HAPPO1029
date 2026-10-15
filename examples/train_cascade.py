@@ -47,6 +47,7 @@ def main():
     parser.add_argument("--check-data-only", action="store_true")
     parser.add_argument("--plot-python", default=sys.executable, help="Interpreter with an interactive Matplotlib backend")
     parser.add_argument("--no-plot", action="store_true", help="Run without opening a figure window")
+    parser.add_argument('--plot-details', action='store_true', help='Also open reward, training generation, and optimization windows')
     parser.add_argument("--diagnostics", action="store_true", help="Print training and validation diagnostics without saving files")
     parser.add_argument("--diagnostic-episodes", nargs="+", type=int, default=[0,20,100,150,400])
     parser.add_argument("--diagnostic-stochastic-repeats", type=int, default=3)
@@ -123,8 +124,12 @@ def main():
                        histories=[r.validation_history for r in runners], tests=tests,
                        references=reference_summary(data, physics, data.validation_years +
                            (() if args.skip_final_test else data.test_years)))
+        if args.plot_details:
+            payload.update(training_histories=[r.training_history for r in runners],
+                           reference_energy_MWh=physics.reference_energy)
         if not args.no_plot:
-            subprocess.run([args.plot_python, str(ROOT / "examples/plot_cascade.py")],
+            subprocess.run([args.plot_python, str(ROOT / "examples/plot_cascade.py")] +
+                           (['--plot-details'] if args.plot_details else []),
                            input=json.dumps(payload), text=True, check=True, env=plot_env)
     print("Finished. Run results and figure were not saved.", flush=True)
 

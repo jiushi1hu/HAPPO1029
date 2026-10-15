@@ -1,4 +1,4 @@
-"""One interactive window; no figure or run-result files are exported."""
+"""Interactive result windows; no figure or run-result files are exported."""
 import argparse
 import importlib
 import json
@@ -77,9 +77,88 @@ def make_figure(payload):
     return fig
 
 
+def make_training_figures(payload, window=20):
+    """Extra windows from existing in-memory training metrics; no model changes."""
+    import matplotlib.pyplot as plt
+    histories = payload['training_histories']
+    if not histories or len(histories) != len(payload['seeds']):
+        raise ValueError('One nonempty training history per seed required')
+    grid = np.array([r['iteration'] for r in histories[0]])
+    if not len(grid) or not np.array_equal(grid, np.arange(1,len(grid)+1)):
+        raise ValueError('Complete training episodes starting at one required')
+    for rows in histories:
+        if not np.array_equal(grid,[r['iteration'] for r in rows]):
+            raise ValueError('Seeds must have matching training episodes')
+    reference = float(payload['reference_energy_MWh'])
+    if not np.isfinite(reference) or reference <= 0 or window < 1:
+        raise ValueError('Positive reward reference and smoothing window required')
+
+    def values(key):
+        result = np.asarray([[r[key] for r in rows] for rows in histories],dtype=float)
+        if not np.isfinite(result).all():
+            raise ValueError('Non-finite training metric: '+key)
+        return result
+
+    def smooth(series):
+        cumulative = np.pad(np.cumsum(series,axis=1),((0,0),(1,0)))
+        stop = np.arange(1,len(grid)+1)
+        start = np.maximum(0,stop-window)
+        return (cumulative[:,stop]-cumulative[:,start])/(stop-start)
+
+    def draw(ax, series, label, show_raw=False):
+        if show_raw:
+            ax.plot(grid,series.mean(axis=0),color='#087f8c',alpha=.2,lw=.7,
+                    label='Raw episode mean across seeds')
+        rolled = smooth(series)
+        for line in rolled:
+            ax.plot(grid,line,color='#087f8c',alpha=.25,lw=.8)
+        mean = rolled.mean(axis=0)
+        ax.plot(grid,mean,color='#087f8c',label=label)
+        if len(histories)>1:
+            sd = rolled.std(axis=0,ddof=1)
+            ax.fill_between(grid,mean-sd,mean+sd,color='#087f8c',alpha=.15,
+                            label='Smoothed seed +/-1 SD')
+        ax.set_xlabel('Training episodes (randomly sampled years)')
+        ax.grid(alpha=.2)
+        ax.legend(fontsize=8)
+
+    energy = values('episode_energy_TWh')
+    reward_fig, ax = plt.subplots(figsize=(10,6),constrained_layout=True)
+    reward_fig.canvas.manager.set_window_title('HAPPO training reward')
+    # The existing reward is daily cascade MWh / reference_energy_MWh;
+    # summing over the year gives exactly this energy-to-return conversion.
+    draw(ax,energy*1e6/reference,'{}-episode trailing mean'.format(window),show_raw=True)
+    ax.set(title='Stochastic training return | sampled training years',
+           ylabel='Episode return (sum of daily rewards)')
+
+    energy_fig, ax = plt.subplots(figsize=(10,6),constrained_layout=True)
+    energy_fig.canvas.manager.set_window_title('HAPPO training generation')
+    draw(ax,energy,'{}-episode trailing mean'.format(window),show_raw=True)
+    ax.set(title='Stochastic training generation | sampled training years',
+           ylabel='Annual cascade generation (TWh)')
+
+    optimization_fig, axes = plt.subplots(2,2,figsize=(12,8),constrained_layout=True)
+    optimization_fig.canvas.manager.set_window_title('HAPPO optimization diagnostics')
+    for i in range(5):
+        for ax, suffix in [(axes[0,0],'policy_loss'),(axes[1,0],'dist_entropy'),
+                           (axes[1,1],'actor_grad_norm')]:
+            ax.plot(grid,smooth(values('actor{}_{}'.format(i,suffix))).mean(axis=0),
+                    label='Actor {}'.format(i+1))
+    axes[0,1].plot(grid,smooth(values('critic_value_loss')).mean(axis=0),label='Critic')
+    for ax,title,ylabel in [(axes[0,0],'Actor loss','Policy loss'),
+            (axes[0,1],'Critic loss','Value loss'),(axes[1,0],'Policy entropy','Entropy (nats)'),
+            (axes[1,1],'Actor gradients before clipping','Gradient norm')]:
+        ax.set(title=title,xlabel='Training episodes',ylabel=ylabel)
+        ax.grid(alpha=.2)
+        ax.legend(fontsize=8)
+    optimization_fig.suptitle('{}-episode trailing means, averaged across seeds'.format(window))
+    return [reward_fig,energy_fig,optimization_fig]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check-backend", action="store_true")
+    parser.add_argument('--plot-details', action='store_true')
     args = parser.parse_args()
     backend = select_interactive_backend()
     if args.check_backend:
@@ -87,6 +166,8 @@ def main():
         return
     payload = json.load(sys.stdin)
     make_figure(payload)
+    if args.plot_details:
+        make_training_figures(payload)
     import matplotlib.pyplot as plt
     plt.show(block=True)
 
