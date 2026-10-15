@@ -38,7 +38,8 @@ def main():
     parser.add_argument("--data-dir", type=Path, default=ROOT / "data/cascade_reservoir_new")
     parser.add_argument("--episodes", type=int)
     parser.add_argument("--eval-interval", type=int)
-    parser.add_argument("--beta-concentration-offset", type=float, help="Increase Beta concentration without changing the action mean function; 0 reproduces the original head")
+    parser.add_argument("--beta-concentration-offset", type=float, help="Increase Beta concentration without changing the deterministic action function; 0 adds no concentration")
+    parser.add_argument("--beta-action-coordinate", choices=['control','release_fraction'], help="Beta over normalized controls or over their squared release fractions")
     parser.add_argument("--seeds", nargs="+", type=int)
     parser.add_argument("--gae-lambda", type=float, help="GAE trace parameter; 1 uses full realized annual returns")
     parser.add_argument("--check-data-only", action="store_true")
@@ -50,6 +51,8 @@ def main():
     parser.add_argument("--skip-final-test", action="store_true", help="Skip typical-year tests during diagnostic tuning")
     args = parser.parse_args()
     config, physical = load_configuration()
+    if args.beta_action_coordinate is not None:
+        config['model']['beta_action_coordinate'] = args.beta_action_coordinate
     if args.beta_concentration_offset is not None:
         if not np.isfinite(args.beta_concentration_offset) or args.beta_concentration_offset < 0:
             parser.error("Beta concentration offset must be finite and nonnegative")
@@ -77,6 +80,7 @@ def main():
         episodes_per_seed=exp["episodes"], episode_days="365/366", release_mapping="quadratic",
         reference_energy_MWh=physics.reference_energy,
         beta_concentration_offset=config["model"].get("beta_concentration_offset", 0.),
+        beta_action_coordinate=config['model'].get('beta_action_coordinate','control'),
         gae_lambda=config["algo"]["gae_lambda"],
         result_storage="memory only"), indent=2), flush=True)
     if args.check_data_only:

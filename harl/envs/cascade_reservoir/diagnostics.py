@@ -54,7 +54,7 @@ def actor_distribution(actor, buffer):
     _, _, dist = actor.evaluate_actions(
         buffer.obs[:-1].reshape(-1, buffer.obs.shape[-1]), buffer.rnn_states[0],
         buffer.actions.reshape(-1, 1), buffer.masks[:-1].reshape(-1, 1))
-    return torch.distributions.Beta(dist.concentration1.clone(), dist.concentration0.clone())
+    return type(dist)(dist.concentration1.clone(), dist.concentration0.clone())
 
 
 @torch.no_grad()
@@ -120,7 +120,7 @@ def after_update(runner, before):
             ratio_min=float(ratio.min()),ratio_max=float(ratio.max()),
             clip_fraction=float(((ratio<1.-actor.clip_param)|(ratio>1.+actor.clip_param)).float().mean()),
             mean_u=float(mean.mean()),std_u=float(variance.sqrt().mean()),
-            eval_mapping_fraction=float((mean**2).mean()),
+            eval_mapping_fraction=float((new.mode()[active]**2).mean()),
             expected_sampled_mapping_fraction=float((mean**2+variance).mean())))
     return result
 

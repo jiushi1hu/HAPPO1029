@@ -32,7 +32,8 @@ class ACTLayer(nn.Module):
                 if not ((action_space.low == 0).all() and (action_space.high == 1).all()):
                     raise ValueError("Beta actions require a Box with bounds [0, 1].")
                 self.action_out = BetaHead(inputs_dim, action_dim, initialization_method, gain,
-                                           args.get("beta_concentration_offset", 0.))
+                                           args.get("beta_concentration_offset", 0.),
+                                           args.get("beta_action_coordinate", "control"))
             else:
                 self.action_out = DiagGaussian(
                     inputs_dim, action_dim, initialization_method, gain, args

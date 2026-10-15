@@ -59,12 +59,17 @@ class CascadeReservoirEnv:
         actions = np.asarray(actions)
         if actions.shape not in [(5,), (5, 1)]:
             raise ValueError("Five scalar normalized actions required")
-        terminal_bounds = None
-        if self.terminal_storage_target is not None:
-            terminal_bounds = TerminalReleaseBounds(self.data, self.physics.dt, self.storage,
-                self.data.external[self.index:self.stop], self.terminal_storage_target)
-        result = self.physics.transition(self.storage, self.data.external[self.index], actions.reshape(5),
-                                         terminal_bounds=terminal_bounds)
+        try:
+            terminal_bounds = None
+            if self.terminal_storage_target is not None:
+                terminal_bounds = TerminalReleaseBounds(self.data, self.physics.dt, self.storage,
+                    self.data.external[self.index:self.stop], self.terminal_storage_target)
+            result = self.physics.transition(self.storage, self.data.external[self.index], actions.reshape(5),
+                                             terminal_bounds=terminal_bounds)
+        except RuntimeError as exc:
+            raise type(exc)('{}; date={} storage_m3={} actions={} target_m3={}'.format(
+                exc, self.data.dates[self.index], self.storage.tolist(), actions.reshape(5).tolist(),
+                None if self.terminal_storage_target is None else self.terminal_storage_target.tolist())) from exc
         if self.index+1 == self.stop and self.terminal_storage_target is not None:
             tolerance = np.maximum(1., 1e-10*np.abs(self.terminal_storage_target))
             if (np.abs(result['storage_end']-self.terminal_storage_target) > tolerance).any():

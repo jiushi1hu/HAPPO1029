@@ -48,11 +48,48 @@ class FixedBeta(torch.distributions.Beta):
         return self.mean
 
 
+class FixedSqrtBeta(FixedBeta):
+    """X is a Beta release fraction; U=sqrt(X) enters the quadratic interface."""
+
+    def sample(self, sample_shape=torch.Size()):
+        return super().sample(sample_shape).sqrt()
+
+    def log_prob(self, value):
+        # p_U(u)=p_X(u^2)*2u. Never attach a Beta(X) density directly to U.
+        if self._validate_args:
+            self._validate_sample(value)
+        return super().log_prob(value.square()) + torch.log(2.*value)
+
+    def log_probs(self, actions):
+        return self.log_prob(actions)
+
+    def entropy(self):
+        expected_log_x = torch.digamma(self.concentration1)-torch.digamma(
+            self.concentration1+self.concentration0)
+        return (torch.distributions.Beta.entropy(self)-math.log(2.)-.5*expected_log_x).sum(-1)
+
+    @property
+    def mean(self):
+        a, b = self.concentration1, self.concentration0
+        return (torch.lgamma(a+.5)+torch.lgamma(a+b)-torch.lgamma(a)-torch.lgamma(a+b+.5)).exp()
+
+    @property
+    def variance(self):
+        return (self.concentration1/(self.concentration1+self.concentration0)-self.mean.square()).clamp_min(0.)
+
+    def mode(self):
+        # Deployment selects E[X], hence Q_det=E[Q] at fixed feasible bounds.
+        return (self.concentration1/(self.concentration1+self.concentration0)).sqrt()
+
+
 class BetaHead(nn.Module):
     """Optional bounded head, leaving the existing Gaussian default unchanged."""
 
-    def __init__(self, num_inputs, num_outputs, initialization_method, gain, concentration_offset=0.):
+    def __init__(self, num_inputs, num_outputs, initialization_method, gain, concentration_offset=0., action_coordinate='control'):
         super().__init__()
+        if action_coordinate not in ('control', 'release_fraction'):
+            raise ValueError('Beta action coordinate must be control or release_fraction')
+        self.action_coordinate = action_coordinate
         self.concentration_offset = float(concentration_offset)
         if not math.isfinite(self.concentration_offset) or self.concentration_offset < 0:
             raise ValueError("Beta concentration offset must be finite and nonnegative")
@@ -62,6 +99,12 @@ class BetaHead(nn.Module):
             lambda x: nn.init.constant_(x, 0),
             gain,
         )
+        if action_coordinate == 'release_fraction':
+            # Preserve the initial quarter-interval deterministic release at
+            # zero features: sqrt(alpha/(alpha+beta))=.5, just as before.
+            alpha = 1.+math.log(2.)
+            with torch.no_grad():
+                self.linear.bias[num_outputs:].fill_(math.log(math.expm1(3.*alpha-1.)))
 
     def forward(self, x, available_actions=None):
         # Shapes >= 1 avoid singular boundary densities. Keep PyTorch's native
@@ -74,7 +117,8 @@ class BetaHead(nn.Module):
             mean = alpha / (alpha + beta)
             alpha = alpha + self.concentration_offset * mean
             beta = beta + self.concentration_offset * (1. - mean)
-        return FixedBeta(alpha, beta)
+        distribution = FixedSqrtBeta if self.action_coordinate == 'release_fraction' else FixedBeta
+        return distribution(alpha, beta)
 
 
 class Categorical(nn.Module):
