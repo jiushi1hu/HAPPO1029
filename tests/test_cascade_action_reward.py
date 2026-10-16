@@ -1,4 +1,4 @@
-"""Latent-action likelihoods, cascade rewards, and hard annual storage closure."""
+"""Discrete-action likelihoods, cascade rewards, and hard annual storage closure."""
 import copy
 from datetime import date
 from pathlib import Path
@@ -49,15 +49,18 @@ class ActionRewardTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.physics.transition(self.storage, np.zeros(5), np.full(5, bad))
 
-    def test_latent_likelihood_ratio_matches_release_density_ratio(self):
-        u = torch.tensor([[.2],[.8]], dtype=torch.float64)
-        old = torch.distributions.Beta(torch.tensor(2.),torch.tensor(3.))
-        new = torch.distributions.Beta(torch.tensor(3.),torch.tensor(2.))
-        width = torch.tensor([[100.],[300.]], dtype=torch.float64)
-        jacobian = torch.log(2.*u*width)
-        latent_ratio = (new.log_prob(u)-old.log_prob(u)).exp()
-        release_ratio = ((new.log_prob(u)-jacobian)-(old.log_prob(u)-jacobian)).exp()
-        torch.testing.assert_close(latent_ratio, release_ratio)
+    def test_index_likelihood_ratio_matches_mapped_release_probability_ratio(self):
+        grid = torch.arange(200, dtype=torch.float64) / 199.
+        old = torch.distributions.Categorical(logits=grid)
+        new = torch.distributions.Categorical(logits=-grid)
+        indices = torch.tensor([0, 20, 100, 199])
+        for low, width in ((0., 100.), (50., 300.)):
+            releases = low + width * grid.square()
+            # At fixed noncollapsed bounds each release corresponds to one index.
+            recovered = torch.searchsorted(releases, releases[indices])
+            release_ratio = new.probs[recovered] / old.probs[recovered]
+            index_ratio = (new.log_prob(indices) - old.log_prob(indices)).exp()
+            torch.testing.assert_close(index_ratio, release_ratio)
 
     def test_energy_reward_ordering_and_spill_saturation(self):
         zero, one, two, three = [self.uniform_release(q) for q in (0.,1.,2.,3.)]
@@ -89,7 +92,7 @@ class DiscreteActionTests(unittest.TestCase):
     def test_all_200_indices_quadratic_mapping_and_inverse(self):
         self.assertEqual(self.config['model']['action_distribution'],'categorical')
         self.assertEqual(self.config['model']['action_bins'],200)
-        env = CascadeReservoirEnv(self.data,self.physical,start_year=1965,action_bins=200)
+        env = CascadeReservoirEnv(self.data,self.physical,start_year=1965)
         self.assertTrue(all(space.n == 200 for space in env.action_space))
         storage = .5*(self.data.vmin+self.data.vmax)
         releases = []
@@ -109,7 +112,7 @@ class DiscreteActionTests(unittest.TestCase):
                                       np.full(5,20))
 
     def test_invalid_indices_fail_without_state_mutation(self):
-        for count in (0,1,2.5,True):
+        for count in (None,0,1,2.5,True):
             with self.assertRaises(ValueError):
                 CascadeReservoirEnv(self.data,self.physical,start_year=1965,action_bins=count)
         env = CascadeReservoirEnv(self.data,self.physical,start_year=1965,action_bins=200)
@@ -185,7 +188,7 @@ class TerminalStorageTests(unittest.TestCase):
         first=env.last_transition
         self.assertAlmostEqual(first['high'][0],1.,places=7)
         self.assertAlmostEqual(first['storage_end'][0]-target[0],86400.,places=5)
-        _,_,rewards,done,_,_=env.step(np.ones(5))
+        _,_,rewards,done,_,_=env.step(np.full(5,199))
         np.testing.assert_allclose(env.storage,target,atol=1e-4,rtol=0)
         np.testing.assert_allclose(env.last_transition['release'],np.ones(5),atol=1e-8)
         np.testing.assert_array_equal(env.last_transition['controls'],np.zeros(5))
@@ -197,7 +200,7 @@ class TerminalStorageTests(unittest.TestCase):
         closed=self.env(external=np.zeros((2,5)));free=self.env(mode='free',external=np.zeros((2,5)))
         initial=closed.storage.copy()
         for _ in range(2):
-            closed.step(np.ones(5));free.step(np.ones(5))
+            closed.step(np.full(5,199));free.step(np.full(5,199))
         np.testing.assert_allclose(closed.storage,initial,atol=1e-4,rtol=0)
         self.assertEqual(closed.last_transition['reward'],0.)
         self.assertLess(free.storage.sum(),initial.sum())
@@ -206,7 +209,7 @@ class TerminalStorageTests(unittest.TestCase):
         env=self.env(external=np.zeros((2,5)))
         env.storage[0]-=86400.;before=env.storage.copy();index=env.index
         with self.assertRaisesRegex(InfeasibleCascade,'Terminal storage target is unreachable'):
-            env.step(np.ones(5))
+            env.step(np.full(5,199))
         np.testing.assert_array_equal(env.storage,before)
         self.assertEqual(env.index,index);self.assertIsNone(env.last_transition)
 
@@ -230,7 +233,6 @@ class RolloutActionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.config,cls.physical=load_configuration()
-        cls.config['model']['action_distribution']='beta'
         cls.config['model']['hidden_sizes']=[16,16]
         cls.config['algo']['ppo_epoch']=cls.config['algo']['critic_epoch']=1
         cls.data=CascadeData(ROOT/'data/cascade_reservoir_new',cls.physical,cls.config['experiment'])
@@ -255,7 +257,7 @@ class RolloutActionTests(unittest.TestCase):
             self.assertTrue(active.any());self.assertFalse(active.all())
             np.testing.assert_allclose(lp.detach().numpy()[active],buffer.action_log_probs.reshape(-1,1)[active],atol=1e-6)
             np.testing.assert_array_equal(buffer.action_log_probs.reshape(-1,1)[~active],0.)
-            np.testing.assert_array_equal(buffer.actions.reshape(-1,1)[~active],.5)
+            np.testing.assert_array_equal(buffer.actions.reshape(-1,1)[~active],0)
         runner.prep_training();runner.train()
         for buffer in runner.actor_buffer:
             self.assertEqual(float(buffer.factor[0,0,0]),1.)

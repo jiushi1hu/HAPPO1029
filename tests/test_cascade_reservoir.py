@@ -38,7 +38,7 @@ class PhysicsTests(unittest.TestCase):
         rng = np.random.RandomState(71)
         incoming, outgoing = 0., 0.
         for _ in range(env.stop-env.start):
-            _, _, reward, done, _, _ = env.step(rng.uniform(size=5))
+            _, _, reward, done, _, _ = env.step(rng.randint(200, size=5))
             r = env.last_transition
             incoming += r["external"].sum()*86400
             outgoing += r["release"][-1]*86400
@@ -49,7 +49,7 @@ class PhysicsTests(unittest.TestCase):
         self.assertTrue(done.all())
         self.assertLess(abs(env.storage.sum()-d.initial_storage(1998).sum()-incoming+outgoing), .1)
         with self.assertRaises(RuntimeError):
-            env.step(np.full(5, .5))
+            env.step(np.full(5, 100))
 
     def test_intervals_against_independent_linear_program(self):
         d = self.data; rng = np.random.RandomState(12)
@@ -82,7 +82,7 @@ class PhysicsTests(unittest.TestCase):
         env = CascadeReservoirEnv(d, self.physical, start_year=1968, end_year=1968)
         np.testing.assert_array_equal(env.storage, d.vmin)
         for _ in range(59):
-            env.step(np.full(5, .5))
+            env.step(np.full(5, 100))
         self.assertEqual(d.dates[env.index].isoformat(), "1968-02-29")
         self.assertAlmostEqual(float(env.observation()[-1]), 307/366., places=6)
 
@@ -90,7 +90,6 @@ class PhysicsTests(unittest.TestCase):
 class LearningTests(unittest.TestCase):
     def setUp(self):
         cfg, self.physical = load_configuration()
-        cfg['model']['action_distribution'] = 'beta'
         cfg["model"]["hidden_sizes"] = [16, 16]
         for key in ["ppo_epoch", "critic_epoch", "actor_num_mini_batch", "critic_num_mini_batch"]:
             cfg["algo"][key] = 1
@@ -221,7 +220,7 @@ class LearningTests(unittest.TestCase):
         entropy = torch.tensor(-.3, requires_grad=True)
         n = len(ratios)
         sample = (np.zeros((n,18), dtype=np.float32),
-                  np.zeros((n,1,16), dtype=np.float32), np.full((n,1), .5, dtype=np.float32),
+                  np.zeros((n,1,16), dtype=np.float32), np.full((n,1), 100, dtype=np.int64),
                   np.ones((n,1), dtype=np.float32), active, np.zeros((n,1), dtype=np.float32),
                   advantages, None, factor)
         # Explicit cases: positive A clips only above the upper bound;
@@ -249,12 +248,9 @@ class LearningTests(unittest.TestCase):
 
     def test_actual_happo_epochs_keep_rollout_denominator_and_sequential_factors(self):
         from contextlib import ExitStack
-        for coordinate, order in [('control', [4,2,0,3,1]),
-                                  ('release_fraction', [1,3,4,0,2])]:
-            with self.subTest(coordinate=coordinate):
+        for order in ([4,2,0,3,1], [1,3,4,0,2]):
+            with self.subTest(order=order):
                 cfg, physical = load_configuration()  # Unchanged default network and epoch counts.
-                cfg['model']['action_distribution'] = 'beta'
-                cfg['model']['beta_action_coordinate'] = coordinate
                 r = CascadeReservoirRunner(self.data, physical, cfg, 1)
                 r.collect_episode(1965)
                 r.prep_training()
@@ -344,7 +340,7 @@ class LearningTests(unittest.TestCase):
         for y in self.data.validation_years+self.data.test_years:
             self.assertNotIn(y, actual)
 
-    def test_complete_annual_happo_update_factor_chain_and_latent_log_probs(self):
+    def test_complete_annual_happo_update_factor_chain_and_index_log_probs(self):
         r = self.r; r.collect_episode(1965); r.prep_training()
         self.assertEqual(r.length, 365)
         ids = [set(id(p) for p in a.actor.parameters()) for a in r.actor]

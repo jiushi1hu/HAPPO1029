@@ -7,7 +7,7 @@ from harl.envs.cascade_reservoir.data_loader import IDS
 
 @torch.no_grad()
 def evaluate_policy(actors, data, physical_config, year, seed, iteration, training_steps, deterministic=True, diagnostics=False):
-    bins = actors[0].args.get('action_bins', 200) if actors[0].args.get('action_distribution') == 'categorical' else None
+    bins = actors[0].args.get('action_bins', 200)
     env = CascadeReservoirEnv(data, physical_config, start_year=year, end_year=year, action_bins=bins)
     initial = env.storage.copy()
     energy, spill, residual = 0., 0., 0.

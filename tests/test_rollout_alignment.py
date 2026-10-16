@@ -163,7 +163,7 @@ class RolloutAlignmentTests(unittest.TestCase):
                 if row['controls'][i]:
                     np.testing.assert_array_equal(b.actions[t], sampled)
                 else:
-                    self.assertEqual(float(b.actions[t, 0, 0]), 0. if runner.action_bins is not None else .5)
+                    self.assertEqual(float(b.actions[t, 0, 0]), 0.)
 
         np.testing.assert_array_equal(cb.value_preds[-1], critic_calls[-1][2])
         np.testing.assert_array_equal(critic_calls[-1][0], cb.share_obs[-1])
@@ -178,7 +178,7 @@ class RolloutAlignmentTests(unittest.TestCase):
             self.assertTrue(np.all(b.masks[:-1] == 1))
             self.assertTrue(np.all(b.masks[-1] == 0))
             self.assertEqual(float(b.active_masks[-2, 0, 0]), 0.)
-            # Same frozen policy, same (s_t, u_t): initial importance ratio is one.
+            # Same frozen policy, same state/index: initial importance ratio is one.
             with torch.no_grad():
                 lp, _, _ = actor.evaluate_actions(b.obs[:-1, 0], b.rnn_states[0],
                     b.actions[:, 0], b.masks[:-1, 0])
@@ -228,60 +228,55 @@ class RolloutAlignmentTests(unittest.TestCase):
             self.assertEqual(sorted(seen), list(range(length)))
 
     def test_real_rollouts_and_reset_across_update(self):
-        for coordinate in ('control', 'release_fraction', 'categorical'):
-            with self.subTest(coordinate=coordinate):
-                cfg, physical = load_configuration()
-                if coordinate != 'categorical':
-                    cfg['model']['action_distribution'] = 'beta'
-                    cfg['model']['beta_action_coordinate'] = coordinate
-                data = CascadeData(Path(__file__).resolve().parents[1] / 'data/cascade_reservoir_new',
-                                   physical, cfg['experiment'])
-                runner = CascadeReservoirRunner(data, physical, cfg, 1)
-                self.audit_year(runner, 1965)
-                previous_buffer = runner.critic_buffer
-                runner.prep_training()
-                cb = runner.critic_buffer
-                returns_before = cb.returns.copy()
-                raw_advantages = cb.returns[:-1] - runner.value_normalizer.denormalize(cb.value_preds[:-1])
-                expected_advantages = (raw_advantages - raw_advantages.mean()) / (raw_advantages.std() + 1e-5)
-                norm_before = copy.deepcopy(runner.value_normalizer.state_dict())
-                delivered = []
+        cfg, physical = load_configuration()
+        data = CascadeData(Path(__file__).resolve().parents[1] / 'data/cascade_reservoir_new',
+                           physical, cfg['experiment'])
+        runner = CascadeReservoirRunner(data, physical, cfg, 1)
+        self.audit_year(runner, 1965)
+        previous_buffer = runner.critic_buffer
+        runner.prep_training()
+        cb = runner.critic_buffer
+        returns_before = cb.returns.copy()
+        raw_advantages = cb.returns[:-1] - runner.value_normalizer.denormalize(cb.value_preds[:-1])
+        expected_advantages = (raw_advantages - raw_advantages.mean()) / (raw_advantages.std() + 1e-5)
+        norm_before = copy.deepcopy(runner.value_normalizer.state_dict())
+        delivered = []
 
-                def check_normalizer():
-                    for key, value in norm_before.items():
-                        torch.testing.assert_close(runner.value_normalizer.state_dict()[key], value, rtol=0, atol=0)
+        def check_normalizer():
+            for key, value in norm_before.items():
+                torch.testing.assert_close(runner.value_normalizer.state_dict()[key], value, rtol=0, atol=0)
 
-                def checked_actor(i, original):
-                    def call(buffer, advantages, state_type):
-                        check_normalizer()
-                        np.testing.assert_array_equal(advantages, expected_advantages)
-                        delivered.append(i)
-                        result = original(buffer, advantages, state_type)
-                        check_normalizer()
-                        return result
-                    return call
+        def checked_actor(i, original):
+            def call(buffer, advantages, state_type):
+                check_normalizer()
+                np.testing.assert_array_equal(advantages, expected_advantages)
+                delivered.append(i)
+                result = original(buffer, advantages, state_type)
+                check_normalizer()
+                return result
+            return call
 
-                original_critic_train = runner.critic.train
+        original_critic_train = runner.critic.train
 
-                def checked_critic(*args, **kwargs):
-                    self.assertEqual(sorted(delivered), list(range(5)))
-                    check_normalizer()
-                    return original_critic_train(*args, **kwargs)
+        def checked_critic(*args, **kwargs):
+            self.assertEqual(sorted(delivered), list(range(5)))
+            check_normalizer()
+            return original_critic_train(*args, **kwargs)
 
-                from contextlib import ExitStack
-                with ExitStack() as stack:
-                    for i, actor in enumerate(runner.actor):
-                        stack.enter_context(patch.object(actor, 'train', checked_actor(i, actor.train)))
-                    stack.enter_context(patch.object(runner.critic, 'train', checked_critic))
-                    actor_info, critic_info = runner.train()
-                np.testing.assert_array_equal(cb.returns, returns_before)
-                self.assertTrue(all(np.isfinite([float(v) for v in row.values()]).all()
-                                    for row in actor_info))
-                self.assertTrue(np.isfinite([float(v) for v in critic_info.values()]).all())
-                self.audit_year(runner, 1968)
-                self.assertIsNot(previous_buffer, runner.critic_buffer)
-                self.assertEqual(runner.sampled_years, [1965, 1968])
-                self.assertEqual(runner.completed_episodes, 2)
+        from contextlib import ExitStack
+        with ExitStack() as stack:
+            for i, actor in enumerate(runner.actor):
+                stack.enter_context(patch.object(actor, 'train', checked_actor(i, actor.train)))
+            stack.enter_context(patch.object(runner.critic, 'train', checked_critic))
+            actor_info, critic_info = runner.train()
+        np.testing.assert_array_equal(cb.returns, returns_before)
+        self.assertTrue(all(np.isfinite([float(v) for v in row.values()]).all()
+                            for row in actor_info))
+        self.assertTrue(np.isfinite([float(v) for v in critic_info.values()]).all())
+        self.audit_year(runner, 1968)
+        self.assertIsNot(previous_buffer, runner.critic_buffer)
+        self.assertEqual(runner.sampled_years, [1965, 1968])
+        self.assertEqual(runner.completed_episodes, 2)
 
 
 if __name__ == '__main__':

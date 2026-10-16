@@ -54,9 +54,7 @@ def actor_distribution(actor, buffer):
     _, _, dist = actor.evaluate_actions(
         buffer.obs[:-1].reshape(-1, buffer.obs.shape[-1]), buffer.rnn_states[0],
         buffer.actions.reshape(-1, 1), buffer.masks[:-1].reshape(-1, 1))
-    if isinstance(dist, torch.distributions.Categorical):
-        return type(dist)(logits=dist.logits.clone())
-    return type(dist)(dist.concentration1.clone(), dist.concentration0.clone())
+    return type(dist)(logits=dist.logits.clone())
 
 
 @torch.no_grad()
@@ -108,19 +106,14 @@ def after_update(runner, before):
         log_ratio = (new.log_probs(action)-old.log_probs(action))[active]
         ratio = log_ratio.exp()
         kl = torch.distributions.kl_divergence(old,new)[active]
-        categorical = isinstance(new, torch.distributions.Categorical)
-        if categorical:
-            grid = torch.linspace(0., 1., new.probs.shape[-1])
-            mean = (new.probs[active]*grid).sum(-1, keepdim=True)
-            second = (new.probs[active]*grid.square()).sum(-1, keepdim=True)
-            variance = (second-mean.square()).clamp_min(0.)
-            deterministic = new.mode()[active].float()/(new.probs.shape[-1]-1)
-        else:
-            mean, variance = new.mean[active], new.variance[active]
-            deterministic = new.mode()[active]
+        grid = torch.linspace(0., 1., new.probs.shape[-1])
+        mean = (new.probs[active]*grid).sum(-1, keepdim=True)
+        second = (new.probs[active]*grid.square()).sum(-1, keepdim=True)
+        variance = (second-mean.square()).clamp_min(0.)
+        deterministic = new.mode()[active].float()/(new.probs.shape[-1]-1)
         require_finite('actor {} ratios'.format(i), ratio.cpu().numpy())
         require_finite('actor {} KL'.format(i), kl.cpu().numpy())
-        sampled = action[active]/(new.probs.shape[-1]-1) if categorical else action[active]
+        sampled = action[active]/(new.probs.shape[-1]-1)
         result['actors'].append(dict(agent=i, active_samples=int(active.sum()),
             **update,
             entropy=float(new.entropy()[active].mean()),

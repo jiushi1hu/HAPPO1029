@@ -48,9 +48,9 @@ class CascadeReservoirRunner(OnPolicyHARunner):
 
     def __init__(self, data, physical_config, algo_args, seed):
         distribution = algo_args['model'].get('action_distribution')
-        if distribution not in ('beta', 'categorical'):
-            raise ValueError('Cascade controls require beta or categorical actions')
-        self.action_bins = algo_args['model'].get('action_bins', 200) if distribution == 'categorical' else None
+        if distribution != 'categorical':
+            raise ValueError('Cascade controls require categorical discrete actions')
+        self.action_bins = algo_args['model'].get('action_bins', 200)
         for key in ("use_policy_active_masks", "mask_inactive_factors"):
             if not algo_args["algo"].get(key, False):
                 raise ValueError("Forced cascade actions require " + key)

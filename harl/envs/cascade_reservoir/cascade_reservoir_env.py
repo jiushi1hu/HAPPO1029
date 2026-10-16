@@ -9,7 +9,7 @@ from harl.envs.cascade_reservoir.terminal_storage import TerminalReleaseBounds
 class CascadeReservoirEnv:
     n_agents = 5
 
-    def __init__(self, data, config, end_year=None, start_year=None, action_bins=None):
+    def __init__(self, data, config, end_year=None, start_year=None, action_bins=200):
         self.data = data
         self.physics = ReservoirPhysics(data, config)
         self.terminal_storage_mode = config.get('terminal_storage_mode', 'free')
@@ -25,12 +25,11 @@ class CascadeReservoirEnv:
         self.time_scale_days = 366  # Fixed annual scale, including leap days.
         self.observation_space = [Box(-np.inf, np.inf, (18,), dtype=np.float32) for _ in range(5)]
         self.share_observation_space = self.observation_space
-        if action_bins is not None and (isinstance(action_bins, bool) or
+        if (isinstance(action_bins, bool) or
                 not isinstance(action_bins, (int, np.integer)) or action_bins < 2):
             raise ValueError('action_bins must be an integer >= 2')
         self.action_bins = action_bins
-        self.action_space = [Discrete(action_bins) if action_bins is not None else
-                            Box(0., 1., (1,), dtype=np.float32) for _ in range(5)]
+        self.action_space = [Discrete(action_bins) for _ in range(5)]
         self.reset()
 
     def reset(self):
@@ -63,10 +62,6 @@ class CascadeReservoirEnv:
         if actions.shape not in ((5,), (5,1)) or not np.isfinite(actions).all():
             raise ValueError('Five finite scalar actions required')
         actions = actions.reshape(5)
-        if self.action_bins is None:
-            if ((actions < 0.) | (actions > 1.)).any():
-                raise ValueError('Normalized actions must lie in [0, 1]')
-            return actions
         if ((actions != np.floor(actions)) | (actions < 0) | (actions >= self.action_bins)).any():
             raise ValueError('Discrete actions must be integer indices in [0, action_bins-1]')
         return actions / (self.action_bins-1)
@@ -75,7 +70,7 @@ class CascadeReservoirEnv:
         """Invert given feasible bounds; round to nearest normalized grid index.
 
         Off-grid releases are quantized in u, not in m3/s. A collapsed interval
-        has canonical index zero (or control .5 for the continuous interface).
+        has canonical index zero.
         """
         releases, low, high = [np.asarray(x, dtype=np.float64) for x in (releases, low, high)]
         if any(x.shape != (5,) or not np.isfinite(x).all() for x in (releases, low, high)):
@@ -85,8 +80,6 @@ class CascadeReservoirEnv:
         active = high-low > 1e-8
         u = np.full(5, .5)
         u[active] = np.sqrt((releases[active]-low[active])/(high[active]-low[active]))
-        if self.action_bins is None:
-            return u
         return np.where(active, np.rint(u*(self.action_bins-1)), 0).astype(np.int64)
 
     def step(self, actions):
@@ -113,9 +106,8 @@ class CascadeReservoirEnv:
                 raise AssertionError('Terminal storage target violation')
         result["date"] = self.data.dates[self.index].isoformat()
         result['normalized_actions'] = result['actions'].copy()
-        if self.action_bins is not None:
-            # Forced actions have no policy contribution; zero is a valid placeholder index.
-            result['actions'] = np.where(result['controls'] > 0, actions.reshape(5), 0).astype(np.int64)
+        # Forced actions have no policy contribution; zero is a valid placeholder index.
+        result['actions'] = np.where(result['controls'] > 0, actions.reshape(5), 0).astype(np.int64)
         result["levels_end"] = self.data.levels(result["storage_end"])
         self.last_transition = result
         self.storage = result["storage_end"].copy()

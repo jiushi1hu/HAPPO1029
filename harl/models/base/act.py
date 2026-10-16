@@ -1,6 +1,6 @@
 import torch
 import torch.nn as nn
-from harl.models.base.distributions import Categorical, DiagGaussian, BetaHead
+from harl.models.base.distributions import Categorical, DiagGaussian
 
 
 class ACTLayer(nn.Module):
@@ -28,16 +28,9 @@ class ACTLayer(nn.Module):
             )
         elif action_space.__class__.__name__ == "Box":
             action_dim = action_space.shape[0]
-            if args is not None and args.get("action_distribution") == "beta":
-                if not ((action_space.low == 0).all() and (action_space.high == 1).all()):
-                    raise ValueError("Beta actions require a Box with bounds [0, 1].")
-                self.action_out = BetaHead(inputs_dim, action_dim, initialization_method, gain,
-                                           args.get("beta_concentration_offset", 0.),
-                                           args.get("beta_action_coordinate", "control"))
-            else:
-                self.action_out = DiagGaussian(
-                    inputs_dim, action_dim, initialization_method, gain, args
-                )
+            self.action_out = DiagGaussian(
+                inputs_dim, action_dim, initialization_method, gain, args
+            )
         elif action_space.__class__.__name__ == "MultiDiscrete":
             self.multidiscrete_action = True
             action_dims = action_space.nvec
