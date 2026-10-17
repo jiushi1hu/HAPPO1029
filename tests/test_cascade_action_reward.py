@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def fixture():
     _, config = load_configuration()
+    config['head_model'] = 'fixed'  # This toy system has no storage-elevation curve.
     data = SimpleNamespace(vmin=np.zeros(5), vmax=np.full(5, 86400000.),
         release_cap=np.full(5, 1000.), turbine_cap=np.full(5, 2.),
         power_cap=np.full(5, 10000.), head=np.full(5, 100.))
@@ -135,8 +136,8 @@ class DiscreteActionTests(unittest.TestCase):
                 self.assertEqual(b.available_actions.shape,(r.length+1,1,200))
                 self.assertTrue(np.all(b.actions==np.floor(b.actions)))
                 self.assertTrue(np.all((b.actions>=0)&(b.actions<200)))
-                lp,_,dist = actor.evaluate_actions(b.obs[:-1,0],b.rnn_states[0],b.actions[:,0],
-                                                    b.masks[:-1,0],b.available_actions[:-1,0])
+                lp,_,dist = actor.evaluate_actions(b.obs[:-1,0],b.actions[:,0],
+                                                    b.available_actions[:-1,0])
                 self.assertIsInstance(dist,FixedCategorical)
                 self.assertEqual(dist.probs.shape,(r.length,200))
                 # Density is for the chosen index, not for i/199 or the release.
@@ -147,7 +148,7 @@ class DiscreteActionTests(unittest.TestCase):
                                            1.,atol=1e-5,rtol=0)
                 np.testing.assert_array_equal(b.actions[:,0][~active],0)
                 np.testing.assert_array_equal(b.action_log_probs[:,0][~active],0)
-                actions,_ = actor.act(b.obs[:1,0],b.rnn_states[0],b.masks[:1,0],deterministic=True)
+                actions = actor.act(b.obs[:1,0],deterministic=True)
                 np.testing.assert_array_equal(actions.detach().numpy(),dist.probs[:1].argmax(-1,keepdim=True).numpy())
             before = before_update(r)
             r.prep_training();r.train()
@@ -215,7 +216,7 @@ class TerminalStorageTests(unittest.TestCase):
 
     def test_annual_target_cannot_be_silently_applied_to_multiple_years(self):
         env=self.env()
-        _,config=load_configuration()
+        _,config,_=fixture()
         with self.assertRaisesRegex(ValueError,'single-year episode'):
             CascadeReservoirEnv(env.data,config,start_year=1965,end_year=1966)
 
@@ -251,8 +252,8 @@ class RolloutActionTests(unittest.TestCase):
         runner=CascadeReservoirRunner(data,physical,copy.deepcopy(self.config),1)
         runner.collect_episode(1965)
         for actor,buffer in zip(runner.actor,runner.actor_buffer):
-            lp,_,_=actor.evaluate_actions(buffer.obs[:-1].reshape(-1,18),buffer.rnn_states[0],
-                buffer.actions.reshape(-1,1),buffer.masks[:-1].reshape(-1,1))
+            lp,_,_=actor.evaluate_actions(buffer.obs[:-1].reshape(-1,18),
+                buffer.actions.reshape(-1,1))
             active=buffer.active_masks[:-1].reshape(-1)>0
             self.assertTrue(active.any());self.assertFalse(active.all())
             np.testing.assert_allclose(lp.detach().numpy()[active],buffer.action_log_probs.reshape(-1,1)[active],atol=1e-6)

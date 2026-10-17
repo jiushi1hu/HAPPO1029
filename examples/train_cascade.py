@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT))
 
 import numpy as np
 import yaml
-from harl.envs.cascade_reservoir.data_loader import CascadeData
+from harl.envs.cascade_reservoir.data_loader import CascadeData, HEAD_MODELS
 from harl.envs.cascade_reservoir.reservoir_physics import ReservoirPhysics
 from harl.envs.cascade_reservoir.evaluation import reference_summary
 from harl.runners.cascade_reservoir_runner import CascadeReservoirRunner
@@ -42,6 +42,8 @@ def main():
     parser.add_argument('--action-bins', type=int, help='Number of discrete choices per reservoir (default: 200)')
     parser.add_argument("--seeds", nargs="+", type=int)
     parser.add_argument("--gae-lambda", type=float, help="GAE trace parameter; 1 uses full realized annual returns")
+    parser.add_argument("--head-model", choices=HEAD_MODELS,
+                        help="Storage-dependent assumed head scenario, or the original fixed head")
     parser.add_argument("--check-data-only", action="store_true")
     parser.add_argument("--plot-python", default=sys.executable, help="Interpreter with an interactive Matplotlib backend")
     parser.add_argument("--no-plot", action="store_true", help="Run without opening a figure window")
@@ -52,6 +54,8 @@ def main():
     parser.add_argument("--skip-final-test", action="store_true", help="Skip typical-year tests during diagnostic tuning")
     args = parser.parse_args()
     config, physical = load_configuration()
+    if args.head_model is not None:
+        physical["head_model"] = args.head_model
     if args.action_distribution is not None:
         config['model']['action_distribution'] = args.action_distribution
     if args.action_bins is not None:
@@ -82,6 +86,9 @@ def main():
         test_years=dict(zip(data.test_labels, data.test_years)),
         episodes_per_seed=exp["episodes"], episode_days="365/366", release_mapping="quadratic",
         reference_energy_MWh=physics.reference_energy,
+        head_model=physics.head_model, head_data_status=physics.head_data_status,
+        head_time_step_rule=("mean of starting and ending forebay elevations"
+                             if physics.head_model == "storage_sensitivity" else "constant typical net head"),
         action_distribution=config['model']['action_distribution'],
         action_bins=config['model']['action_bins'],
         gae_lambda=config["algo"]["gae_lambda"],

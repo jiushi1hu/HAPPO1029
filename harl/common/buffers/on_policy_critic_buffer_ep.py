@@ -2,7 +2,6 @@
 import torch
 import numpy as np
 from harl.utils.envs_tools import get_shape_from_obs_space
-from harl.utils.trans_tools import _flatten, _sa_cast
 
 
 class OnPolicyCriticBufferEP:
@@ -16,9 +15,6 @@ class OnPolicyCriticBufferEP:
         """
         self.episode_length = args["episode_length"]
         self.n_rollout_threads = args["n_rollout_threads"]
-        self.hidden_sizes = args["hidden_sizes"]
-        self.rnn_hidden_size = self.hidden_sizes[-1]
-        self.recurrent_n = args["recurrent_n"]
         self.gamma = args["gamma"]
         self.gae_lambda = args["gae_lambda"]
         self.use_gae = args["use_gae"]
@@ -31,17 +27,6 @@ class OnPolicyCriticBufferEP:
         # Buffer for share observations
         self.share_obs = np.zeros(
             (self.episode_length + 1, self.n_rollout_threads, *share_obs_shape),
-            dtype=np.float32,
-        )
-
-        # Buffer for rnn states of critic
-        self.rnn_states_critic = np.zeros(
-            (
-                self.episode_length + 1,
-                self.n_rollout_threads,
-                self.recurrent_n,
-                self.rnn_hidden_size,
-            ),
             dtype=np.float32,
         )
 
@@ -71,11 +56,10 @@ class OnPolicyCriticBufferEP:
         self.step = 0
 
     def insert(
-        self, share_obs, rnn_states_critic, value_preds, rewards, masks, bad_masks
+        self, share_obs, value_preds, rewards, masks, bad_masks
     ):
         """Insert data into buffer."""
         self.share_obs[self.step + 1] = share_obs.copy()
-        self.rnn_states_critic[self.step + 1] = rnn_states_critic.copy()
         self.value_preds[self.step] = value_preds.copy()
         self.rewards[self.step] = rewards.copy()
         self.masks[self.step + 1] = masks.copy()
@@ -86,7 +70,6 @@ class OnPolicyCriticBufferEP:
     def after_update(self):
         """After an update, copy the data at the last step to the first position of the buffer."""
         self.share_obs[0] = self.share_obs[-1].copy()
-        self.rnn_states_critic[0] = self.rnn_states_critic[-1].copy()
         self.masks[0] = self.masks[-1].copy()
         self.bad_masks[0] = self.bad_masks[-1].copy()
 
@@ -231,9 +214,6 @@ class OnPolicyCriticBufferEP:
         # (episode_length + 1, n_rollout_threads, *share_obs_shape) --> (episode_length, n_rollout_threads, *share_obs_shape)
         # --> (episode_length * n_rollout_threads, *share_obs_shape)
         share_obs = self.share_obs[:-1].reshape(-1, *self.share_obs.shape[2:])
-        rnn_states_critic = self.rnn_states_critic[:-1].reshape(
-            -1, *self.rnn_states_critic.shape[2:]
-        )  # actually not used, just for consistency
         value_preds = self.value_preds[:-1].reshape(-1, 1)
         returns = self.returns[:-1].reshape(-1, 1)
         masks = self.masks[:-1].reshape(-1, 1)
@@ -242,128 +222,8 @@ class OnPolicyCriticBufferEP:
             # share_obs shape:
             # (episode_length * n_rollout_threads, *share_obs_shape) --> (mini_batch_size, *share_obs_shape)
             share_obs_batch = share_obs[indices]
-            rnn_states_critic_batch = rnn_states_critic[indices]
             value_preds_batch = value_preds[indices]
             return_batch = returns[indices]
             masks_batch = masks[indices]
 
-            yield share_obs_batch, rnn_states_critic_batch, value_preds_batch, return_batch, masks_batch
-
-    def naive_recurrent_generator_critic(self, critic_num_mini_batch):
-        """Training data generator for critic that uses RNN network.
-        This generator does not split the trajectories into chunks,
-        and therefore maybe less efficient than the recurrent_generator_critic in training.
-        Args:
-            critic_num_mini_batch: (int) Number of mini batches for critic.
-        """
-
-        # get n_rollout_threads and num_envs_per_batch
-        n_rollout_threads = self.rewards.shape[1]
-        assert n_rollout_threads >= critic_num_mini_batch, (
-            f"The number of processes ({n_rollout_threads}) "
-            f"has to be greater than or equal to the number of "
-            f"mini batches ({critic_num_mini_batch})."
-        )
-        num_envs_per_batch = n_rollout_threads // critic_num_mini_batch
-
-        # shuffle indices
-        perm = torch.randperm(n_rollout_threads).numpy()
-
-        T, N = self.episode_length, num_envs_per_batch
-
-        for batch_id in range(critic_num_mini_batch):
-            start_id = batch_id * num_envs_per_batch
-            ids = perm[start_id : start_id + num_envs_per_batch]
-            share_obs_batch = _flatten(T, N, self.share_obs[:-1, ids])
-            value_preds_batch = _flatten(T, N, self.value_preds[:-1, ids])
-            return_batch = _flatten(T, N, self.returns[:-1, ids])
-            masks_batch = _flatten(T, N, self.masks[:-1, ids])
-            rnn_states_critic_batch = self.rnn_states_critic[0, ids]
-
-            yield share_obs_batch, rnn_states_critic_batch, value_preds_batch, return_batch, masks_batch
-
-    def recurrent_generator_critic(self, critic_num_mini_batch, data_chunk_length):
-        """Training data generator for critic that uses RNN network.
-        This generator splits the trajectories into chunks of length data_chunk_length,
-        and therefore maybe more efficient than the naive_recurrent_generator_actor in training.
-        Args:
-            critic_num_mini_batch: (int) Number of mini batches for critic.
-            data_chunk_length: (int) Length of data chunks.
-        """
-
-        # get episode_length, n_rollout_threads, and mini_batch_size
-        episode_length, n_rollout_threads = self.rewards.shape[0:2]
-        batch_size = n_rollout_threads * episode_length
-        data_chunks = batch_size // data_chunk_length
-        mini_batch_size = data_chunks // critic_num_mini_batch
-
-        assert (
-            episode_length % data_chunk_length == 0
-        ), f"episode length ({episode_length}) must be a multiple of data chunk length ({data_chunk_length})."
-        assert data_chunks >= 2, "need larger batch size"
-
-        # shuffle indices
-        rand = torch.randperm(data_chunks).numpy()
-        sampler = [
-            rand[i * mini_batch_size : (i + 1) * mini_batch_size]
-            for i in range(critic_num_mini_batch)
-        ]
-
-        # The following data operations first transpose the first two dimensions of the data (episode_length, n_rollout_threads)
-        # to (n_rollout_threads, episode_length), then reshape the data to (n_rollout_threads * episode_length, *dim).
-        # Take share_obs shape as an example:
-        # (episode_length + 1, n_rollout_threads, *share_obs_shape) --> (episode_length, n_rollout_threads, *share_obs_shape)
-        # --> (n_rollout_threads, episode_length, *share_obs_shape) --> (n_rollout_threads * episode_length, *share_obs_shape)
-        if len(self.share_obs.shape) > 3:
-            share_obs = (
-                self.share_obs[:-1]
-                .transpose(1, 0, 2, 3, 4)
-                .reshape(-1, *self.share_obs.shape[2:])
-            )
-        else:
-            share_obs = _sa_cast(self.share_obs[:-1])
-        value_preds = _sa_cast(self.value_preds[:-1])
-        returns = _sa_cast(self.returns[:-1])
-        masks = _sa_cast(self.masks[:-1])
-        rnn_states_critic = (
-            self.rnn_states_critic[:-1]
-            .transpose(1, 0, 2, 3)
-            .reshape(-1, *self.rnn_states_critic.shape[2:])
-        )
-
-        # generate mini-batches
-        for indices in sampler:
-            share_obs_batch = []
-            rnn_states_critic_batch = []
-            value_preds_batch = []
-            return_batch = []
-            masks_batch = []
-
-            for index in indices:
-                ind = index * data_chunk_length
-                share_obs_batch.append(share_obs[ind : ind + data_chunk_length])
-                value_preds_batch.append(value_preds[ind : ind + data_chunk_length])
-                return_batch.append(returns[ind : ind + data_chunk_length])
-                masks_batch.append(masks[ind : ind + data_chunk_length])
-                rnn_states_critic_batch.append(
-                    rnn_states_critic[ind]
-                )  # only the beginning rnn states are needed
-
-            L, N = data_chunk_length, mini_batch_size
-            # These are all ndarrays of size (data_chunk_length, mini_batch_size, *dim)
-            share_obs_batch = np.stack(share_obs_batch, axis=1)
-            value_preds_batch = np.stack(value_preds_batch, axis=1)
-            return_batch = np.stack(return_batch, axis=1)
-            masks_batch = np.stack(masks_batch, axis=1)
-            # rnn_states_critic_batch is a (mini_batch_size, *dim) ndarray
-            rnn_states_critic_batch = np.stack(rnn_states_critic_batch).reshape(
-                N, *self.rnn_states_critic.shape[2:]
-            )
-
-            # Flatten the (data_chunk_length, mini_batch_size, *dim) ndarrays to (data_chunk_length * mini_batch_size, *dim)
-            share_obs_batch = _flatten(L, N, share_obs_batch)
-            value_preds_batch = _flatten(L, N, value_preds_batch)
-            return_batch = _flatten(L, N, return_batch)
-            masks_batch = _flatten(L, N, masks_batch)
-
-            yield share_obs_batch, rnn_states_critic_batch, value_preds_batch, return_batch, masks_batch
+            yield share_obs_batch, value_preds_batch, return_batch, masks_batch

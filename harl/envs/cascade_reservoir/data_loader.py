@@ -7,6 +7,8 @@ from pathlib import Path
 import numpy as np
 
 IDS = ("WDD", "BHT", "XLD", "XJB", "THR")
+HEAD_MODELS = ("fixed", "storage_sensitivity")
+HEAD_SENSITIVITY_FILE = "reservoir_head_sensitivity.csv"
 FLOW_COLUMNS = ("WDD_external_inflow_m3s",) + tuple(
     name + "_interval_inflow_m3s" for name in IDS[1:]
 )
@@ -23,6 +25,9 @@ def read_csv(path):
 class CascadeData:
     def __init__(self, root, config, experiment=None):
         self.root = Path(root).resolve()
+        self.head_model = config.get("head_model", "fixed")
+        if self.head_model not in HEAD_MODELS:
+            raise ValueError("Unknown head model: " + str(self.head_model))
         experiment = experiment or {}
         self.validation_years = tuple(int(y) for y in experiment.get("validation_years", range(2020, 2025)))
         self.test_years = tuple(int(y) for y in experiment.get("test_years", [1998, 1999, 1970, 1997, 2006]))
@@ -123,6 +128,55 @@ class CascadeData:
         for year, storage in self.initial_storage_by_year.items():
             if not np.isfinite(storage).all() or ((storage < self.vmin) | (storage > self.vmax)).any():
                 raise ValueError("Initial storage outside operating bounds in year " + str(year))
+        self.head_sensitivity = None
+        if self.head_model == "storage_sensitivity":
+            self._load_head_sensitivity(config)
+
+    def _load_head_sensitivity(self, config):
+        """Validate the explicitly assumed scenario against its source inputs."""
+        path = self.root / HEAD_SENSITIVITY_FILE
+        if not path.is_file():
+            raise ValueError("storage_sensitivity requires " + str(path))
+        rows = read_csv(path)
+        if len(rows) != 5 or {r.get("reservoir_id") for r in rows} != set(IDS):
+            raise ValueError("Head sensitivity must contain exactly one row per reservoir")
+        records = {r["reservoir_id"]: r for r in rows}
+        if any(records[i].get("data_status") != "assumed_sensitivity_only" for i in IDS):
+            raise ValueError("Head sensitivity must be labelled assumed_sensitivity_only")
+        columns = ("operating_level_min_m", "operating_level_max_m",
+                   "assumed_reference_forebay_level_m", "reference_net_head_m",
+                   "assumed_effective_tailwater_plus_loss_m", "head_slope_m_per_m",
+                   "scenario_net_head_min_m", "scenario_net_head_max_m", "efficiency")
+        try:
+            values = {key: np.array([float(records[i][key]) for i in IDS]) for key in columns}
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("Missing or nonnumeric head sensitivity field") from exc
+        if not all(np.isfinite(v).all() for v in values.values()):
+            raise ValueError("Head sensitivity fields must be finite")
+        low, high = np.array([config["level_bounds_m"][i] for i in IDS], dtype=float).T
+        reference_level = (low + high) / 2.
+        expected = {
+            "operating_level_min_m": low,
+            "operating_level_max_m": high,
+            "assumed_reference_forebay_level_m": reference_level,
+            "reference_net_head_m": self.head,
+            "assumed_effective_tailwater_plus_loss_m": reference_level - self.head,
+            "scenario_net_head_min_m": self.head + low - reference_level,
+            "scenario_net_head_max_m": self.head + high - reference_level,
+        }
+        for key, value in expected.items():
+            if not np.allclose(values[key], value, rtol=0., atol=1e-6):
+                raise ValueError("Head sensitivity inconsistent with source inputs: " + key)
+        if not np.allclose(values["head_slope_m_per_m"], 1., rtol=0., atol=1e-12):
+            raise ValueError("This head scenario requires a constant offset (head slope 1)")
+        if ((values["scenario_net_head_min_m"] <= 0).any() or
+                (values["scenario_net_head_max_m"] <= 0).any()):
+            raise ValueError("Scenario net head must remain positive throughout operating bounds")
+        eta = float(config["efficiency"])
+        if not 0. < eta <= 1. or not np.allclose(values["efficiency"], eta, rtol=0., atol=1e-12):
+            raise ValueError("Head sensitivity efficiency must match the physical configuration")
+        self.head_sensitivity = values
+        self.hashes[HEAD_SENSITIVITY_FILE] = hashlib.sha256(path.read_bytes()).hexdigest()
 
     def initial_storage(self, year):
         """Return a copy of the selected year's supplied initial storage."""

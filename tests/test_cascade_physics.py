@@ -43,7 +43,7 @@ class PhysicalInputTests(unittest.TestCase):
             with self.subTest(flows=flows):
                 with self.assertRaises(ValueError):
                     physics.constant_storage(flows)
-        release, energy = physics.constant_storage(np.zeros((2, 5)))
+        release, energy = physics.constant_storage(np.zeros((2, 5)), self.data.initial_storage(1965))
         np.testing.assert_array_equal(release, np.zeros((2, 5)))
         np.testing.assert_array_equal(energy, np.zeros((2, 5)))
 
@@ -51,6 +51,7 @@ class PhysicalInputTests(unittest.TestCase):
 class AnalyticalPhysicsTests(unittest.TestCase):
     def setUp(self):
         _, self.config = load_configuration()
+        self.config['head_model'] = 'fixed'  # Analytical fixtures specify constant head.
         self.data = SimpleNamespace(vmin=np.full(5, 1e9), vmax=np.full(5, 2e9),
             release_cap=np.full(5, 20000.), turbine_cap=np.full(5, 10000.),
             power_cap=np.full(5, 10000.), head=np.full(5, 100.))

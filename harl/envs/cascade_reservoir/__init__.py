@@ -1,1 +1,1 @@
-"""Daily five-reservoir, constant-head cascade scheduling."""
+"""Daily five-reservoir scheduling with fixed or assumed storage-dependent head."""

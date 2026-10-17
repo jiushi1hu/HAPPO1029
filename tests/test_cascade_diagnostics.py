@@ -44,8 +44,7 @@ class DiagnosticTests(unittest.TestCase):
                     self.assertTrue(0. <= a['eval_mapping_fraction'] <= 1.)
                     b=r.actor_buffer[i]
                     with torch.no_grad():
-                        _,_,dist=r.actor[i].evaluate_actions(b.obs[:-1,0],b.rnn_states[0],
-                            b.actions[:,0],b.masks[:-1,0])
+                        _,_,dist=r.actor[i].evaluate_actions(b.obs[:-1,0],b.actions[:,0])
                         active=b.active_masks[:-1,0,0]>0
                         probs=dist.probs[active].numpy()
                         grid=np.arange(200)/199.

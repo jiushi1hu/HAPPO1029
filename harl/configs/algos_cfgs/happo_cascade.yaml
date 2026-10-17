@@ -12,8 +12,6 @@ model:
   hidden_sizes: [128, 128]
   activation_func: tanh
   use_feature_normalization: false
-  use_recurrent_policy: false
-  use_naive_recurrent_policy: false
   lr: 0.0003
   critic_lr: 0.0003
   action_distribution: categorical

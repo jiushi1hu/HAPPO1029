@@ -37,9 +37,8 @@ class HAPPO(OnPolicyBase):
         """
         (
             obs_batch,
-            rnn_states_batch,
             actions_batch,
-            masks_batch,
+            _masks_batch,
             active_masks_batch,
             old_action_log_probs_batch,
             adv_targ,
@@ -61,9 +60,7 @@ class HAPPO(OnPolicyBase):
         # Reshape to do evaluations for all steps in a single forward pass
         action_log_probs, dist_entropy, _ = self.evaluate_actions(
             obs_batch,
-            rnn_states_batch,
             actions_batch,
-            masks_batch,
             available_actions_batch,
             active_masks_batch,
         )
@@ -133,18 +130,9 @@ class HAPPO(OnPolicyBase):
             advantages = (advantages - mean_advantages) / (std_advantages + 1e-5)
 
         for _ in range(self.ppo_epoch):
-            if self.use_recurrent_policy:
-                data_generator = actor_buffer.recurrent_generator_actor(
-                    advantages, self.actor_num_mini_batch, self.data_chunk_length
-                )
-            elif self.use_naive_recurrent_policy:
-                data_generator = actor_buffer.naive_recurrent_generator_actor(
-                    advantages, self.actor_num_mini_batch
-                )
-            else:
-                data_generator = actor_buffer.feed_forward_generator_actor(
-                    advantages, self.actor_num_mini_batch
-                )
+            data_generator = actor_buffer.feed_forward_generator_actor(
+                advantages, self.actor_num_mini_batch
+            )
 
             for sample in data_generator:
                 policy_loss, dist_entropy, actor_grad_norm, imp_weights = self.update(

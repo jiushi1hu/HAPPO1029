@@ -1,5 +1,6 @@
 """Double-precision water balance and exact current-day chain feasibility."""
 import numpy as np
+from harl.envs.cascade_reservoir.data_loader import HEAD_MODELS
 
 
 class InfeasibleCascade(RuntimeError):
@@ -21,9 +22,65 @@ class ReservoirPhysics:
         gravity = float(config["gravity_m_s2"])
         if not np.isfinite([density, gravity]).all() or density <= 0 or gravity <= 0:
             raise ValueError("Water density and gravity must be finite and positive")
-        self.coefficient = density * gravity * eta * data.head / 1e6
-        self.effective_turbine_cap = np.minimum(data.turbine_cap, data.power_cap / self.coefficient)
+        self.head_model = config.get("head_model", "fixed")
+        if self.head_model not in HEAD_MODELS:
+            raise ValueError("Unknown head model: " + str(self.head_model))
+        self.rho_g_eta = density * gravity * eta
+        self.head_data_status = "supplied_typical_head"
+        if self.head_model == "fixed":
+            self.coefficient = self.rho_g_eta * data.head / 1e6
+            self.effective_turbine_cap = np.minimum(data.turbine_cap, data.power_cap / self.coefficient)
+        else:
+            if getattr(data, "head_sensitivity", None) is None:
+                raise ValueError("Load the sensitivity data before selecting storage_sensitivity")
+            if not np.allclose(data.head_sensitivity["efficiency"], eta, rtol=0., atol=1e-12):
+                raise ValueError("Head sensitivity efficiency must match the physical configuration")
+            self.head_data_status = "assumed_sensitivity_only"
         self.reference_energy = float(24 * data.power_cap.sum())
+
+    def _forebay_levels(self, storage):
+        storage = np.asarray(storage, dtype=np.float64)
+        if storage.shape != (5,) or not np.isfinite(storage).all():
+            raise ValueError("Generation requires a finite five-vector of storage")
+        tolerance = np.maximum(1., 1e-10 * np.abs(storage))
+        if ((storage < self.data.vmin - tolerance) | (storage > self.data.vmax + tolerance)).any():
+            raise InfeasibleCascade("Generation storage violates operating bounds")
+        # Absorb tolerated roundoff only in the elevation lookup. Water balance
+        # and the physical storage vectors are never clipped or changed.
+        return self.data.levels(np.clip(storage, self.data.vmin, self.data.vmax))
+
+    def generation(self, release, storage_start=None, storage_end=None):
+        """Daily mean-head generation shared by transitions and the reference.
+
+        The sensitivity scenario has constant efficiency and a constant combined
+        tailwater/loss offset, so no flow/head root solve is required. Installed
+        capacity is enforced at the modeled daily mean head.
+        """
+        release = np.asarray(release, dtype=np.float64)
+        if (release.ndim < 1 or release.shape[-1] != 5 or
+                not np.isfinite(release).all() or (release < 0).any()):
+            raise ValueError("Generation releases must be finite nonnegative five-vectors")
+        result = {}
+        if self.head_model == "fixed":
+            head = self.data.head.copy()
+            coefficient, cap = self.coefficient, self.effective_turbine_cap
+        else:
+            start_level = self._forebay_levels(storage_start)
+            end_level = self._forebay_levels(storage_end)
+            mean_level = (start_level + end_level) / 2.
+            scenario = self.data.head_sensitivity
+            head = (scenario["reference_net_head_m"] + scenario["head_slope_m_per_m"] *
+                    (mean_level - scenario["assumed_reference_forebay_level_m"]))
+            if not np.isfinite(head).all() or (head <= 0).any():
+                raise ValueError("Calculated net head must be finite and positive")
+            coefficient = self.rho_g_eta * head / 1e6
+            cap = np.minimum(self.data.turbine_cap, self.data.power_cap / coefficient)
+            result["forebay_level_mean_m"] = mean_level
+        turbine = np.minimum(release, cap)
+        power = turbine * coefficient
+        result.update(net_head_m=head, effective_turbine_cap_m3s=cap.copy(),
+                      turbine=turbine, spill=release-turbine, power=power, energy=24.*power)
+        return result
 
     def downstream_intervals(self, storage, external):
         d = self.data
@@ -67,16 +124,14 @@ class ReservoirPhysics:
             else:
                 release[i] = low[i] + actions[i] ** 2 * (high[i] - low[i])
         next_storage = storage + (inflow - release) * self.dt
-        turbine = np.minimum(release, self.effective_turbine_cap)
-        spill = release - turbine
-        power = turbine * self.coefficient
-        energy = 24. * power
         residual = next_storage - storage - (inflow - release) * self.dt
         tolerance = np.maximum(1., 1e-10 * np.abs(storage))
         if ((next_storage < d.vmin - tolerance) | (next_storage > d.vmax + tolerance)).any():
             raise InfeasibleCascade("Storage bound violation after execution")
         if (release < -1e-8).any() or (release > d.release_cap + 1e-8).any():
             raise InfeasibleCascade("Release capacity violation")
+        generated = self.generation(release, storage, next_storage)
+        power, energy = generated["power"], generated["energy"]
         if (np.abs(residual) > tolerance).any() or (power > d.power_cap + 1e-7).any():
             raise AssertionError("Water/energy calculation failed")
         system_residual = next_storage.sum() - storage.sum() - (external.sum() - release[-1]) * self.dt
@@ -84,12 +139,12 @@ class ReservoirPhysics:
             raise AssertionError("Cascade water conservation failed")
         return dict(storage_start=storage.copy(), storage_end=next_storage, inflow=inflow,
                     external=external.copy(), actions=executed_actions, release=release,
-                    turbine=turbine, spill=spill, power=power, energy=energy,
                     low=low, high=high, controls=controls, residual=residual,
                     reward=float(energy.sum() / self.reference_energy),
-                    system_residual=float(system_residual))
+                    system_residual=float(system_residual), **generated)
 
-    def constant_storage(self, external):
+    def constant_storage(self, external, storage=None):
+        """Reference at the explicitly supplied, unchanged annual storage."""
         external = np.asarray(external, dtype=np.float64)
         if (external.ndim < 1 or external.shape[-1] != 5 or
                 not np.isfinite(external).all() or (external < 0).any()):
@@ -97,5 +152,8 @@ class ReservoirPhysics:
         release = np.cumsum(external, axis=-1)
         if (release > self.data.release_cap + 1e-8).any():
             raise InfeasibleCascade("Constant-storage reference exceeds outlet capacities")
-        turbine = np.minimum(release, self.effective_turbine_cap)
-        return release, 24. * self.coefficient * turbine
+        generated = self.generation(release, storage, storage)
+        # Preserve the fixed-head reference's original multiplication order.
+        if self.head_model == "fixed":
+            return release, 24. * self.coefficient * generated["turbine"]
+        return release, generated["energy"]

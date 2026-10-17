@@ -106,9 +106,9 @@ class RolloutAlignmentTests(unittest.TestCase):
         normalization_before = copy.deepcopy(runner.value_normalizer.state_dict())
 
         def record_actor(i, original):
-            def call(obs, hidden, masks):
-                result = original(obs, hidden, masks)
-                actor_calls[i].append((obs.copy(), masks.copy(),
+            def call(obs):
+                result = original(obs)
+                actor_calls[i].append((obs.copy(),
                                        result[0].cpu().numpy().copy(),
                                        result[1].cpu().numpy().copy()))
                 return result
@@ -116,9 +116,9 @@ class RolloutAlignmentTests(unittest.TestCase):
 
         original_critic = runner.critic.get_values
 
-        def record_critic(obs, hidden, masks):
-            result = original_critic(obs, hidden, masks)
-            critic_calls.append((obs.copy(), masks.copy(), result[0].cpu().numpy().copy()))
+        def record_critic(obs):
+            result = original_critic(obs)
+            critic_calls.append((obs.copy(), result.cpu().numpy().copy()))
             return result
 
         from contextlib import ExitStack
@@ -144,15 +144,15 @@ class RolloutAlignmentTests(unittest.TestCase):
             np.testing.assert_array_equal(cb.share_obs[t, 0], row['obs'])
             np.testing.assert_array_equal(cb.share_obs[t + 1, 0], row['next_obs'])
             np.testing.assert_array_equal(cb.rewards[t, 0], row['reward'][0])
-            np.testing.assert_array_equal(cb.value_preds[t], critic_calls[t][2])
+            np.testing.assert_array_equal(cb.value_preds[t], critic_calls[t][1])
             np.testing.assert_array_equal(critic_calls[t][0], cb.share_obs[t])
             self.assertEqual(bool(row['done'].all()), t == length - 1)
             if t:
                 np.testing.assert_array_equal(row['obs'], records[t - 1]['next_obs'])
             for i, b in enumerate(runner.actor_buffer):
-                obs, masks, sampled, log_prob = actor_calls[i][t]
+                obs, sampled, log_prob = actor_calls[i][t]
                 np.testing.assert_array_equal(obs[0], row['obs'])
-                np.testing.assert_array_equal(masks, b.masks[t])
+                self.assertEqual(float(b.masks[t+1,0,0]), float(not row['done'].all()))
                 np.testing.assert_array_equal(sampled[0], row['sampled'][i])
                 np.testing.assert_array_equal(b.obs[t, 0], row['obs'])
                 np.testing.assert_array_equal(b.obs[t + 1, 0], row['next_obs'])
@@ -165,7 +165,7 @@ class RolloutAlignmentTests(unittest.TestCase):
                 else:
                     self.assertEqual(float(b.actions[t, 0, 0]), 0.)
 
-        np.testing.assert_array_equal(cb.value_preds[-1], critic_calls[-1][2])
+        np.testing.assert_array_equal(cb.value_preds[-1], critic_calls[-1][1])
         np.testing.assert_array_equal(critic_calls[-1][0], cb.share_obs[-1])
         self.assertTrue(np.all(cb.share_obs[-1] == 0))
         np.testing.assert_allclose(cb.returns[-2], cb.rewards[-1], atol=1e-6, rtol=0)
@@ -180,8 +180,7 @@ class RolloutAlignmentTests(unittest.TestCase):
             self.assertEqual(float(b.active_masks[-2, 0, 0]), 0.)
             # Same frozen policy, same state/index: initial importance ratio is one.
             with torch.no_grad():
-                lp, _, _ = actor.evaluate_actions(b.obs[:-1, 0], b.rnn_states[0],
-                    b.actions[:, 0], b.masks[:-1, 0])
+                lp, _, _ = actor.evaluate_actions(b.obs[:-1, 0], b.actions[:, 0])
             active = b.active_masks[:-1, 0, 0] > 0
             ratio = np.exp(lp.numpy()[active] - b.action_log_probs[:, 0][active])
             # Batch-size-dependent float32 kernels differ by a few ulps;
@@ -201,11 +200,11 @@ class RolloutAlignmentTests(unittest.TestCase):
             b.update_factor(ids + 1000)
             for batches in (1, length):  # Full-year batch and one sample per batch.
                 seen = []
-                for obs, hidden, actions, masks, active, lp, adv, available, factor in \
+                for obs, actions, masks, active, lp, adv, available, factor in \
                         b.feed_forward_generator_actor(ids + 2000, batches):
                     ix = indices(obs)
                     seen.extend(ix.tolist())
-                    for actual, expected in ((obs, b.obs[ix, 0]), (hidden, b.rnn_states[ix, 0]),
+                    for actual, expected in ((obs, b.obs[ix, 0]),
                             (actions, b.actions[ix, 0]), (masks, b.masks[ix, 0]),
                             (active, b.active_masks[ix, 0]), (lp, b.action_log_probs[ix, 0])):
                         np.testing.assert_array_equal(actual, expected)
@@ -218,11 +217,11 @@ class RolloutAlignmentTests(unittest.TestCase):
                 self.assertEqual(sorted(seen), list(range(length)))
         for batches in (1, length):
             seen = []
-            for obs, hidden, values, returns, masks in cb.feed_forward_generator_critic(batches):
+            for obs, values, returns, masks in cb.feed_forward_generator_critic(batches):
                 ix = indices(obs)
                 seen.extend(ix.tolist())
                 for actual, expected in ((obs, cb.share_obs[ix, 0]),
-                        (hidden, cb.rnn_states_critic[ix, 0]), (values, cb.value_preds[ix, 0]),
+                        (values, cb.value_preds[ix, 0]),
                         (returns, cb.returns[ix, 0]), (masks, cb.masks[ix, 0])):
                     np.testing.assert_array_equal(actual, expected)
             self.assertEqual(sorted(seen), list(range(length)))

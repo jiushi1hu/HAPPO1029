@@ -71,15 +71,9 @@ class OnPolicyHARunner(OnPolicyBaseRunner):
                 self.actor_buffer[agent_id]
                 .obs[:-1]
                 .reshape(-1, *self.actor_buffer[agent_id].obs.shape[2:]),
-                self.actor_buffer[agent_id]
-                .rnn_states[0:1]
-                .reshape(-1, *self.actor_buffer[agent_id].rnn_states.shape[2:]),
                 self.actor_buffer[agent_id].actions.reshape(
                     -1, *self.actor_buffer[agent_id].actions.shape[2:]
                 ),
-                self.actor_buffer[agent_id]
-                .masks[:-1]
-                .reshape(-1, *self.actor_buffer[agent_id].masks.shape[2:]),
                 available_actions,
                 self.actor_buffer[agent_id]
                 .active_masks[:-1]
@@ -101,15 +95,9 @@ class OnPolicyHARunner(OnPolicyBaseRunner):
                 self.actor_buffer[agent_id]
                 .obs[:-1]
                 .reshape(-1, *self.actor_buffer[agent_id].obs.shape[2:]),
-                self.actor_buffer[agent_id]
-                .rnn_states[0:1]
-                .reshape(-1, *self.actor_buffer[agent_id].rnn_states.shape[2:]),
                 self.actor_buffer[agent_id].actions.reshape(
                     -1, *self.actor_buffer[agent_id].actions.shape[2:]
                 ),
-                self.actor_buffer[agent_id]
-                .masks[:-1]
-                .reshape(-1, *self.actor_buffer[agent_id].masks.shape[2:]),
                 available_actions,
                 self.actor_buffer[agent_id]
                 .active_masks[:-1]

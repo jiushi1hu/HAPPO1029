@@ -70,14 +70,10 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         torch.set_num_threads(algo_args["device"]["torch_threads"])
         random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
         torch.use_deterministic_algorithms(True)
-        self.recurrent_n = 1
-        self.rnn_hidden_size = algo_args["model"]["hidden_sizes"][-1]
         self.n_envs = algo_args["train"]["n_rollout_threads"]
         self.length = algo_args["train"]["episode_length"]
         if algo_args["algo"]["gamma"] != 1.:
             raise ValueError("The undiscounted generation objective requires gamma=1")
-        if algo_args["model"]["use_recurrent_policy"] or algo_args["model"]["use_naive_recurrent_policy"]:
-            raise ValueError("The cascade adapter currently supports feed-forward actors only")
         if algo_args["algo"]["share_param"]:
             raise ValueError("The cascade specification requires independent actors")
         for key in ("actor_num_mini_batch", "critic_num_mini_batch"):
@@ -130,19 +126,19 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         obs = np.stack([env.observation() for env in self.envs])
         for b in self.actor_buffer:
             b.step = 0; b.obs[0] = obs
-            b.masks.fill(1); b.active_masks.fill(1); b.rnn_states.fill(0)
+            b.masks.fill(1); b.active_masks.fill(1)
         cb = self.critic_buffer
         cb.step = 0; cb.share_obs[0] = obs
-        cb.masks.fill(1); cb.bad_masks.fill(1); cb.rnn_states_critic.fill(0)
+        cb.masks.fill(1); cb.bad_masks.fill(1)
         energy, forced, largest_residual = np.zeros(self.n_envs), 0, 0.
         for t in range(self.length):
-            actions, log_probs, rnn = [], [], []
+            actions, log_probs = [], []
             for i in range(5):
                 b = self.actor_buffer[i]
-                a, lp, h = self.actor[i].get_actions(b.obs[t], b.rnn_states[t], b.masks[t])
-                actions.append(_t2n(a)); log_probs.append(_t2n(lp)); rnn.append(_t2n(h))
+                a, lp = self.actor[i].get_actions(b.obs[t])
+                actions.append(_t2n(a)); log_probs.append(_t2n(lp))
             actions = np.stack(actions, axis=1)
-            values, hidden = self.critic.get_values(cb.share_obs[t], cb.rnn_states_critic[t], cb.masks[t])
+            values = self.critic.get_values(cb.share_obs[t])
             for e, env in enumerate(self.envs):
                 env.step(actions[e])
                 energy[e] += env.last_transition["energy"].sum()
@@ -156,12 +152,12 @@ class CascadeReservoirRunner(OnPolicyHARunner):
             next_masks = (~done).astype(np.float32)[:, None]
             for i, b in enumerate(self.actor_buffer):
                 lp = np.where(controls[:, i:i+1] > 0, log_probs[i], 0.)
-                b.insert(next_obs, rnn[i], effective_actions[:, i:i+1], lp, next_masks,
+                b.insert(next_obs, effective_actions[:, i:i+1], lp, next_masks,
                          np.ones((self.n_envs, 1), dtype=np.float32))
                 # Controllability belongs to the sampled action at t, not t+1.
                 b.active_masks[t] = controls[:, i:i+1]
             rewards = np.array([[r["reward"]] for r in results], dtype=np.float32)
-            cb.insert(next_obs, _t2n(hidden), _t2n(values), rewards, next_masks,
+            cb.insert(next_obs, _t2n(values), rewards, next_masks,
                       np.ones_like(next_masks))
         self.completed_episodes += 1
         self.sampled_years.append(year)

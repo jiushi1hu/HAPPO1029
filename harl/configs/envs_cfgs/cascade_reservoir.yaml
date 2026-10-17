@@ -1,4 +1,5 @@
-# Approved physical assumptions; source CSVs remain unchanged.
+# Physical assumptions; the variable-head table is a sensitivity scenario.
+head_model: storage_sensitivity  # fixed reproduces the original typical-head model
 reservoir_ids: [WDD, BHT, XLD, XJB, THR]
 level_bounds_m:
   WDD: [945, 975]

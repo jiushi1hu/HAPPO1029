@@ -52,8 +52,8 @@ def fit_metrics(target, prediction):
 @torch.no_grad()
 def actor_distribution(actor, buffer):
     _, _, dist = actor.evaluate_actions(
-        buffer.obs[:-1].reshape(-1, buffer.obs.shape[-1]), buffer.rnn_states[0],
-        buffer.actions.reshape(-1, 1), buffer.masks[:-1].reshape(-1, 1))
+        buffer.obs[:-1].reshape(-1, buffer.obs.shape[-1]),
+        buffer.actions.reshape(-1, 1))
     return type(dist)(logits=dist.logits.clone())
 
 
@@ -79,9 +79,8 @@ def before_update(runner):
 @torch.no_grad()
 def after_update(runner, before):
     cb = runner.critic_buffer
-    prediction, _ = runner.critic.get_values(
-        cb.share_obs[:-1].reshape(-1, cb.share_obs.shape[-1]),
-        cb.rnn_states_critic[0], cb.masks[:-1].reshape(-1,1))
+    prediction = runner.critic.get_values(
+        cb.share_obs[:-1].reshape(-1, cb.share_obs.shape[-1]))
     prediction = prediction.cpu().numpy().reshape(cb.rewards.shape)
     if runner.value_normalizer is not None:
         prediction = runner.value_normalizer.denormalize(prediction)

@@ -149,7 +149,7 @@ class LearningTests(unittest.TestCase):
         def update(sample, value_normalizer=None):
             nonlocal mean_acc, square_acc, weight
             self.assertIs(value_normalizer, r.value_normalizer)
-            obs, hidden, old_values, returns, masks = sample
+            obs, old_values, returns, masks = sample
             ix = r.length-np.rint(obs[:,-1]*366).astype(int)
             np.testing.assert_array_equal(returns, saved_returns[ix,0])
             np.testing.assert_array_equal(old_values, saved_values[ix,0])
@@ -163,7 +163,7 @@ class LearningTests(unittest.TestCase):
             mean = mean_acc/weight.clamp_min(value_normalizer.epsilon)
             variance = (square_acc/weight.clamp_min(value_normalizer.epsilon)-mean.square()).clamp_min(.01)
             normalized = (targets-mean)/variance.sqrt()
-            values, _ = reference.get_values(obs, hidden, masks)
+            values = reference.get_values(obs)
             expected_loss = .5*(values-normalized).square().mean()
             reference.critic_optimizer.zero_grad()
             # Supply the analytic derivative, independently of cal_value_loss().
@@ -220,7 +220,7 @@ class LearningTests(unittest.TestCase):
         entropy = torch.tensor(-.3, requires_grad=True)
         n = len(ratios)
         sample = (np.zeros((n,18), dtype=np.float32),
-                  np.zeros((n,1,16), dtype=np.float32), np.full((n,1), 100, dtype=np.int64),
+                  np.full((n,1), 100, dtype=np.int64),
                   np.ones((n,1), dtype=np.float32), active, np.zeros((n,1), dtype=np.float32),
                   advantages, None, factor)
         # Explicit cases: positive A clips only above the upper bound;
@@ -239,7 +239,7 @@ class LearningTests(unittest.TestCase):
         self.assertAlmostEqual(float(entropy.grad), -actor.entropy_coef, places=7)
         step.assert_called_once()
         # Even an existing Adam state must not advance for an all-forced batch.
-        forced_sample = sample[:4] + (np.zeros_like(active),) + sample[5:]
+        forced_sample = sample[:3] + (np.zeros_like(active),) + sample[4:]
         with patch.object(actor, 'evaluate_actions') as evaluate, \
                 patch.object(actor.actor_optimizer, 'step') as step:
             actor.update(forced_sample)
@@ -259,8 +259,8 @@ class LearningTests(unittest.TestCase):
                 def log_probs(i):
                     b = r.actor_buffer[i]
                     with torch.no_grad():
-                        lp, _, _ = r.actor[i].evaluate_actions(b.obs[:-1,0], b.rnn_states[0],
-                            b.actions[:,0], b.masks[:-1,0], None, b.active_masks[:-1,0])
+                        lp, _, _ = r.actor[i].evaluate_actions(b.obs[:-1,0],
+                            b.actions[:,0], None, b.active_masks[:-1,0])
                     return lp.numpy().reshape(r.length,1,1)
 
                 baseline = [log_probs(i).copy() for i in range(5)]
@@ -271,13 +271,13 @@ class LearningTests(unittest.TestCase):
 
                 def wrap_update(i, original):
                     def update(sample):
-                        obs, _, _, _, active, old_lp, adv, _, factor = sample
+                        obs, _, _, active, old_lp, adv, _, factor = sample
                         ix = r.length - np.rint(obs[:,-1]*366).astype(int)
                         np.testing.assert_array_equal(old_lp, old_stored[i][ix,0])
                         np.testing.assert_allclose(factor, expected_factor[ix,0], rtol=2e-5)
                         with torch.no_grad():
-                            lp, _, _ = r.actor[i].evaluate_actions(*sample[:3], sample[3],
-                                                                  sample[7], active)
+                            lp, _, _ = r.actor[i].evaluate_actions(sample[0], sample[1],
+                                                                  sample[6], active)
                         ratio = np.exp(lp.numpy() - old_lp)
                         active_rows = active[:,0] > 0
                         if calls[i] == 0:
@@ -351,8 +351,8 @@ class LearningTests(unittest.TestCase):
         self.assertEqual(r.critic_buffer.masks[-1, 0, 0], 0.)
         old = []
         for actor, b in zip(r.actor, r.actor_buffer):
-            lp, _, _ = actor.evaluate_actions(b.obs[:-1].reshape(-1,18), b.rnn_states[0],
-                                            b.actions.reshape(-1,1), b.masks[:-1].reshape(-1,1))
+            lp, _, _ = actor.evaluate_actions(b.obs[:-1].reshape(-1,18),
+                                            b.actions.reshape(-1,1))
             old.append(lp.detach().numpy())
             active = b.active_masks[:-1].reshape(-1) > 0
             np.testing.assert_allclose(old[-1][active], b.action_log_probs.reshape(-1,1)[active], atol=1e-6)
@@ -365,8 +365,8 @@ class LearningTests(unittest.TestCase):
         for i in order:
             actor, b = r.actor[i], r.actor_buffer[i]
             np.testing.assert_allclose(b.factor, factor, rtol=2e-5)
-            lp, _, _ = actor.evaluate_actions(b.obs[:-1].reshape(-1,18), b.rnn_states[0],
-                                            b.actions.reshape(-1,1), b.masks[:-1].reshape(-1,1))
+            lp, _, _ = actor.evaluate_actions(b.obs[:-1].reshape(-1,18),
+                                            b.actions.reshape(-1,1))
             factor *= np.where(b.active_masks[:-1]>0, np.exp(lp.detach().numpy()-old[i]).reshape(365,1,1), 1.)
         self.assertTrue(np.isfinite(float(critic["value_loss"])))
         self.assertGreater(float(r.value_normalizer.debiasing_term), 0.)
