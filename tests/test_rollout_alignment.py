@@ -58,7 +58,7 @@ class RolloutAlignmentTests(unittest.TestCase):
 
     def test_hand_calculated_gae_and_terminal_bootstrap(self):
         cfg, _ = load_configuration()
-        args = {**cfg['train'], **cfg['model'], **cfg['algo'], 'episode_length': 3}
+        args = {**cfg['train'], **cfg['model'], **cfg['algo'], 'episode_length': 3, 'gamma': 1.}
         self.assertTrue(args['use_gae'])
         self.assertTrue(args['use_proper_time_limits'])
         for normalized in (False, True):
@@ -86,7 +86,7 @@ class RolloutAlignmentTests(unittest.TestCase):
 
     def test_gae_cannot_cross_an_episode_boundary(self):
         cfg, _ = load_configuration()
-        args = {**cfg['train'], **cfg['model'], **cfg['algo'], 'episode_length': 4}
+        args = {**cfg['train'], **cfg['model'], **cfg['algo'], 'episode_length': 4, 'gamma': 1.}
         cb = OnPolicyCriticBufferEP(args, Box(-np.inf, np.inf, (18,), dtype=np.float32))
         cb.masks[2] = cb.masks[4] = 0.
         cb.rewards[:, 0, 0] = [1., 2., 3., 4.]

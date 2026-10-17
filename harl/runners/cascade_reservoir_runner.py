@@ -16,9 +16,24 @@ from harl.runners.on_policy_ha_runner import OnPolicyHARunner
 from harl.utils.trans_tools import _t2n
 
 
+def validate_discount_factor(value):
+    """Return a finite training discount in [0, 1], including episodic gamma=1."""
+    message = "Discount factor gamma must be finite and between 0 and 1"
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(message)
+    try:
+        gamma = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(message) from exc
+    if not np.isfinite(gamma) or not 0. <= gamma <= 1.:
+        raise ValueError(message)
+    return gamma
+
+
 def configure_calendar(algo_args, data, year=None):
     """Allocate a complete sampled year without padding or dropping leap days."""
     args = copy.deepcopy(algo_args)
+    args["algo"]["gamma"] = validate_discount_factor(args["algo"]["gamma"])
     if args["train"]["n_rollout_threads"] != 1:
         raise ValueError("Annual sampling uses one environment: one year = one episode")
     year = data.training_years[0] if year is None else int(year)
@@ -72,8 +87,6 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         torch.use_deterministic_algorithms(True)
         self.n_envs = algo_args["train"]["n_rollout_threads"]
         self.length = algo_args["train"]["episode_length"]
-        if algo_args["algo"]["gamma"] != 1.:
-            raise ValueError("The undiscounted generation objective requires gamma=1")
         if algo_args["algo"]["share_param"]:
             raise ValueError("The cascade specification requires independent actors")
         for key in ("actor_num_mini_batch", "critic_num_mini_batch"):

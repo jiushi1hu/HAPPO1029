@@ -11,7 +11,7 @@ from examples.train_cascade import load_configuration
 from harl.envs.cascade_reservoir.data_loader import CascadeData
 from harl.envs.cascade_reservoir.evaluation import evaluate_policy
 from harl.envs.cascade_reservoir.diagnostics import (before_update, after_update, validation_report,
-    fit_metrics, parameter_snapshot, parameter_update)
+    fit_metrics, parameter_snapshot, parameter_update, monte_carlo_returns)
 from harl.runners.cascade_reservoir_runner import CascadeReservoirRunner
 
 ROOT=Path(__file__).resolve().parents[1]
@@ -60,7 +60,10 @@ class DiagnosticTests(unittest.TestCase):
                     self.assertLessEqual(a['final_grad_norm_post_clip'],.50001)
                     self.assertTrue(0.<=a['sampled_boundary_fraction']<=1.)
                 self.assertGreater(report['critic_update']['parameter_delta_l2'],0.)
-                self.assertAlmostEqual(report['episode_reward'],float(captured['mc'][0,0,0]))
+                self.assertEqual(report['gamma'],r.critic_buffer.gamma)
+                self.assertAlmostEqual(report['episode_reward'],
+                    float(r.critic_buffer.rewards.astype(np.float64).sum()))
+                self.assertAlmostEqual(report['discounted_episode_reward'],float(captured['mc'][0,0,0]))
                 self.assertTrue(np.isfinite(report['critic_mc_post']['rmse']))
             outcomes.append(dict(actions=actions,actors=[copy.deepcopy(a.actor.state_dict()) for a in r.actor],
                 critic=copy.deepcopy(r.critic.critic.state_dict()),norm=copy.deepcopy(r.value_normalizer.state_dict()),
@@ -101,6 +104,24 @@ class DiagnosticTests(unittest.TestCase):
         self.assertEqual(good['explained_variance'],1.)
         constant=fit_metrics([1.,2.,3.],[2.,2.,2.])
         self.assertEqual(constant['explained_variance'],0.)
+
+    def test_mc_returns_use_selected_gamma_and_stop_at_terminal_boundaries(self):
+        rewards=np.array([1.,2.,3.,4.])[:,None,None]
+        masks=np.array([1.,1.,0.,1.,0.])[:,None,None]
+        for gamma,expected in ((0.,[1.,2.,3.,4.]),(.5,[2.,2.,5.,4.]),(1.,[3.,2.,7.,4.])):
+            with self.subTest(gamma=gamma):
+                np.testing.assert_array_equal(monte_carlo_returns(rewards,masks,gamma)[:,0,0],expected)
+
+    def test_real_rollout_mc_diagnostics_match_discounted_rewards(self):
+        r=self.runner()
+        r.collect_episode(1968)
+        before=before_update(r)
+        cb=r.critic_buffer
+        rewards=cb.rewards.astype(np.float64)
+        expected=np.stack([(rewards[t:] *
+            (cb.gamma ** np.arange(len(rewards)-t))[:,None,None]).sum(axis=0)
+            for t in range(len(rewards))])
+        np.testing.assert_allclose(before['mc'],expected,rtol=1e-12,atol=1e-12)
 
     def test_nonfinite_rollout_is_rejected_with_location(self):
         r=self.runner();r.collect_episode(1965)

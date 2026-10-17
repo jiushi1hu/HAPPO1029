@@ -16,7 +16,7 @@ import yaml
 from harl.envs.cascade_reservoir.data_loader import CascadeData, HEAD_MODELS
 from harl.envs.cascade_reservoir.reservoir_physics import ReservoirPhysics
 from harl.envs.cascade_reservoir.evaluation import reference_summary
-from harl.runners.cascade_reservoir_runner import CascadeReservoirRunner
+from harl.runners.cascade_reservoir_runner import CascadeReservoirRunner, validate_discount_factor
 
 
 def merge(base, override):
@@ -41,7 +41,9 @@ def main():
     parser.add_argument('--action-distribution', choices=['categorical'], help='Categorical discrete indices')
     parser.add_argument('--action-bins', type=int, help='Number of discrete choices per reservoir (default: 200)')
     parser.add_argument("--seeds", nargs="+", type=int)
-    parser.add_argument("--gae-lambda", type=float, help="GAE trace parameter; 1 uses full realized annual returns")
+    parser.add_argument("--gamma", type=float, help="Training discount factor in [0, 1]; overrides YAML")
+    parser.add_argument("--gae-lambda", type=float,
+                        help="GAE trace parameter; 1 uses full realized returns with the selected gamma")
     parser.add_argument("--head-model", choices=HEAD_MODELS,
                         help="Storage-dependent assumed head scenario, or the original fixed head")
     parser.add_argument("--check-data-only", action="store_true")
@@ -54,6 +56,11 @@ def main():
     parser.add_argument("--skip-final-test", action="store_true", help="Skip typical-year tests during diagnostic tuning")
     args = parser.parse_args()
     config, physical = load_configuration()
+    try:
+        config["algo"]["gamma"] = validate_discount_factor(
+            config["algo"]["gamma"] if args.gamma is None else args.gamma)
+    except ValueError as exc:
+        parser.error(str(exc))
     if args.head_model is not None:
         physical["head_model"] = args.head_model
     if args.action_distribution is not None:
@@ -91,7 +98,9 @@ def main():
                              if physics.head_model == "storage_sensitivity" else "constant typical net head"),
         action_distribution=config['model']['action_distribution'],
         action_bins=config['model']['action_bins'],
+        gamma=config["algo"]["gamma"],
         gae_lambda=config["algo"]["gae_lambda"],
+        evaluation_metric="undiscounted annual generation",
         result_storage="memory only"), indent=2), flush=True)
     if args.check_data_only:
         print("Data checks passed; no training or evaluation was run.")
@@ -115,7 +124,8 @@ def main():
                 year, label, values.mean(), values.std(ddof=1) if len(values) > 1 else 0.), flush=True)
         if args.skip_final_test:
             print("Typical-year final tests skipped for this diagnostic run.", flush=True)
-        payload = dict(validation_years=list(data.validation_years), test_years=list(data.test_years),
+        payload = dict(gamma=config["algo"]["gamma"], gae_lambda=config["algo"]["gae_lambda"],
+                       validation_years=list(data.validation_years), test_years=list(data.test_years),
                        test_labels=list(data.test_labels), seeds=exp["seeds"],
                        histories=[r.validation_history for r in runners], tests=tests,
                        references=reference_summary(data, physics, data.validation_years +

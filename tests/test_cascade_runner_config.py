@@ -1,12 +1,13 @@
 """Runner options must have the same execution semantics as the HARL runner."""
 import copy
 import io
-from contextlib import redirect_stdout
+from contextlib import redirect_stdout, redirect_stderr
+import json
 from pathlib import Path
 import unittest
 from unittest.mock import patch
 import numpy as np
-from examples.train_cascade import load_configuration
+from examples.train_cascade import load_configuration, main
 from harl.envs.cascade_reservoir.data_loader import CascadeData
 from harl.runners.cascade_reservoir_runner import CascadeReservoirRunner
 from harl.runners.on_policy_ha_runner import OnPolicyHARunner
@@ -37,6 +38,44 @@ class RunnerConfigurationTests(unittest.TestCase):
             actor.train = spy
         r.train()
         self.assertEqual(seen, list(range(5)))
+
+    def test_gamma_is_validated_for_direct_runner_configuration(self):
+        for gamma in (-.01, 1.01, np.nan, np.inf, -np.inf, None, True, 'invalid'):
+            with self.subTest(gamma=gamma):
+                cfg = copy.deepcopy(self.cfg)
+                cfg['algo']['gamma'] = gamma
+                with self.assertRaisesRegex(ValueError, 'gamma must be finite and between 0 and 1'):
+                    CascadeReservoirRunner(self.data, self.physical, cfg, 5)
+
+    def test_cli_gamma_overrides_yaml_and_is_reported(self):
+        for override in (None, 0., .99, 1.):
+            with self.subTest(override=override):
+                cfg = copy.deepcopy(self.cfg)
+                cfg['algo']['gamma'] = .9
+                argv = ['train_cascade.py', '--check-data-only']
+                if override is not None:
+                    argv += ['--gamma', str(override)]
+                output = io.StringIO()
+                with patch('sys.argv', argv), \
+                     patch('examples.train_cascade.load_configuration', return_value=(cfg, self.physical)), \
+                     patch('examples.train_cascade.CascadeData', return_value=self.data), \
+                     redirect_stdout(output):
+                    main()
+                startup, _ = json.JSONDecoder().raw_decode(output.getvalue())
+                self.assertEqual(startup['gamma'], .9 if override is None else override)
+                self.assertEqual(startup['evaluation_metric'], 'undiscounted annual generation')
+
+    def test_cli_rejects_invalid_gamma_before_loading_data(self):
+        for value in ('-.01', '1.01', 'nan', 'inf', '-inf'):
+            with self.subTest(value=value), patch('sys.argv', [
+                    'train_cascade.py', '--check-data-only', '--gamma='+value]), \
+                 patch('examples.train_cascade.CascadeData') as load, \
+                 redirect_stderr(io.StringIO()) as error:
+                with self.assertRaises(SystemExit) as failure:
+                    main()
+                self.assertEqual(failure.exception.code, 2)
+                self.assertIn('gamma must be finite and between 0 and 1', error.getvalue())
+                load.assert_not_called()
 
     def test_actor_and_critic_learning_rates_follow_decay_option(self):
         for enabled in [False, True]:

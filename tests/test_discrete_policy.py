@@ -40,19 +40,28 @@ class DiscretePolicyTests(unittest.TestCase):
         layer = ACTLayer(Box(-1., 1., (1,), dtype=np.float32), 4, 'orthogonal_', .01, args)
         self.assertIsInstance(layer.action_out(torch.zeros(1, 4)), FixedNormal)
 
-    def test_lambda_one_uses_complete_annual_return_without_critic_bootstrap(self):
+    def test_lambda_one_uses_selected_discount_without_critic_bootstrap(self):
         cfg, physical = load_configuration()
         cfg['algo']['gae_lambda'] = 1.
         cfg['model']['hidden_sizes'] = [16, 16]
         data = CascadeData(Path(__file__).resolve().parents[1] / 'data/cascade_reservoir_new',
                            physical, cfg['experiment'])
-        runner = CascadeReservoirRunner(data, physical, cfg, 1)
-        runner.value_normalizer.update(np.array([[20.], [40.]], dtype=np.float32))
-        runner.collect_episode(1965)
-        rewards = runner.critic_buffer.rewards
-        expected = np.cumsum(rewards[::-1].astype(np.float64), axis=0)[::-1]
-        np.testing.assert_allclose(runner.critic_buffer.returns[:-1], expected,
-                                   rtol=1e-5, atol=1e-4)
+        for gamma, year in ((0., 1965), (.99, 1968), (1., 1965)):
+            with self.subTest(gamma=gamma, year=year):
+                cfg['algo']['gamma'] = gamma
+                runner = CascadeReservoirRunner(data, physical, cfg, 1)
+                runner.value_normalizer.update(np.array([[20.], [40.]], dtype=np.float32))
+                runner.collect_episode(year)
+                cb = runner.critic_buffer
+                self.assertEqual(cb.gamma, gamma)
+                rewards = cb.rewards.astype(np.float64)
+                # Independent forward weighted sum, including all leap-year days.
+                expected = np.stack([(rewards[t:] *
+                    (gamma ** np.arange(len(rewards)-t))[:, None, None]).sum(axis=0)
+                    for t in range(len(rewards))])
+                np.testing.assert_allclose(cb.returns[:-1], expected, rtol=1e-5, atol=1e-4)
+                np.testing.assert_allclose(runner.envs[0].storage, data.initial_storage(year),
+                                           rtol=0., atol=1e-3)
 
 
 if __name__ == '__main__':

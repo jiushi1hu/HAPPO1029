@@ -49,6 +49,24 @@ def fit_metrics(target, prediction):
                     float(1.-np.var(target-prediction)/variance))
 
 
+def monte_carlo_returns(rewards, masks, gamma):
+    """Realized discounted reward-to-go, with no critic bootstrap.
+
+    The calendar rollout ends at a true terminal state. Masks also keep an
+    internal terminal boundary from leaking rewards into the preceding episode.
+    """
+    rewards = np.asarray(rewards, dtype=np.float64)
+    masks = np.asarray(masks, dtype=np.float64)
+    if gamma == 1. and np.all(masks[1:-1] == 1.):
+        return np.cumsum(rewards[::-1], axis=0)[::-1].copy()
+    returns = np.empty_like(rewards)
+    remaining = np.zeros_like(rewards[0])
+    for t in reversed(range(len(rewards))):
+        remaining = rewards[t] + gamma * masks[t+1] * remaining
+        returns[t] = remaining
+    return returns
+
+
 @torch.no_grad()
 def actor_distribution(actor, buffer):
     _, _, dist = actor.evaluate_actions(
@@ -68,8 +86,7 @@ def before_update(runner):
     prediction = cb.value_preds[:-1].copy()
     if runner.value_normalizer is not None:
         prediction = runner.value_normalizer.denormalize(prediction)
-    # Full realized on-policy return; unlike GAE, it has no critic bootstrap.
-    mc = np.cumsum(cb.rewards[::-1].astype(np.float64), axis=0)[::-1].copy()
+    mc = monte_carlo_returns(cb.rewards, cb.masks, cb.gamma)
     return dict(mc=mc, prediction=prediction,
                 actor_parameters=[parameter_snapshot(a.actor) for a in runner.actor],
                 critic_parameters=parameter_snapshot(runner.critic.critic),
@@ -86,7 +103,9 @@ def after_update(runner, before):
         prediction = runner.value_normalizer.denormalize(prediction)
     require_finite('post-update values', prediction)
     result = dict(episode=runner.iteration, sampled_year=runner.sampled_years[-1],
+        gamma=float(cb.gamma),
         episode_reward=float(cb.rewards.astype(np.float64).sum()),
+        discounted_episode_reward=float(before['mc'][0,0,0]),
         episode_energy_TWh=runner.last_rollout['episode_energy_TWh'],
         critic_update=parameter_update(runner.critic.critic, before['critic_parameters']),
         critic_mc_pre=fit_metrics(before['mc'], before['prediction']),
@@ -134,7 +153,7 @@ def print_update_window(runner, window=10):
         values=[r[key][metric] for r in rows if r[key][metric] is not None]
         return float(np.mean(values)) if values else None
     active=[a for r in rows for a in r['actors'] if a['active_samples']]
-    summary=dict(episode=runner.iteration,window_episodes=len(rows),
+    summary=dict(episode=runner.iteration,window_episodes=len(rows),gamma=rows[-1]['gamma'],
         sampled_years=[r['sampled_year'] for r in rows],
         mc_rmse_pre=avg('critic_mc_pre','rmse'),mc_rmse_post=avg('critic_mc_post','rmse'),
         mc_explained_variance_post=avg('critic_mc_post','explained_variance'),
@@ -151,6 +170,7 @@ def print_update_window(runner, window=10):
     summary['gradient_clip_threshold']=float(runner.algo_args['algo']['max_grad_norm'])
     summary['critic_grad_norm_pre_clip_mean']=float(np.mean([r['critic_critic_grad_norm'] for r in training]))
     summary['last_episode_reward']=rows[-1]['episode_reward']
+    summary['last_discounted_episode_reward']=rows[-1]['discounted_episode_reward']
     summary['last_episode_energy_TWh']=rows[-1]['episode_energy_TWh']
     summary['last_critic_update']=rows[-1]['critic_update']
     summary['last_training_metrics']={k:v for k,v in training[-1].items()
