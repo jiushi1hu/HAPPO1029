@@ -57,9 +57,8 @@ def comparison_data(payload):
     return reference, label, 'seasonal constraints' if seasonal else 'global storage bounds'
 
 
-def make_figure(payload):
-    # Tests may explicitly select Agg before calling this function.
-    import matplotlib.pyplot as plt
+def validation_series(payload, metric):
+    """Align validation checkpoints by episode, including the untrained point."""
     seeds = payload["seeds"]
     histories = payload["histories"]
     if len(seeds) != len(histories) or not seeds:
@@ -71,10 +70,19 @@ def make_figure(payload):
     for history in histories:
         if not np.array_equal(grid, [r["episode"] for r in history]):
             raise ValueError("Seeds must have matching episode checkpoints")
-        values.append([r["mean_TWh"] for r in history])
+        if any(metric not in r for r in history):
+            raise ValueError('Validation plot requires recorded '+metric+' values')
+        values.append([r[metric] for r in history])
     values = np.asarray(values, dtype=float)
     if not np.isfinite(values).all():
-        raise ValueError("Non-finite validation energy")
+        raise ValueError('Non-finite validation metric: '+metric)
+    return seeds, grid, values
+
+
+def make_figure(payload):
+    # Tests may explicitly select Agg before calling this function.
+    import matplotlib.pyplot as plt
+    seeds, grid, values = validation_series(payload, 'mean_TWh')
     mean = values.mean(axis=0)
     sd = values.std(axis=0, ddof=1) if len(seeds) > 1 else np.zeros_like(mean)
     reference, reference_label, operating_mode = comparison_data(payload)
@@ -119,6 +127,29 @@ def make_figure(payload):
     bx.set(title="Final typical-year tests (user-defined categories)", ylabel="Annual generation (TWh)")
     bx.legend(frameon=False, fontsize=9); bx.grid(axis="y", alpha=.2)
     fig.suptitle("Five independent HAPPO actors | daily scale | "+operating_mode, fontsize=13)
+    return fig
+
+
+def make_validation_reward_figure(payload):
+    """Plot recorded, undiscounted validation returns used for model selection."""
+    import matplotlib.pyplot as plt
+    seeds, grid, values = validation_series(payload, 'mean_reward')
+    mean = values.mean(axis=0)
+    fig, ax = plt.subplots(figsize=(10,6), constrained_layout=True)
+    fig.canvas.manager.set_window_title('HAPPO validation net reward')
+    for seed, line in zip(seeds, values):
+        ax.plot(grid, line, alpha=.4, lw=.9, label='Seed {}'.format(seed))
+    ax.plot(grid, mean, color='#087f8c', lw=2, marker='o', ms=3, label='Validation mean')
+    if len(seeds) > 1:
+        sd = values.std(axis=0, ddof=1)
+        ax.fill_between(grid, mean-sd, mean+sd, color='#087f8c', alpha=.15,
+                        label='Seed +/-1 SD')
+    years = payload['validation_years']
+    ax.set(title='{}-{} mean annual validation net reward'.format(min(years),max(years)),
+           xlabel='Training episodes (one episode = one randomly sampled year)',
+           ylabel='Undiscounted annual net reward (reward units)')
+    ax.grid(alpha=.2)
+    ax.legend(frameon=False, fontsize=9, ncol=2)
     return fig
 
 
@@ -217,6 +248,8 @@ def main():
         return
     payload = json.load(sys.stdin)
     make_figure(payload)
+    if payload.get('reward_penalties',{}).get('enabled',False):
+        make_validation_reward_figure(payload)
     if args.plot_details:
         make_training_figures(payload)
     import matplotlib.pyplot as plt

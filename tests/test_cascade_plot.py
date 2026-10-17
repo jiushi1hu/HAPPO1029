@@ -9,10 +9,52 @@ from unittest.mock import patch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from examples.plot_cascade import make_figure, make_training_figures, main
+from examples.plot_cascade import make_figure, make_validation_reward_figure, make_training_figures, main
+import numpy as np
 
 
 class PlotTests(unittest.TestCase):
+    def validation_reward_payload(self):
+        return dict(seeds=[1,2],validation_years=list(range(2020,2025)),
+            histories=[[dict(episode=e,training_steps=steps,mean_reward=r,mean_TWh=100.)
+                        for e,steps,r in zip((0,10,20),(0,3650,7300+i),rewards)]
+                       for i,rewards in enumerate(((2.,6.,-2.),(4.,10.,-6.)))])
+
+    def test_validation_reward_uses_recorded_returns_and_sample_sd(self):
+        payload=self.validation_reward_payload()
+        fig=make_validation_reward_figure(payload);ax=fig.axes[0]
+        np.testing.assert_array_equal(ax.lines[-1].get_xdata(),[0,10,20])
+        np.testing.assert_array_equal(ax.lines[-1].get_ydata(),[3.,8.,-4.])
+        for line,expected in zip(ax.lines[:2],([2.,6.,-2.],[4.,10.,-6.])):
+            np.testing.assert_array_equal(line.get_ydata(),expected)
+        vertices=ax.collections[0].get_paths()[0].vertices
+        for x,mean,sd in zip((0,10,20),(3.,8.,-4.),np.sqrt(2.)*np.array([1.,2.,2.])):
+            y=vertices[vertices[:,0]==x,1]
+            self.assertAlmostEqual(y.min(),mean-sd)
+            self.assertAlmostEqual(y.max(),mean+sd)
+        self.assertIn('2020-2024',ax.get_title())
+        self.assertIn('Undiscounted',ax.get_ylabel())
+        self.assertIn('Seed +/-1 SD',ax.get_legend_handles_labels()[1])
+        self.assertTrue(all(line.get_linestyle()!='--' for line in ax.lines))
+        self.assertLess(ax.get_ylim()[0],-4.)
+        plt.close(fig)
+
+    def test_validation_reward_single_seed_and_invalid_inputs(self):
+        payload=self.validation_reward_payload()
+        single=dict(payload,seeds=[1],histories=payload['histories'][:1])
+        fig=make_validation_reward_figure(single)
+        self.assertEqual(len(fig.axes[0].collections),0)
+        plt.close(fig)
+        for issue in ('missing_reward','nonfinite','mismatched_checkpoints','empty','missing_seed'):
+            bad=copy.deepcopy(payload)
+            if issue=='missing_reward':del bad['histories'][0][0]['mean_reward']
+            elif issue=='nonfinite':bad['histories'][0][0]['mean_reward']=float('nan')
+            elif issue=='mismatched_checkpoints':bad['histories'][1][1]['episode']=11
+            elif issue=='empty':bad['histories']=[[],[]]
+            else:bad['seeds']=[1]
+            with self.subTest(issue=issue),self.assertRaises(ValueError):
+                make_validation_reward_figure(bad)
+
     def seasonal_payload(self):
         metadata=dict(seasonal_constraints=True,action_bins=37,head_model='storage_sensitivity',
                       head_data_status='assumed_sensitivity_only',terminal_storage_mode='initial',
@@ -98,6 +140,34 @@ class PlotTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'same reward penalties'):make_figure(bad)
         payload['reward_penalties']={'enabled':False}
         with self.assertRaisesRegex(ValueError,'same reward penalties'):make_figure(payload)
+
+    def test_validation_reward_window_is_opened_with_and_without_plot_details(self):
+        payload=self.seasonal_payload()
+        penalties=dict(enabled=True,target_band_weight=.1,daily_rise_weight=.1,daily_fall_weight=.1)
+        payload['reward_penalties']=penalties
+        payload['histories'][0][0]['mean_reward']=7.
+        for row in payload['references']+payload['tests']+payload['histories'][0][0]['years']:
+            row.update(reward_penalties=dict(penalties),episode_reward=7.)
+        metrics=dict(iteration=1,episode_energy_TWh=10.,episode_reward=3.,critic_value_loss=.1)
+        for i in range(5):
+            metrics.update({'actor{}_policy_loss'.format(i):-.01,
+                            'actor{}_dist_entropy'.format(i):1.,
+                            'actor{}_actor_grad_norm'.format(i):.2})
+        payload.update(training_histories=[[metrics]],reference_energy_MWh=1624800.)
+        for details in (False,True):
+            plt.close('all')
+            argv=['plot_cascade.py']+(['--plot-details'] if details else [])
+            with self.subTest(details=details),patch('matplotlib.figure.Figure.savefig') as save, \
+                 patch('examples.plot_cascade.select_interactive_backend',return_value='Agg'), \
+                 patch('sys.argv',argv),patch('sys.stdin',io.StringIO(json.dumps(payload))), \
+                 patch('matplotlib.pyplot.show') as show:
+                main()
+                self.assertEqual(len(plt.get_fignums()),5 if details else 2)
+                titles=[plt.figure(n).axes[0].get_title() for n in plt.get_fignums()]
+                self.assertIn('2020-2020 mean annual validation net reward',titles)
+                show.assert_called_once_with(block=True)
+                save.assert_not_called()
+            plt.close('all')
 
     def test_reward_plot_uses_actual_penalized_return_and_requires_it(self):
         rows=[]
