@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from gym.spaces import Box, Discrete
 
-from examples.train_cascade import load_configuration
+from cascade_test_utils import load_configuration
 from harl.envs.cascade_reservoir.data_loader import CascadeData
 from harl.models.base.act import ACTLayer
 from harl.models.base.distributions import FixedCategorical, FixedNormal

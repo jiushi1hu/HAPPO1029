@@ -14,6 +14,49 @@ def select_interactive_backend():
     return backend
 
 
+def comparison_data(payload):
+    """Reject mixed operating modes rather than plotting an unfair comparison."""
+    seasonal = payload.get('seasonal_constraints', False)
+    if not isinstance(seasonal, bool):
+        raise ValueError('seasonal_constraints must be a boolean')
+    kind = 'seasonal_target_tracking' if seasonal else 'constant_storage'
+    if payload.get('reference_type', kind) != kind:
+        raise ValueError('Reference type does not match operating mode')
+    label = payload.get('reference_label', 'Seasonal rule reference' if seasonal else 'Constant-storage reference')
+    penalties = payload.get('reward_penalties',{'enabled':False})
+    reference = {}
+    rows = list(payload['references']) + list(payload['tests'])
+    for history in payload['histories']:
+        rows.extend(row for checkpoint in history for row in checkpoint.get('years', []))
+    for row in rows:
+        row_penalties = row.get('reward_penalties',{'enabled':False})
+        if (row_penalties.get('enabled',False) != penalties.get('enabled',False) or
+                penalties.get('enabled',False) and row_penalties != penalties):
+            raise ValueError('Policy and reference must use the same reward penalties')
+        if row.get('seasonal_constraints', False) != seasonal:
+            raise ValueError('Policy and reference must use the same seasonal constraints')
+        if seasonal and row.get('action_bins') != payload.get('action_bins'):
+            raise ValueError('Policy and reference must use the same action grid')
+        for key in ('head_model', 'head_data_status'):
+            if key in payload and row.get(key) != payload[key]:
+                raise ValueError('Policy and reference must use the same '+key)
+        if seasonal and row.get('terminal_storage_mode') != payload.get('terminal_storage_mode'):
+            raise ValueError('Policy and reference must use the same terminal storage mode')
+        if row.get('feasible', True) is not True or row.get('violation_count', 0) != 0:
+            raise ValueError('Cannot compare infeasible evaluation trajectories')
+    for row in payload['references']:
+        year = row['year']
+        if year in reference or not np.isfinite(row['energy_TWh']):
+            raise ValueError('Reference years must be unique with finite energy')
+        if row.get('reference_type', kind) != kind:
+            raise ValueError('Mixed reference types')
+        reference[year] = row['energy_TWh']
+    required = list(payload['validation_years']) + (list(payload['test_years']) if payload['tests'] else [])
+    if not required or any(year not in reference for year in required):
+        raise ValueError('Reference missing for an evaluated year')
+    return reference, label, 'seasonal constraints' if seasonal else 'global storage bounds'
+
+
 def make_figure(payload):
     # Tests may explicitly select Agg before calling this function.
     import matplotlib.pyplot as plt
@@ -34,7 +77,7 @@ def make_figure(payload):
         raise ValueError("Non-finite validation energy")
     mean = values.mean(axis=0)
     sd = values.std(axis=0, ddof=1) if len(seeds) > 1 else np.zeros_like(mean)
-    reference = {r["year"]: r["energy_TWh"] for r in payload["references"]}
+    reference, reference_label, operating_mode = comparison_data(payload)
     fig, (ax, bx) = plt.subplots(1, 2, figsize=(14, 6), constrained_layout=True)
     fig.canvas.manager.set_window_title("Five-reservoir HAPPO results")
     for line in values:
@@ -42,16 +85,18 @@ def make_figure(payload):
     ax.plot(grid, mean, color="#087f8c", marker="o", ms=3, label="Validation mean")
     if len(seeds) > 1:
         ax.fill_between(grid, mean-sd, mean+sd, color="#087f8c", alpha=.15, label="Seed +/-1 SD")
-    ax.axhline(np.mean([reference[y] for y in payload["validation_years"]]),
-               color="#bb6c22", ls="--", label="Constant-storage reference")
-    ax.set(title="2020-2024 mean annual validation generation",
+    years = payload['validation_years']
+    year_label = '{}-{}'.format(min(years), max(years))
+    ax.set(title=year_label+" mean annual validation generation",
            xlabel="Training episodes (one episode = one randomly sampled year)", ylabel="Generation (TWh/year)")
     ax.legend(frameon=False, fontsize=9); ax.grid(axis="y", alpha=.2)
+    if payload.get('reward_penalties',{}).get('enabled',False):
+        operating_mode += ' | selected by penalized return'
     if not payload["tests"]:
         bx.axis("off")
         bx.text(.5,.5,"Final typical-year tests skipped\n(diagnostic run)",
                 ha="center",va="center",transform=bx.transAxes,fontsize=14)
-        fig.suptitle("Five-reservoir HAPPO | validation diagnostics",fontsize=13)
+        fig.suptitle("Five-reservoir HAPPO | "+operating_mode+" | validation diagnostics",fontsize=13)
         return fig
     test_values = []
     for year, label in zip(payload["test_years"], payload["test_labels"]):
@@ -67,13 +112,13 @@ def make_figure(payload):
     bx.bar(positions-.18, test_values.mean(axis=1), .36, yerr=test_sd,
            capsize=3, color="#087f8c", label="Selected HAPPO (seed SD)")
     bx.bar(positions+.18, [reference[y] for y in payload["test_years"]], .36,
-           color="#bb6c22", label="Constant-storage reference")
+           color="#bb6c22", label=reference_label)
     bx.set_xticks(positions)
     bx.set_xticklabels([str(y)+"\n"+label.replace("_", "\n") for y,label in
                         zip(payload["test_years"], payload["test_labels"])], fontsize=9)
     bx.set(title="Final typical-year tests (user-defined categories)", ylabel="Annual generation (TWh)")
     bx.legend(frameon=False, fontsize=9); bx.grid(axis="y", alpha=.2)
-    fig.suptitle("Five independent HAPPO actors | daily scale | quadratic release mapping", fontsize=13)
+    fig.suptitle("Five independent HAPPO actors | daily scale | "+operating_mode, fontsize=13)
     return fig
 
 
@@ -123,12 +168,18 @@ def make_training_figures(payload, window=20):
         ax.legend(fontsize=8)
 
     energy = values('episode_energy_TWh')
+    if all('episode_reward' in row for rows in histories for row in rows):
+        returns = values('episode_reward')
+    elif payload.get('reward_penalties',{}).get('enabled',False):
+        raise ValueError('Penalized reward plots require actual episode_reward values')
+    else:
+        # Backward compatibility for generation-only historical payloads.
+        returns = energy*1e6/reference
     reward_fig, ax = plt.subplots(figsize=(10,6),constrained_layout=True)
     reward_fig.canvas.manager.set_window_title('HAPPO training reward')
-    # The existing reward is daily cascade MWh / reference_energy_MWh;
-    # summing over the year gives exactly this energy-to-return conversion.
-    draw(ax,energy*1e6/reference,'{}-episode trailing mean'.format(window),show_raw=True)
-    ax.set(title='Stochastic training return | sampled training years',
+    draw(ax,returns,'{}-episode trailing mean'.format(window),show_raw=True)
+    objective = 'penalized return' if payload.get('reward_penalties',{}).get('enabled',False) else 'return'
+    ax.set(title='Stochastic training '+objective+' | sampled training years',
            ylabel='Episode return (sum of daily rewards)')
 
     energy_fig, ax = plt.subplots(figsize=(10,6),constrained_layout=True)

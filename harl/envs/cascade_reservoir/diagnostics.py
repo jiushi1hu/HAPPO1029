@@ -111,9 +111,17 @@ def after_update(runner, before):
         critic_mc_pre=fit_metrics(before['mc'], before['prediction']),
         critic_mc_post=fit_metrics(before['mc'], prediction),
         critic_gae_post=fit_metrics(cb.returns[:-1], prediction),
-        predicted_start_return_TWh=float(before['prediction'][0,0,0]*runner.envs[0].physics.reference_energy/1e6),
-        realized_sampled_return_TWh=float(before['mc'][0,0,0]*runner.envs[0].physics.reference_energy/1e6),
         actors=[])
+    if runner.reward_settings['enabled']:
+        result.update(predicted_start_return_reward_units=float(before['prediction'][0,0,0]),
+            realized_sampled_return_reward_units=float(before['mc'][0,0,0]),
+            episode_penalty=runner.last_reward_metrics['episode_penalty'],
+            episode_generation_reward=runner.last_reward_metrics['episode_generation_reward'],
+            episode_penalty_components={k:runner.last_reward_metrics['episode_penalty_'+k]
+                for k in ('target_band','daily_rise','daily_fall')})
+    else:
+        result.update(predicted_start_return_TWh=float(before['prediction'][0,0,0]*runner.envs[0].physics.reference_energy/1e6),
+            realized_sampled_return_TWh=float(before['mc'][0,0,0]*runner.envs[0].physics.reference_energy/1e6))
     for i,(actor,buffer,old) in enumerate(zip(runner.actor, runner.actor_buffer,before['distributions'])):
         new = actor_distribution(actor,buffer)
         update = parameter_update(actor.actor, before['actor_parameters'][i])
@@ -158,13 +166,19 @@ def print_update_window(runner, window=10):
         mc_rmse_pre=avg('critic_mc_pre','rmse'),mc_rmse_post=avg('critic_mc_post','rmse'),
         mc_explained_variance_post=avg('critic_mc_post','explained_variance'),
         gae_explained_variance_post=avg('critic_gae_post','explained_variance'),
-        predicted_start_return_TWh=float(np.mean([r['predicted_start_return_TWh'] for r in rows])),
-        realized_sampled_return_TWh=float(np.mean([r['realized_sampled_return_TWh'] for r in rows])),
         max_actor_policy_kl=max((a['policy_kl'] for a in active),default=0.),
         mean_actor_clip_fraction=float(np.mean([a['clip_fraction'] for a in active])) if active else 0.,
         ratio_min=min((a['ratio_min'] for a in active),default=1.),
         ratio_max=max((a['ratio_max'] for a in active),default=1.),
         last_actors=rows[-1]['actors'])
+    suffix = 'reward_units' if runner.reward_settings['enabled'] else 'TWh'
+    for prefix in ('predicted_start_return_', 'realized_sampled_return_'):
+        key = prefix+suffix
+        summary[key] = float(np.mean([r[key] for r in rows]))
+    if runner.reward_settings['enabled']:
+        summary['last_episode_penalty'] = rows[-1]['episode_penalty']
+        summary['last_episode_generation_reward'] = rows[-1]['episode_generation_reward']
+        summary['last_episode_penalty_components'] = rows[-1]['episode_penalty_components']
     # Existing grad norms are measured BEFORE clipping, not applied update sizes.
     training=runner.training_history[-window:]
     summary['gradient_clip_threshold']=float(runner.algo_args['algo']['max_grad_norm'])
@@ -184,20 +198,29 @@ def validation_report(runner, deterministic_rows):
     """Compare deterministic actions with sampled policy, preserving RNG state."""
     repeats=int(runner.algo_args['experiment'].get('diagnostic_stochastic_repeats',3))
     samples=[]
+    reward_samples=[]
     for repeat in range(repeats):
-        values=[]
+        values=[]; rewards=[]
         for year in runner.data.validation_years:
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(1000000+runner.seed*100000+repeat*10000+year)
                 row=evaluate_policy(runner.actor,runner.data,runner.physical_config,year,
                     runner.seed,runner.iteration,runner.training_steps,deterministic=False)
             values.append(row['energy_TWh'])
+            if runner.reward_settings['enabled']:
+                rewards.append(row['episode_reward'])
         samples.append(float(np.mean(values)))
+        if rewards:reward_samples.append(float(np.mean(rewards)))
     report=dict(episode=runner.iteration,
         deterministic_mean_TWh=float(np.mean([r['energy_TWh'] for r in deterministic_rows])),
         stochastic_mean_TWh=float(np.mean(samples)),
         stochastic_repeat_means_TWh=samples,
         stochastic_repeat_sd_TWh=float(np.std(samples,ddof=1)) if repeats>1 else 0.,
         years=deterministic_rows)
+    if runner.reward_settings['enabled']:
+        report.update(deterministic_mean_reward=float(np.mean([r['episode_reward'] for r in deterministic_rows])),
+            stochastic_mean_reward=float(np.mean(reward_samples)),
+            stochastic_repeat_means_reward=reward_samples,
+            stochastic_repeat_sd_reward=float(np.std(reward_samples,ddof=1)) if repeats>1 else 0.)
     print('DIAG_VALIDATION '+json.dumps(report),flush=True)
     return report

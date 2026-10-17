@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 import numpy as np
 import torch
-from examples.train_cascade import load_configuration
+from cascade_test_utils import load_configuration
 from harl.envs.cascade_reservoir.data_loader import CascadeData
 from harl.envs.cascade_reservoir.evaluation import evaluate_policy
 from harl.envs.cascade_reservoir.diagnostics import (before_update, after_update, validation_report,

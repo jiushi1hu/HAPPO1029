@@ -4,7 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import unittest
 import numpy as np
-from examples.train_cascade import load_configuration
+from cascade_test_utils import load_configuration
 from harl.envs.cascade_reservoir.data_loader import CascadeData
 from harl.envs.cascade_reservoir.reservoir_physics import ReservoirPhysics, InfeasibleCascade
 from harl.envs.cascade_reservoir.cascade_reservoir_env import CascadeReservoirEnv

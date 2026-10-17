@@ -10,6 +10,7 @@ class InfeasibleCascade(RuntimeError):
 class ReservoirPhysics:
     def __init__(self, data, config):
         self.data = data
+        self.config = dict(config)
         if config.get("release_mapping", "quadratic") != "quadratic":
             raise ValueError("This experiment uses quadratic normalized-action mapping")
         self.dt = float(config["timestep_seconds"])
@@ -82,32 +83,56 @@ class ReservoirPhysics:
                       turbine=turbine, spill=release-turbine, power=power, energy=24.*power)
         return result
 
-    def downstream_intervals(self, storage, external):
+    def _storage_bounds(self, storage_lower, storage_upper):
+        """Validate END-of-day bounds without changing the global curve domain."""
+        if storage_lower is None and storage_upper is None:
+            return self.data.vmin, self.data.vmax
+        if storage_lower is None or storage_upper is None:
+            raise ValueError("Supply both daily storage_lower and storage_upper")
+        lower, upper = [np.asarray(x, dtype=np.float64) for x in (storage_lower, storage_upper)]
+        if (lower.shape != (5,) or upper.shape != (5,) or
+                not np.isfinite(lower).all() or not np.isfinite(upper).all() or (lower > upper).any()):
+            raise ValueError("Daily storage bounds must be finite ordered five-vectors")
+        if (lower < self.data.vmin).any() or (upper > self.data.vmax).any():
+            raise ValueError("Daily storage bounds must lie within global operating bounds")
+        return lower, upper
+
+    def downstream_intervals(self, storage, external, storage_lower=None, storage_upper=None):
+        storage_min, storage_max = self._storage_bounds(storage_lower, storage_upper)
         d = self.data
         lo, hi = np.zeros(5), d.release_cap.copy()
         for i in range(3, -1, -1):
-            lo[i] = max(0., lo[i + 1] - external[i + 1] + (d.vmin[i + 1] - storage[i + 1]) / self.dt)
-            hi[i] = min(d.release_cap[i], hi[i + 1] - external[i + 1] + (d.vmax[i + 1] - storage[i + 1]) / self.dt)
+            lo[i] = max(0., lo[i + 1] - external[i + 1] + (storage_min[i + 1] - storage[i + 1]) / self.dt)
+            hi[i] = min(d.release_cap[i], hi[i + 1] - external[i + 1] + (storage_max[i + 1] - storage[i + 1]) / self.dt)
             if lo[i] > hi[i] + 1e-8:
                 raise InfeasibleCascade("Empty downstream-compatible release interval")
         return lo, hi
 
-    def transition(self, storage, external, actions, terminal_bounds=None):
+    def transition(self, storage, external, actions, terminal_bounds=None,
+                   storage_lower=None, storage_upper=None, action_selector=None):
+        """Execute within current-day bounds AND remaining-horizon feasibility.
+
+        Starting storage may exceed today's ceiling on a drawdown deadline:
+        that ceiling constrains the state after today's release. Global start
+        bounds still apply, and the environment checks the previous day's
+        seasonal bounds. Storage is never clipped to make a release feasible.
+        """
         storage, external, actions = [np.asarray(x, dtype=np.float64) for x in (storage, external, actions)]
         if any(x.shape != (5,) or not np.isfinite(x).all() for x in (storage, external, actions)):
             raise ValueError("Expected three finite five-vectors")
         if ((actions < 0) | (actions > 1)).any() or (external < 0).any():
             raise ValueError("Invalid normalized action or external flow")
         d = self.data
+        storage_min, storage_max = self._storage_bounds(storage_lower, storage_upper)
         if ((storage < d.vmin - 1) | (storage > d.vmax + 1)).any():
             raise InfeasibleCascade("Starting storage violates operating bounds")
-        lower, upper = self.downstream_intervals(storage, external)
+        lower, upper = self.downstream_intervals(storage, external, storage_min, storage_max)
         inflow, release, low, high = [np.empty(5) for _ in range(4)]
         controls, executed_actions = np.ones(5, dtype=np.float32), actions.copy()
         for i in range(5):
             inflow[i] = external[i] + (release[i - 1] if i else 0.)
-            low[i] = max(lower[i], inflow[i] + (storage[i] - d.vmax[i]) / self.dt)
-            high[i] = min(upper[i], inflow[i] + (storage[i] - d.vmin[i]) / self.dt)
+            low[i] = max(lower[i], inflow[i] + (storage[i] - storage_max[i]) / self.dt)
+            high[i] = min(upper[i], inflow[i] + (storage[i] - storage_min[i]) / self.dt)
             if terminal_bounds is not None:
                 terminal_low, terminal_high = terminal_bounds.interval(i, release)
                 low[i] = max(low[i], terminal_low)
@@ -122,11 +147,18 @@ class ReservoirPhysics:
                 # storage is still computed from it and checked below.
                 release[i] = min(d.release_cap[i], max(0., 0.5 * (low[i] + high[i])))
             else:
-                release[i] = low[i] + actions[i] ** 2 * (high[i] - low[i])
+                if action_selector is not None:
+                    # Rule controllers resolve each action after upstream
+                    # releases have fixed this reservoir's feasible interval.
+                    selected = float(action_selector(i, inflow[i], low[i], high[i]))
+                    if not np.isfinite(selected) or not 0. <= selected <= 1.:
+                        raise ValueError('Selected normalized action must lie in [0, 1]')
+                    executed_actions[i] = selected
+                release[i] = low[i] + executed_actions[i] ** 2 * (high[i] - low[i])
         next_storage = storage + (inflow - release) * self.dt
         residual = next_storage - storage - (inflow - release) * self.dt
         tolerance = np.maximum(1., 1e-10 * np.abs(storage))
-        if ((next_storage < d.vmin - tolerance) | (next_storage > d.vmax + tolerance)).any():
+        if ((next_storage < storage_min - tolerance) | (next_storage > storage_max + tolerance)).any():
             raise InfeasibleCascade("Storage bound violation after execution")
         if (release < -1e-8).any() or (release > d.release_cap + 1e-8).any():
             raise InfeasibleCascade("Release capacity violation")
@@ -137,11 +169,14 @@ class ReservoirPhysics:
         system_residual = next_storage.sum() - storage.sum() - (external.sum() - release[-1]) * self.dt
         if abs(system_residual) > tolerance.sum():
             raise AssertionError("Cascade water conservation failed")
-        return dict(storage_start=storage.copy(), storage_end=next_storage, inflow=inflow,
+        result = dict(storage_start=storage.copy(), storage_end=next_storage, inflow=inflow,
                     external=external.copy(), actions=executed_actions, release=release,
                     low=low, high=high, controls=controls, residual=residual,
                     reward=float(energy.sum() / self.reference_energy),
                     system_residual=float(system_residual), **generated)
+        if storage_lower is not None:
+            result.update(storage_lower_m3=storage_min.copy(), storage_upper_m3=storage_max.copy())
+        return result
 
     def constant_storage(self, external, storage=None):
         """Reference at the explicitly supplied, unchanged annual storage."""

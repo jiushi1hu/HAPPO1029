@@ -1,0 +1,6 @@
+﻿reservoir_id,name_cn,flood_control_limit_level_m,drawdown_deadline_mmdd,flood_control_limit_end_mmdd,impoundment_target_level_m,impoundment_deadline_mmdd,date_interpretation,value_status
+WDD,乌东德,952.0,05-31,07-31,975.0,10-31,end_of_day,scenario_reference_not_official_operating_rule
+BHT,白鹤滩,785.0,05-31,07-31,825.0,08-31,end_of_day,scenario_reference_not_official_operating_rule
+XLD,溪洛渡,560.0,05-31,09-10,600.0,09-30,end_of_day,scenario_reference_not_official_operating_rule
+XJB,向家坝,370.0,05-31,09-10,380.0,09-30,end_of_day,scenario_reference_not_official_operating_rule
+THR,三峡,145.0,06-10,09-10,175.0,10-31,end_of_day,scenario_reference_not_official_operating_rule

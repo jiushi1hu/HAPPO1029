@@ -9,7 +9,7 @@ import unittest
 
 import numpy as np
 
-from examples.train_cascade import load_configuration
+from cascade_test_utils import load_configuration
 from harl.envs.cascade_reservoir.cascade_reservoir_env import CascadeReservoirEnv
 from harl.envs.cascade_reservoir.data_loader import CascadeData, HEAD_SENSITIVITY_FILE, IDS
 from harl.envs.cascade_reservoir.evaluation import evaluate_policy, reference_summary

@@ -5,7 +5,7 @@ import tempfile
 from pathlib import Path
 import unittest
 import numpy as np
-from examples.train_cascade import load_configuration
+from cascade_test_utils import load_configuration
 from harl.envs.cascade_reservoir.data_loader import CascadeData, FLOW_COLUMNS
 from harl.runners.cascade_reservoir_runner import configure_calendar
 

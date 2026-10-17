@@ -8,7 +8,7 @@ import numpy as np
 import torch
 from gym.spaces import Box
 
-from examples.train_cascade import load_configuration
+from cascade_test_utils import load_configuration
 from harl.envs.cascade_reservoir.cascade_reservoir_env import CascadeReservoirEnv
 from harl.envs.cascade_reservoir.data_loader import CascadeData
 from harl.runners.cascade_reservoir_runner import CascadeReservoirRunner

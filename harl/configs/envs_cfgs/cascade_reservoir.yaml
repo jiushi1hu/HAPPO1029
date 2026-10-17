@@ -14,3 +14,13 @@ timestep_seconds: 86400.0
 release_mapping: quadratic
 state_type: EP
 terminal_storage_mode: initial
+# Supplied scenario rules, including end-of-day flood ceilings and refill deadlines.
+seasonal_constraints: true
+# Illustrative sensitivity weights; these are not calibrated or monetary costs.
+# Each metre of excess is normalized by its reservoir's operating level range;
+# the five normalized excesses are averaged before applying each weight.
+reward_penalties:
+  enabled: true
+  target_band_weight: 0.10
+  daily_rise_weight: 0.10
+  daily_fall_weight: 0.10

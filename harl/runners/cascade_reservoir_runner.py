@@ -12,6 +12,7 @@ from harl.common.buffers.on_policy_critic_buffer_ep import OnPolicyCriticBufferE
 from harl.common.valuenorm import ValueNorm
 from harl.envs.cascade_reservoir.cascade_reservoir_env import CascadeReservoirEnv
 from harl.envs.cascade_reservoir.evaluation import evaluate_policy
+from harl.envs.cascade_reservoir.reward import EpisodeRewardMetrics, reward_settings
 from harl.runners.on_policy_ha_runner import OnPolicyHARunner
 from harl.utils.trans_tools import _t2n
 
@@ -30,10 +31,34 @@ def validate_discount_factor(value):
     return gamma
 
 
+def validate_gae_lambda(value):
+    """Return a finite GAE trace parameter in [0, 1] for every entry point."""
+    message = "GAE lambda must be finite and between 0 and 1"
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(message)
+    try:
+        trace = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(message) from exc
+    if not np.isfinite(trace) or not 0. <= trace <= 1.:
+        raise ValueError(message)
+    return trace
+
+
+def validate_seed(value):
+    """Use the integer seed range shared by all RNGs, including NumPy."""
+    message = "Seed must be an integer between 0 and 4294967295"
+    if (isinstance(value, (bool, np.bool_)) or
+            not isinstance(value, (int, np.integer)) or not 0 <= value <= 2**32-1):
+        raise ValueError(message)
+    return int(value)
+
+
 def configure_calendar(algo_args, data, year=None):
     """Allocate a complete sampled year without padding or dropping leap days."""
     args = copy.deepcopy(algo_args)
     args["algo"]["gamma"] = validate_discount_factor(args["algo"]["gamma"])
+    args["algo"]["gae_lambda"] = validate_gae_lambda(args["algo"]["gae_lambda"])
     if args["train"]["n_rollout_threads"] != 1:
         raise ValueError("Annual sampling uses one environment: one year = one episode")
     year = data.training_years[0] if year is None else int(year)
@@ -62,6 +87,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
     """
 
     def __init__(self, data, physical_config, algo_args, seed):
+        seed = validate_seed(seed)
+        self.reward_settings = reward_settings(physical_config)
         distribution = algo_args['model'].get('action_distribution')
         if distribution != 'categorical':
             raise ValueError('Cascade controls require categorical discrete actions')
@@ -73,9 +100,9 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         self.requested_args = copy.deepcopy(algo_args)
         self.algo_args = algo_args = configure_calendar(algo_args, data)
         self.training_years = data.training_years
-        self.year_rng = np.random.RandomState(int(seed))
+        self.year_rng = np.random.RandomState(seed)
         self.sampled_years = []
-        self.seed = int(seed)
+        self.seed = seed
         self.num_agents, self.state_type = 5, "EP"
         self.share_param = False
         self.fixed_order = algo_args["algo"]["fixed_order"]
@@ -101,9 +128,11 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         self._allocate_buffers()
         self.iteration, self.training_steps = 0, 0
         self.best_energy = -float("inf")
+        self.best_score = -float("inf")
         self.best_iteration = None
         self.started = time.monotonic()
         self.last_rollout = {}
+        self.last_reward_metrics = EpisodeRewardMetrics().summary()
         self.completed_episodes = 0
         self.validation_history = []
         self.training_history = []
@@ -144,6 +173,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         cb.step = 0; cb.share_obs[0] = obs
         cb.masks.fill(1); cb.bad_masks.fill(1)
         energy, forced, largest_residual = np.zeros(self.n_envs), 0, 0.
+        reward_metrics = EpisodeRewardMetrics()
         for t in range(self.length):
             actions, log_probs = [], []
             for i in range(5):
@@ -155,6 +185,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
             for e, env in enumerate(self.envs):
                 env.step(actions[e])
                 energy[e] += env.last_transition["energy"].sum()
+                reward_metrics.update(env.last_transition)
             results = [env.last_transition for env in self.envs]
             done = np.array([env.index == env.stop for env in self.envs])
             next_obs = np.stack([env.observation() for env in self.envs])
@@ -173,6 +204,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
             cb.insert(next_obs, _t2n(values), rewards, next_masks,
                       np.ones_like(next_masks))
         self.completed_episodes += 1
+        self.last_reward_metrics = reward_metrics.summary()
         self.sampled_years.append(year)
         self.last_rollout = dict(sampled_year=year, episode_days=self.length,
                                  episode_energy_TWh=float(energy.mean() / 1e6),
@@ -198,14 +230,26 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                                 self.seed, self.iteration, self.training_steps,
                                 **({"diagnostics": True} if self.diagnostics_enabled else {}))
                 for year in self.data.validation_years]
-        score = float(np.mean([row["energy_MWh"] for row in rows]))
-        self.validation_history.append(dict(episode=self.iteration,
-            training_steps=self.training_steps, mean_TWh=score / 1e6, years=rows))
-        if score > self.best_energy:
-            self.best_energy, self.best_iteration = score, self.iteration
+        energy = float(np.mean([row["energy_MWh"] for row in rows]))
+        score = float(np.mean([row['episode_reward'] for row in rows])) if self.reward_settings['enabled'] else energy
+        if not np.isfinite(energy) or not np.isfinite(score):
+            raise FloatingPointError('Non-finite validation score')
+        history = dict(episode=self.iteration, training_steps=self.training_steps,
+                       mean_TWh=energy/1e6, years=rows)
+        if self.reward_settings['enabled']:
+            history.update(mean_reward=score,mean_penalty=float(np.mean([row['episode_penalty'] for row in rows])))
+        self.validation_history.append(history)
+        if score > self.best_score:
+            self.best_score, self.best_energy, self.best_iteration = score, energy, self.iteration
             self.best_actor_states = [copy.deepcopy(a.actor.state_dict()) for a in self.actor]
-        print("seed={} episode={} steps={} validation_2020_2024_mean={:.3f} TWh best={:.3f} TWh".format(
-            self.seed, self.iteration, self.training_steps, score / 1e6, self.best_energy / 1e6), flush=True)
+        if self.reward_settings['enabled']:
+            print('seed={} episode={} steps={} validation_2020_2024_mean={:.3f} TWh reward={:.6f} '
+                  'penalty={:.6f} best_reward={:.6f} selected_generation={:.3f} TWh'.format(
+                self.seed,self.iteration,self.training_steps,energy/1e6,score,history['mean_penalty'],
+                self.best_score,self.best_energy/1e6),flush=True)
+        else:
+            print("seed={} episode={} steps={} validation_2020_2024_mean={:.3f} TWh best={:.3f} TWh".format(
+                self.seed, self.iteration, self.training_steps, energy / 1e6, self.best_energy / 1e6), flush=True)
         if self.diagnostics_enabled:
             milestones = self.algo_args["experiment"].get("diagnostic_eval_episodes", [0,20,100,150,400])
             if self.iteration in milestones or self.iteration == self.algo_args["experiment"]["episodes"]:
@@ -232,7 +276,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
             actor_info, critic_info = super().train()  # Original sequential HAPPO implementation.
             self.training_steps += self.length * self.n_envs
             row = dict(seed=self.seed, iteration=k, training_steps=self.training_steps,
-                       elapsed_seconds=time.monotonic() - self.started, **self.last_rollout)
+                       elapsed_seconds=time.monotonic() - self.started, **self.last_rollout,
+                       **self.last_reward_metrics)
             for i, info in enumerate(actor_info):
                 for name, value in info.items():
                     row["actor{}_{}".format(i, name)] = float(value)
@@ -247,8 +292,11 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                     print_update_window(self, min(eval_interval,k))
             if k % eval_interval == 0 or k == episodes:
                 self.validate()
-        return dict(seed=self.seed, best_episode=self.best_iteration, best_iteration=self.best_iteration,
-                    best_validation_TWh=self.best_energy / 1e6)
+        result = dict(seed=self.seed, best_episode=self.best_iteration, best_iteration=self.best_iteration,
+                      best_validation_TWh=self.best_energy / 1e6)
+        if self.reward_settings['enabled']:
+            result['best_validation_reward'] = self.best_score
+        return result
 
     def final_test(self):
         """Evaluate selected actors once on each user-defined typical year."""
