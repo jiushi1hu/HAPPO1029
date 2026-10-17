@@ -17,7 +17,7 @@ model:
   action_distribution: categorical
   action_bins: 200
 algo:
-  gamma: 1.0
+  gamma: 0.99
   gae_lambda: 0.95
   share_param: false
   fixed_order: false
