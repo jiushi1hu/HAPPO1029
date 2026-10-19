@@ -44,10 +44,10 @@ class OperationReward:
 
     def __init__(self, data, seasonal, settings):
         self.data, self.seasonal, self.settings = data, seasonal, dict(settings)
-        if not settings['enabled']:
-            return
         if seasonal is None:
-            raise ValueError('Reward penalties require seasonal operating data')
+            if settings['enabled']:
+                raise ValueError('Reward penalties require seasonal operating data')
+            return
         self.level_range = data.levels(data.vmax)-data.levels(data.vmin)
         if not np.isfinite(self.level_range).all() or (self.level_range <= 0).any():
             raise ValueError('Penalty normalization requires positive operating level ranges')
@@ -62,7 +62,7 @@ class OperationReward:
             raise ValueError('Soft target bands must be finite and ordered')
 
     def apply(self, transition, index):
-        if not self.settings['enabled']:
+        if self.seasonal is None:
             return
         level = transition['levels_end']
         delta = level-self.data.levels(transition['storage_start'])
@@ -75,7 +75,10 @@ class OperationReward:
         # reward calculations and reported soft-deviation counts.
         excess = {k: np.where(v > 1e-9,v,0.) for k,v in excess.items()}
         normalized = {k: v/self.level_range for k,v in excess.items()}
-        costs = {k: self.settings[k+'_weight']*float(v.mean()) for k,v in normalized.items()}
+        # Measure exceedances even in a generation-only ablation. Applied costs
+        # remain exactly zero when disabled; observations and physics are unchanged.
+        costs = {k: self.settings[k+'_weight']*float(v.mean()) if self.settings['enabled'] else 0.
+                 for k,v in normalized.items()}
         penalty = float(sum(costs.values()))
         generation_reward = transition['reward']
         reward = generation_reward-penalty
@@ -84,7 +87,7 @@ class OperationReward:
         transition.update(generation_reward=generation_reward, reward=reward, reward_penalty=penalty,
             reward_penalty_components=costs, soft_violations_m=excess,
             normalized_soft_violations=normalized,
-            reward_penalty_by_reservoir=sum(self.settings[k+'_weight']*v/len(IDS)
+            reward_penalty_by_reservoir=sum((self.settings[k+'_weight'] if self.settings['enabled'] else 0.)*v/len(IDS)
                                            for k,v in normalized.items()))
 
 
@@ -97,6 +100,8 @@ class EpisodeRewardMetrics:
         self.by_reservoir = np.zeros(len(IDS))
         self.violation_days = {k: np.zeros(len(IDS),dtype=int) for k in PENALTY_TERMS}
         self.violation_sum = {k: np.zeros(len(IDS)) for k in PENALTY_TERMS}
+        self.violation_max = {k: np.zeros(len(IDS)) for k in PENALTY_TERMS}
+        self.violation_any_days = dict.fromkeys(PENALTY_TERMS, 0)
 
     def update(self, transition):
         self.reward += float(transition['reward'])
@@ -108,6 +113,8 @@ class EpisodeRewardMetrics:
             excess = transition.get('soft_violations_m',{}).get(term,np.zeros(5))
             self.violation_days[term] += excess > 0.
             self.violation_sum[term] += excess
+            self.violation_max[term] = np.maximum(self.violation_max[term], excess)
+            self.violation_any_days[term] += int(np.any(excess > 0.))
 
     def summary(self, detailed=False):
         result = dict(episode_reward=self.reward, episode_generation_reward=self.generation_reward,

@@ -1,4 +1,4 @@
-"""Interactive result windows; no figure or run-result files are exported."""
+"""Interactive result windows; figures are not exported."""
 import argparse
 import importlib
 import json
@@ -237,6 +237,88 @@ def make_training_figures(payload, window=20):
     return [reward_fig,energy_fig,optimization_fig]
 
 
+def make_reward_scale_figures(payload, window=20):
+    """Plot applied reward components and ratios without rerunning any policy."""
+    import matplotlib.pyplot as plt
+    histories = payload['episode_histories']
+    if (not histories or len(histories) != len(payload['seeds']) or
+            isinstance(window, bool) or not isinstance(window, int) or window < 1):
+        raise ValueError('One episode history per seed and a positive integer window required')
+    grid = np.array([r['episode'] for r in histories[0]])
+    if not len(grid) or not np.array_equal(grid, np.arange(1, len(grid)+1)):
+        raise ValueError('Complete episode metrics starting at one required')
+    for seed, history in zip(payload['seeds'], histories):
+        if not np.array_equal(grid, [r['episode'] for r in history]):
+            raise ValueError('Seeds must have matching episode metrics')
+        if any(r['seed'] != seed for r in history):
+            raise ValueError('Episode metrics must match their seed')
+
+    def values(key):
+        result = np.asarray([[r[key] for r in rows] for rows in histories], dtype=float)
+        if not np.isfinite(result).all():
+            raise ValueError('Non-finite episode metric: '+key)
+        return result
+
+    power, total = values('power_reward'), values('total_reward')
+    costs = [values(k+'_penalty') for k in ('band', 'rise', 'fall')]
+    if (power < 0.).any() or any((cost < 0.).any() for cost in costs):
+        raise ValueError('Power Reward and penalty costs must be nonnegative')
+    if not np.allclose(total, power-sum(costs), rtol=1e-9, atol=1e-9):
+        raise ValueError('Reward components do not sum to Total Reward')
+    stop = np.arange(1, len(grid)+1)
+    start = np.maximum(0, stop-window)
+
+    def rolling_sum(series):
+        cumulative = np.pad(np.cumsum(series, axis=1), ((0,0),(1,0)))
+        return cumulative[:,stop]-cumulative[:,start]
+
+    def average(series):
+        return rolling_sum(series)/(stop-start)
+
+    def seed_mean(series):
+        return np.ma.masked_invalid(series).mean(axis=0).filled(np.nan)
+
+    def draw(ax, raw, rolled):
+        ax.plot(grid, seed_mean(raw), color='#087f8c', alpha=.22, lw=.7,
+                label='Raw episode mean')
+        for line in rolled:
+            ax.plot(grid, line, color='#087f8c', alpha=.25, lw=.8)
+        mean = seed_mean(rolled)
+        ax.plot(grid, mean, color='#087f8c', lw=1.8, marker='o', ms=2.5,
+                label='{}-episode window'.format(window))
+        if len(histories) > 1:
+            sd = np.ma.masked_invalid(rolled).std(axis=0, ddof=1).filled(np.nan)
+            ax.fill_between(grid, mean-sd, mean+sd, color='#087f8c', alpha=.15,
+                            label='Seed +/-1 SD')
+        ax.set_xlabel('Training episodes (sampled years)')
+        ax.grid(alpha=.2)
+        ax.legend(fontsize=8)
+
+    components_fig, axes = plt.subplots(2, 3, figsize=(14, 7), constrained_layout=True)
+    components_fig.canvas.manager.set_window_title('HAPPO reward components')
+    for ax, name, series in zip(axes.flat, ['Power Reward', 'Band penalty', 'Rise penalty',
+                                          'Fall penalty', 'Total Reward'], [power]+costs+[total]):
+        draw(ax, series, average(series))
+        ax.set(title=name, ylabel='Undiscounted episode reward units')
+    axes.flat[-1].axis('off')
+    axes.flat[-1].text(.05,.6,'Total = Power - Band - Rise - Fall\n\nPenalties are positive applied costs.\nFailed episodes contain executed days only.',
+                        transform=axes.flat[-1].transAxes, va='center', fontsize=10)
+    components_fig.suptitle('Training reward components | episode sums')
+
+    ratios_fig, axes = plt.subplots(2, 2, figsize=(11, 7), constrained_layout=True)
+    ratios_fig.canvas.manager.set_window_title('HAPPO penalties relative to Power Reward')
+    def percent(numerator, denominator):
+        return np.divide(100.*numerator, denominator, out=np.full_like(denominator, np.nan),
+                         where=denominator > 0.)
+    for ax, name, cost in zip(axes.flat, ['Band', 'Rise', 'Fall', 'All soft penalties'], costs+[sum(costs)]):
+        # Ratios of window sums preserve energy weighting. Averaging episode
+        # percentages would over-weight low-generation years.
+        draw(ax, percent(cost, power), percent(rolling_sum(cost), rolling_sum(power)))
+        ax.set(title=name+' / Power Reward', ylabel='Applied penalty / Power Reward (%)')
+    ratios_fig.suptitle('Penalty scaling | window cost / window Power Reward\nZero denominators are gaps')
+    return [components_fig, ratios_fig]
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check-backend", action="store_true")
@@ -250,6 +332,8 @@ def main():
     make_figure(payload)
     if payload.get('reward_penalties',{}).get('enabled',False):
         make_validation_reward_figure(payload)
+    if 'episode_histories' in payload:
+        make_reward_scale_figures(payload)
     if args.plot_details:
         make_training_figures(payload)
     import matplotlib.pyplot as plt

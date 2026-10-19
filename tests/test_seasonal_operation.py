@@ -13,7 +13,7 @@ import numpy as np
 from scipy.optimize import linprog
 
 from cascade_test_utils import load_configuration
-from harl.envs.cascade_reservoir.data_loader import CascadeData, IDS, SEASONAL_FILES
+from harl.envs.cascade_reservoir.data_loader import CascadeData, IDS, SEASONAL_FILES, OPERATION_PERIODS
 from harl.envs.cascade_reservoir.reservoir_physics import InfeasibleCascade, ReservoirPhysics
 from harl.envs.cascade_reservoir.cascade_reservoir_env import CascadeReservoirEnv
 from harl.envs.cascade_reservoir.terminal_storage import TerminalReleaseBounds
@@ -321,7 +321,11 @@ class SeasonalExecutionTests(unittest.TestCase):
         seasonal=SimpleNamespace(storage_lower=lower,storage_upper=upper,
             flood_limit_active=flood,refill_deadline=refill,
             reference={'target_end_of_day_storage_m3':targets,
-                       'target_end_of_day_level_m':targets/DT},
+                       'target_end_of_day_level_m':targets/DT,
+                       'soft_target_lower_level_m':np.maximum(0., targets/DT-.2),
+                       'soft_target_upper_level_m':np.minimum(d.vmax/DT, targets/DT+.2)},
+            period_parameters={(name,period):dict(suggested_soft_daily_rise_limit_m=.2,
+                suggested_soft_daily_fall_limit_m=.3) for name in IDS for period in OPERATION_PERIODS},
             key_parameters={name:{'value_status':'test_scenario'} for name in IDS},
             storage_bounds=lambda a,b:(lower[a:b].copy(),upper[a:b].copy()))
         d.load_seasonal_operation=lambda:seasonal

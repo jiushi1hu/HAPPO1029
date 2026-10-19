@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import sys
 import tempfile
+from contextlib import ExitStack
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -75,11 +76,15 @@ def main():
     parser.add_argument("--plot-python", default=sys.executable, help="Interpreter with an interactive Matplotlib backend")
     parser.add_argument("--no-plot", action="store_true", help="Run without opening a figure window")
     parser.add_argument('--plot-details', action='store_true', help='Also open reward, training generation, and optimization windows')
+    parser.add_argument('--episode-log', type=Path,
+                        help='Write per-episode metrics as JSONL to a new file (never overwrite)')
     parser.add_argument("--diagnostics", action="store_true", help="Print training and validation diagnostics without saving files")
     parser.add_argument("--diagnostic-episodes", nargs="+", type=int, default=[0,20,100,150,400])
     parser.add_argument("--diagnostic-stochastic-repeats", type=int, default=3)
     parser.add_argument("--skip-final-test", action="store_true", help="Skip typical-year tests during diagnostic tuning")
     args = parser.parse_args()
+    if args.episode_log is not None and args.episode_log.exists():
+        parser.error('episode-log must name a new file; existing paths are not overwritten')
     config, physical = load_configuration()
     try:
         config["algo"]["gamma"] = validate_discount_factor(
@@ -159,7 +164,12 @@ def main():
         evaluation_metric=('undiscounted annual penalized return' if penalty_settings['enabled'] else
                            'undiscounted annual generation'),
         generation_metric='undiscounted annual generation',
-        result_storage="memory only", **comparison), indent=2), flush=True)
+        result_storage="memory and console; optional episode JSONL",
+        episode_log=None if args.episode_log is None else str(args.episode_log.resolve()),
+        reward_curve_units='undiscounted episode sums; penalties are positive costs',
+        penalty_ratio_definition='100 * episode applied penalty / episode Power Reward; null if Power Reward is zero',
+        hard_failure_rate_definition='failed episode attempts / attempted episodes, per seed; failures still raise',
+        **comparison), indent=2), flush=True)
     print('Checking annual operating feasibility for all supplied years ...', flush=True)
     checked = validate_operating_feasibility(data, physical)
     print('Operating feasibility passed for {} years (physical bounds and deadlines only).'.format(
@@ -167,19 +177,24 @@ def main():
     if args.check_data_only:
         print("Data checks passed; no training or evaluation was run.")
         return
-    # Cache is temporary, and no models, logs or figures are written to the repository.
-    with tempfile.TemporaryDirectory(prefix="cascade_happo_plot_") as cache:
+    # Only an explicitly requested episode log persists; figures/models are not exported.
+    with tempfile.TemporaryDirectory(prefix="cascade_happo_plot_") as cache, ExitStack() as stack:
         plot_env = dict(os.environ, MPLCONFIGDIR=cache, PYTHONDONTWRITEBYTECODE="1")
         if not args.no_plot:
             subprocess.run([args.plot_python, str(ROOT / "examples/plot_cascade.py"), "--check-backend"],
                            check=True, env=plot_env)
+        episode_log = None
+        if args.episode_log is not None:
+            args.episode_log.parent.mkdir(parents=True, exist_ok=True)
+            episode_log = stack.enter_context(args.episode_log.open('x', encoding='utf-8'))
         references = reported_references(data, physics, data.validation_years,
                                          config['model']['action_bins'], 'validation')
         print('Validation reference mean = {:.3f} TWh/year ({})'.format(
             np.mean([r['energy_TWh'] for r in references]), comparison['reference_label']), flush=True)
         runners = []
         for seed in exp["seeds"]:
-            runner = CascadeReservoirRunner(data, physical, config, seed)
+            runner = CascadeReservoirRunner(data, physical, config, seed,
+                **({'episode_log': episode_log} if episode_log is not None else {}))
             runner.run(exp["episodes"], exp["eval_interval"])
             runners.append(runner)
         # Test years are used only after all validation-based selections finish.
@@ -202,6 +217,7 @@ def main():
                        validation_years=list(data.validation_years), test_years=list(data.test_years),
                        test_labels=list(data.test_labels), seeds=exp["seeds"],
                        histories=[r.validation_history for r in runners], tests=tests,
+                       episode_histories=[r.episode_history for r in runners],
                        references=references, seasonal_constraints=seasonal_enabled,
                        action_bins=config['model']['action_bins'], head_model=physics.head_model,
                        head_data_status=physics.head_data_status,
@@ -214,7 +230,9 @@ def main():
             subprocess.run([args.plot_python, str(ROOT / "examples/plot_cascade.py")] +
                            (['--plot-details'] if args.plot_details else []),
                            input=json.dumps(payload), text=True, check=True, env=plot_env)
-    print("Finished. Run results and figure were not saved.", flush=True)
+    print('Finished. Models and figures were not saved.' +
+          (' Episode metrics saved to {}.'.format(args.episode_log.resolve()) if args.episode_log is not None
+           else ' Episode metrics remain in memory and console.'), flush=True)
 
 
 if __name__ == "__main__":

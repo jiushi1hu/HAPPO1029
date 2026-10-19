@@ -13,6 +13,8 @@ from harl.common.valuenorm import ValueNorm
 from harl.envs.cascade_reservoir.cascade_reservoir_env import CascadeReservoirEnv
 from harl.envs.cascade_reservoir.evaluation import evaluate_policy
 from harl.envs.cascade_reservoir.reward import EpisodeRewardMetrics, reward_settings
+from harl.envs.cascade_reservoir.reservoir_physics import InfeasibleCascade
+from harl.envs.cascade_reservoir.training_metrics import episode_record, log_episode
 from harl.runners.on_policy_ha_runner import OnPolicyHARunner
 from harl.utils.trans_tools import _t2n
 
@@ -86,7 +88,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
     the physical environment resolves releases upstream to downstream.
     """
 
-    def __init__(self, data, physical_config, algo_args, seed):
+    def __init__(self, data, physical_config, algo_args, seed, episode_log=None):
         seed = validate_seed(seed)
         self.reward_settings = reward_settings(physical_config)
         distribution = algo_args['model'].get('action_distribution')
@@ -136,6 +138,10 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         self.completed_episodes = 0
         self.validation_history = []
         self.training_history = []
+        self.episode_history = []
+        self.episode_log = episode_log
+        self.episode_attempts = 0
+        self.hard_failed_episodes = 0
         self.best_actor_states = None
         self.diagnostics_enabled = bool(algo_args["experiment"].get("diagnostics", False))
         self.diagnostics_history = []
@@ -155,6 +161,14 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         # Independent of action sampling, optimizer shuffling and evaluation.
         return int(self.year_rng.choice(self.training_years))
 
+    def _log_episode(self, rewards, energy, failure=None):
+        self.hard_failed_episodes += int(failure is not None)
+        record = episode_record(self.envs[0], rewards, energy, self.seed, self.episode_attempts,
+            self.algo_args['algo']['gamma'], self.algo_args['algo']['gae_lambda'],
+            self.hard_failed_episodes, failure)
+        self.episode_history.append(record)
+        log_episode(record, self.episode_log)
+
     @torch.no_grad()
     def collect_episode(self, year=None):
         """Sample one year with replacement; reset storage and collect every day."""
@@ -163,6 +177,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         self.length = self.algo_args["train"]["episode_length"]
         self.envs = [CascadeReservoirEnv(self.data, self.physical_config,
                                        start_year=year, end_year=year, action_bins=self.action_bins)]
+        self.episode_attempts += 1
         self._allocate_buffers()
         self.prep_rollout()
         obs = np.stack([env.observation() for env in self.envs])
@@ -174,6 +189,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         cb.masks.fill(1); cb.bad_masks.fill(1)
         energy, forced, largest_residual = np.zeros(self.n_envs), 0, 0.
         reward_metrics = EpisodeRewardMetrics()
+        energy_by_reservoir = np.zeros(5)
         for t in range(self.length):
             actions, log_probs = [], []
             for i in range(5):
@@ -183,8 +199,15 @@ class CascadeReservoirRunner(OnPolicyHARunner):
             actions = np.stack(actions, axis=1)
             values = self.critic.get_values(cb.share_obs[t])
             for e, env in enumerate(self.envs):
-                env.step(actions[e])
+                try:
+                    env.step(actions[e])
+                except (InfeasibleCascade, AssertionError) as exc:
+                    self._log_episode(reward_metrics, energy_by_reservoir,
+                        dict(date=env.data.dates[env.index].isoformat(),
+                             error_type=type(exc).__name__, reason=str(exc)))
+                    raise  # Observability only: preserve strict failure behavior.
                 energy[e] += env.last_transition["energy"].sum()
+                energy_by_reservoir += env.last_transition['energy']
                 reward_metrics.update(env.last_transition)
             results = [env.last_transition for env in self.envs]
             done = np.array([env.index == env.stop for env in self.envs])
@@ -205,6 +228,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                       np.ones_like(next_masks))
         self.completed_episodes += 1
         self.last_reward_metrics = reward_metrics.summary()
+        self._log_episode(reward_metrics, energy_by_reservoir)
         self.sampled_years.append(year)
         self.last_rollout = dict(sampled_year=year, episode_days=self.length,
                                  episode_energy_TWh=float(energy.mean() / 1e6),

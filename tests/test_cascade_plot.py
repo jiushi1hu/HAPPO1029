@@ -9,7 +9,8 @@ from unittest.mock import patch
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-from examples.plot_cascade import make_figure, make_validation_reward_figure, make_training_figures, main
+from examples.plot_cascade import (make_figure, make_validation_reward_figure, make_training_figures,
+                                  make_reward_scale_figures, main)
 import numpy as np
 
 
@@ -212,6 +213,62 @@ class PlotTests(unittest.TestCase):
             self.assertIn('skipped',fig.axes[1].texts[0].get_text())
             save.assert_not_called()
             plt.close(fig)
+
+    def reward_scale_payload(self):
+        histories=[]
+        for seed in (1,2):
+            rows=[]
+            for episode,power,band,rise,fall in [(1,10.,1.,.5,0.),(2,0.,1.,0.,0.),(3,30.,3.,0.,1.5)]:
+                rows.append(dict(seed=seed,episode=episode,power_reward=power*seed,
+                    band_penalty=band*seed,rise_penalty=rise*seed,fall_penalty=fall*seed,
+                    total_reward=(power-band-rise-fall)*seed))
+            histories.append(rows)
+        return dict(seeds=[1,2],episode_histories=histories)
+
+    def test_reward_components_and_energy_weighted_percentage_windows(self):
+        with patch('matplotlib.figure.Figure.savefig') as save:
+            figures=make_reward_scale_figures(self.reward_scale_payload(),window=2)
+            components,ratios=figures
+            self.assertEqual([ax.get_title() for ax in components.axes[:5]],
+                             ['Power Reward','Band penalty','Rise penalty','Fall penalty','Total Reward'])
+            np.testing.assert_allclose(components.axes[0].lines[-1].get_ydata(),[15.,7.5,22.5])
+            np.testing.assert_allclose(components.axes[1].lines[-1].get_ydata(),[1.5,1.5,3.])
+            # Episode 2 has no generation but still incurs a cost. Its raw
+            # percentage is undefined; the 2-episode ratio of sums is 20%.
+            self.assertTrue(np.isnan(ratios.axes[0].lines[0].get_ydata()[1]))
+            np.testing.assert_allclose(ratios.axes[0].lines[-1].get_ydata(),[10.,20.,100.*4/30])
+            np.testing.assert_allclose(ratios.axes[3].lines[-1].get_ydata(),[15.,25.,100.*5.5/30])
+            for fig in figures:fig.canvas.draw();plt.close(fig)
+            save.assert_not_called()
+
+    def test_zero_power_ratios_are_gaps_and_invalid_accounting_is_rejected(self):
+        payload=self.reward_scale_payload()
+        for rows in payload['episode_histories']:
+            for row in rows:
+                row['power_reward']=0.
+                row['total_reward']=-sum(row[k+'_penalty'] for k in ('band','rise','fall'))
+        figures=make_reward_scale_figures(payload)
+        self.assertTrue(np.isnan(figures[1].axes[0].lines[-1].get_ydata()).all())
+        for fig in figures:fig.canvas.draw();plt.close(fig)
+        for issue in ('nonfinite','negative','accounting','seed','alignment'):
+            bad=self.reward_scale_payload();row=bad['episode_histories'][0][0]
+            if issue=='nonfinite':row['power_reward']=np.inf
+            elif issue=='negative':row['band_penalty']=-1.
+            elif issue=='accounting':row['total_reward']+=1.
+            elif issue=='seed':row['seed']=7
+            else:bad['episode_histories'][1].pop()
+            with self.subTest(issue=issue),self.assertRaises(ValueError):make_reward_scale_figures(bad)
+
+    def test_reward_scaling_windows_open_without_plot_details(self):
+        payload=self.seasonal_payload()
+        payload['episode_histories']=self.reward_scale_payload()['episode_histories'][:1]
+        with patch('examples.plot_cascade.select_interactive_backend',return_value='Agg'), \
+             patch('sys.argv',['plot_cascade.py']),patch('sys.stdin',io.StringIO(json.dumps(payload))), \
+             patch('matplotlib.pyplot.show') as show,patch('matplotlib.figure.Figure.savefig') as save:
+            main()
+            self.assertEqual(len(plt.get_fignums()),3)
+            show.assert_called_once_with(block=True);save.assert_not_called()
+        plt.close('all')
 
 
 if __name__ == "__main__":

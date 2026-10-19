@@ -44,9 +44,9 @@ PYTHONDONTWRITEBYTECODE=1 /opt/anaconda3/envs/harl/bin/python examples/train_cas
 
 启动时输出分期开关、观测维数、数据来源状态和参考控制器类型，并检查全部 60 年的物理／截止约束是否可行。随后逐年计算五个验证年的参考发电量并打印其均值；典型年参考只在全部种子模型选择结束后计算，`--skip-final-test` 同时跳过这些参考。
 
-训练结束后弹出一个窗口：左侧显示 2020—2024 五个验证年的平均年发电量学习曲线及多种子标准差，不绘制参考虚线；右侧每组柱子分别比较该典型年选定策略与参考的发电量，多种子策略展示标准差。默认选定策略按净奖励选取，因此其发电量不一定是训练过程中最高的发电量。右侧参考图例默认为 `Seasonal rule reference`；关闭分期约束后才使用 `Constant-storage reference`。绘图检查运行模式、水头模式、分期动作网格和惩罚配置是否一致，拒绝混合对照。图只在窗口显示，程序不导出 PNG 或 PDF；模型、训练记录及结果只在内存中保留，关闭窗口后退出。没有断点恢复或自动保存功能。可用 --no-plot 禁用弹窗。
+训练结束后弹出结果窗口：左侧显示 2020—2024 五个验证年的平均年发电量学习曲线及多种子标准差，不绘制参考虚线；右侧每组柱子分别比较该典型年选定策略与参考的发电量，多种子策略展示标准差。默认选定策略按净奖励选取，因此其发电量不一定是训练过程中最高的发电量。右侧参考图例默认为 `Seasonal rule reference`；关闭分期约束后才使用 `Constant-storage reference`。绘图检查运行模式、水头模式、分期动作网格和惩罚配置是否一致，拒绝混合对照。图只在窗口显示，程序不导出 PNG 或 PDF；模型不保存，训练记录默认保留在内存和控制台，也可显式指定 `--episode-log` 保存逐回合 JSONL。没有断点恢复功能。可用 --no-plot 禁用弹窗。
 
-启用软约束惩罚时，还会自动打开 `HAPPO validation net reward` 窗口：横轴为训练 episode，纵轴为五个验证年的平均未折扣年度净奖励。细线表示各训练种子，粗线表示种子均值，阴影表示种子间 ±1 标准差（不是置信区间）；单种子不绘制阴影。该图包含 episode=0，直接使用各验证点记录的 `mean_reward`，保留真实波动，不绘制历史最优包络线，也不从发电量反算。此图不依赖 `--diagnostics` 或 `--plot-details`，无需额外评估。`--plot-details` 另开训练奖励、训练发电量和优化诊断三个窗口，因此默认惩罚模式下共五个窗口；关闭惩罚时沿用发电量选模及原绘图窗口。
+启用软约束惩罚时，还会自动打开 `HAPPO validation net reward` 窗口：横轴为训练 episode，纵轴为五个验证年的平均未折扣年度净奖励。细线表示各训练种子，粗线表示种子均值，阴影表示种子间 ±1 标准差（不是置信区间）；单种子不绘制阴影。该图包含 episode=0，直接使用各验证点记录的 `mean_reward`，保留真实波动，不绘制历史最优包络线，也不从发电量反算。此图不依赖 `--diagnostics` 或 `--plot-details`，无需额外评估。另外自动打开奖励分项和惩罚占发电奖励比例两个窗口，详见下文。`--plot-details` 另开训练奖励、训练发电量和优化诊断三个窗口；关闭惩罚时沿用发电量选模，分项图显示实际为零的惩罚。
 
 只检查输入、划分和逐年硬约束可行性，不执行参考轨迹或训练：
 
@@ -58,7 +58,7 @@ PYTHONDONTWRITEBYTECODE=1 /opt/anaconda3/envs/harl/bin/python examples/train_cas
 
 examples/train_cascade.py 为训练入口；examples/plot_cascade.py 为弹窗绘图入口。harl/envs/cascade_reservoir 负责真实数据读取、年度环境、硬约束与发电、冻结策略评估；harl/runners 组织年度采样和原有顺序 HAPPO 更新；harl/algorithms、common、models、utils 保留所需算法与公共组件。配置位于 harl/configs，回归检查位于 tests。
 
-合成数据生成入口、旧版文件读取格式、单个验证／测试年配置、文件导出和可选 LP 输出入口已移除。真实 CSV 保持原样。统一运行时期表用于核对日历，逐库分期边界与截止日期由补充分期表给出。
+合成数据生成入口、旧版文件读取格式、单个验证／测试年配置、模型／图片导出和可选 LP 输出入口已移除；逐回合日志支持按需导出 JSONL。真实 CSV 保持原样。统一运行时期表用于核对日历，逐库分期边界与截止日期由补充分期表给出。
 
 分期运行已接入数据读取、剩余时域可达性、物理动作执行、环境观测、评估参考和绘图。默认物理配置为 `seasonal_constraints: true`，环境读取四个补充分期 CSV，并在每一步同时执行当日日末边界和剩余时域约束。也可通过 `data.load_seasonal_operation()` 或 `load_seasonal_operation: true` 只读取数据，这两种方式不会单独启用动作约束。输入按日期和水库 ID 对齐，并检查缺失、重复、库容—水位关系、参考节点、闰年及跨表一致性；来源状态原样保留。当前关键参数仍标记为 `scenario_reference_not_official_operating_rule`，日参考为软情景目标；启用约束不代表已核实为官方运行规程。
 
@@ -111,7 +111,33 @@ DIAG_VALIDATION 默认在第 0、20、100、150、400 轮及本次最后一轮�
 
 离散策略下，随机训练的平均映射位置为 Σ p(k)×(k/199)²，确定性评估的映射位置为 (argmax p(k)/199)²，两者可能不同。诊断分别报告这两项统计，本身不更改评估方式。
 
-诊断仍不保存模型、日志、图或新增报告文件；需要保留控制台内容时可自行复制。
+诊断不保存模型和图片；默认日志仅在内存和控制台，指定 `--episode-log` 才保存逐回合指标。
+
+## Reward scaling and episode logging
+
+Every sampled training episode prints an `EPISODE_METRICS` JSON record, independently of `--diagnostics` and `--plot-details`. Two new plot windows open automatically unless `--no-plot` is set:
+
+- **Reward components:** Power Reward, Band penalty, Rise penalty, Fall penalty, and Total Reward. Power Reward is the actual generation reward before costs, not MW. All curves are undiscounted episode sums, and penalties are positive applied costs: `Total = Power - Band - Rise - Fall`.
+- **Penalty percentages:** each cost and their sum divided by Power Reward, multiplied by 100. Thin raw curves use each episode's ratio. The 20-episode curves use `100 * sum(window cost) / sum(window Power Reward)` for each seed, followed by the seed mean and sample standard deviation. They do not average episode percentages. A zero denominator is undefined (`null` in logs, a gap in plots).
+
+Episode records include:
+
+- Actual generated MWh/TWh and generation by reservoir, with sampled year and simulated/calendar days. `annual_generation_TWh` is present only for completed episodes; failed records retain the actually executed prefix and set annual generation to `null`.
+- Applied reward components and their exact percentages of Power Reward, plus gamma, GAE lambda, reward weights, and the normalization constant.
+- `hard_constraint_failed` and `hard_constraint_failure_rate` (a per-attempt indicator, 0 or 1), and `hard_constraint_failure_rate_so_far` (failed training attempts divided by attempted training episodes, separately for each seed). A physical infeasibility/assertion during a transition is logged and then re-raised: no failure penalty, relaxed constraint, or automatic continuation is introduced. A zero failure rate describes the environment-protected executed trajectories; it does not establish that the raw policies independently enforce the constraints. The current future-inflow feasibility layer is explicitly identified in the record.
+- `soft_exceedances` for Band, Rise and Fall: reservoir-day count/rate, days with any exceedance, summed excess metres and maximum excess, and corresponding per-reservoir arrays in `reservoir_ids` order. The reservoir-day denominator is `5 * simulated_days`, including leap days and excluding rejected transitions. Sum of excess metres is an accumulated deviation, not a water volume. Raw exceedances remain measured when `--no-reward-penalties` makes all applied costs zero. With seasonal constraints disabled, soft metrics are unavailable rather than a claim of zero exceedances.
+
+To retain logs, specify a **new** JSONL path; existing files are never overwritten. Parent directories are created, each episode is flushed immediately, and the log remains available if a later episode fails. This adds accounting only and does not change reward weights, action selection, inflow information, or HAPPO updates.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /opt/anaconda3/envs/harl/bin/python examples/train_cascade.py \
+  --episodes 100 --eval-interval 10 --seeds 1 \
+  --plot-details --skip-final-test \
+  --episode-log runs/reward_scaling_seed1.jsonl \
+  --plot-python /Library/Frameworks/Python.framework/Versions/3.9/bin/python3
+```
+
+Focused accounting checks: `PYTHONPATH=tests /opt/anaconda3/envs/harl/bin/python -B -m unittest test_reward_scale_metrics test_cascade_reward_penalties`. Plot checks use the Matplotlib interpreter listed above and `test_cascade_plot`.
 
 ## 折扣与 GAE 回报对照
 

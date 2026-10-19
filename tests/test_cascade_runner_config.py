@@ -211,7 +211,7 @@ class RunnerConfigurationTests(unittest.TestCase):
             cfg['experiment'].update(episodes=1,eval_interval=1,seeds=[1,2])
             class FakeRunner:
                 def __init__(runner,data,physical,config,seed):
-                    runner.seed=seed;runner.validation_history=[]
+                    runner.seed=seed;runner.validation_history=[];runner.episode_history=[]
                 def run(runner,*args):events.append(('run',runner.seed))
                 def final_test(runner):
                     events.append(('test',runner.seed))
