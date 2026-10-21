@@ -10,11 +10,67 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from examples.plot_cascade import (make_figure, make_validation_reward_figure, make_training_figures,
-                                  make_reward_scale_figures, main)
+                                  make_reward_scale_figures, make_fixed_year_figure, main)
 import numpy as np
 
 
 class PlotTests(unittest.TestCase):
+    def fixed_year_payload(self):
+        return dict(fixed_training_year=2013, seeds=[1, 2], fixed_year_histories=[[
+            dict(seed=seed, episode=episode, year=2013, deterministic=True,
+                 feasible=True, violation_count=0, actual_generation_TWh=power*seed,
+                 power_reward=power*seed, band_penalty=seed, rise_penalty=0., fall_penalty=0.,
+                 total_reward=(power-1)*seed)
+            for episode, power in [(0, 10.), (5, 14.), (10, 11.)]] for seed in (1, 2)])
+
+    def test_fixed_year_plot_uses_unsmoothed_deterministic_checkpoints_and_baseline(self):
+        with patch('matplotlib.figure.Figure.savefig') as save:
+            fig = make_fixed_year_figure(self.fixed_year_payload())
+            self.assertEqual(len(fig.axes), 6)
+            np.testing.assert_array_equal(fig.axes[0].lines[-1].get_xdata(), [0, 5, 10])
+            np.testing.assert_allclose(fig.axes[0].lines[-1].get_ydata(), [15., 21., 16.5])
+            np.testing.assert_allclose(fig.axes[0].lines[-2].get_ydata(), [15., 15.])
+            np.testing.assert_allclose(fig.axes[-1].lines[-1].get_ydata(), [13.5, 19.5, 15.])
+            self.assertIn('in-sample', fig._suptitle.get_text())
+            self.assertIn('2013', fig.axes[0].get_xlabel())
+            fig.canvas.draw()
+            save.assert_not_called()
+            plt.close(fig)
+
+    def test_fixed_year_plot_rejects_mixed_years_sampling_and_missing_baseline(self):
+        for issue in ('year', 'deterministic', 'baseline', 'accounting', 'alignment', 'feasible'):
+            payload = self.fixed_year_payload()
+            row = payload['fixed_year_histories'][0][0]
+            if issue == 'year':
+                row['year'] = 2012
+            elif issue == 'deterministic':
+                row['deterministic'] = False
+            elif issue == 'baseline':
+                for history in payload['fixed_year_histories']:
+                    history.pop(0)
+            elif issue == 'accounting':
+                row['total_reward'] += 1.
+            elif issue == 'alignment':
+                payload['fixed_year_histories'][1].pop()
+            else:
+                row['feasible'] = False
+            with self.subTest(issue=issue), self.assertRaises(ValueError):
+                make_fixed_year_figure(payload)
+
+    def test_fixed_year_plot_entry_point_does_not_require_validation_or_references(self):
+        payload = self.fixed_year_payload()
+        with patch('examples.plot_cascade.select_interactive_backend', return_value='Agg'), \
+                patch('sys.argv', ['plot_cascade.py']), \
+                patch('sys.stdin', io.StringIO(json.dumps(payload))), \
+                patch('examples.plot_cascade.make_figure') as validation, \
+                patch('examples.plot_cascade.make_validation_reward_figure') as reward, \
+                patch('matplotlib.pyplot.show') as show:
+            main()
+            validation.assert_not_called()
+            reward.assert_not_called()
+            show.assert_called_once_with(block=True)
+        plt.close('all')
+
     def validation_reward_payload(self):
         return dict(seeds=[1,2],validation_years=list(range(2020,2025)),
             histories=[[dict(episode=e,training_steps=steps,mean_reward=r,mean_TWh=100.)

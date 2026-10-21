@@ -113,6 +113,57 @@ DIAG_VALIDATION 默认在第 0、20、100、150、400 轮及本次最后一轮�
 
 诊断不保存模型和图片；默认日志仅在内存和控制台，指定 `--episode-log` 才保存逐回合指标。
 
+## Fixed-training-year learning check
+
+Use `--fixed-training-year YEAR` to repeat one year from the existing training split. The initial
+check below uses **2013**. Every rollout resets to that year's original initial storage and covers
+the complete 365/366-day calendar. Training still samples actions; the five actors, 200 action
+bins, physical constraints, reward weights, gamma **0.99**, GAE lambda **0.95**, and optimizer
+settings are unchanged. Inflow normalization continues to use the original 50-year training split.
+
+This mode evaluates the current policy **deterministically on the same training year**, before
+the first update (episode 0), at every `--eval-interval`, and after the last update even when it
+does not fall on an interval. Evaluation uses a fresh environment, does not insert transitions
+into training buffers, and preserves the Torch RNG state. Validation years and typical-year
+tests cannot be chosen as the fixed training year. Held-out evaluations and reference simulations
+are skipped automatically in this mode; the standard multi-year run is available by omitting
+`--fixed-training-year` (the YAML default is `null`).
+
+Run this command from the repository root in the VS Code terminal:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /opt/anaconda3/envs/harl/bin/python examples/train_cascade.py \
+  --fixed-training-year 2013 --episodes 60 --eval-interval 5 --seeds 1 \
+  --gamma 0.99 --gae-lambda 0.95 --diagnostics --plot-details \
+  --episode-log runs/fixed_2013_seed1_run1.jsonl \
+  --plot-python /Library/Frameworks/Python.framework/Versions/3.9/bin/python3
+```
+
+The primary figure has six **unsmoothed deterministic** curves: actual annual generation,
+Power Reward, Band penalty, Rise penalty, Fall penalty, and Total Reward. Dashed lines mark the
+untrained checkpoint. The sampled training curves remain separate and are labelled with the
+fixed year. `--diagnostics` still reports critic errors against realized discounted returns and
+GAE targets, along with policy update statistics; it does not run extra stochastic evaluations
+on the held-out years in fixed-year mode.
+
+The JSONL file contains `record_type="training_episode"` for each sampled rollout and
+`record_type="fixed_year_evaluation"` for deterministic checkpoints, including episode 0.
+Checkpoint records contain generation, all reward components, penalty percentages, settings,
+and the detailed evaluation trajectory summary. With `--diagnostics`, checkpoints after an
+update also retain `last_training_update_diagnostics`, including critic MC/GAE errors from
+the latest sampled training rollout (not from the deterministic evaluation). Only training records contribute to training
+episode counts and failure-rate denominators. Always choose a new log filename when repeating
+the command; existing logs are never overwritten.
+
+Improvement above episode 0 on this fixed year demonstrates in-sample learning. Sustained
+improvement and stabilization are useful diagnostics, but do not establish optimality or
+generalization to other inflow years. Inspect Total Reward together with generation, penalties
+and critic diagnostics. The original information assumptions of the feasibility layer are
+retained; this option changes the training-year selection, not the inflow model.
+
+Regression coverage for this mode is in `tests/test_fixed_year_training.py` and
+`tests/test_cascade_plot.py`.
+
 ## Reward scaling and episode logging
 
 Every sampled training episode prints an `EPISODE_METRICS` JSON record, independently of `--diagnostics` and `--plot-details`. Two new plot windows open automatically unless `--no-plot` is set:

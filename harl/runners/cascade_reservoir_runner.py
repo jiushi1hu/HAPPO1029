@@ -56,6 +56,17 @@ def validate_seed(value):
     return int(value)
 
 
+def validate_fixed_training_year(value, data):
+    """Restrict the optional in-sample diagnostic to the existing training split."""
+    if value is None:
+        return None
+    if (isinstance(value, (bool, np.bool_)) or
+            not isinstance(value, (int, np.integer)) or value not in data.training_years):
+        raise ValueError('fixed_training_year must be an integer from the training split; '
+                         'validation and test years are reserved')
+    return int(value)
+
+
 def configure_calendar(algo_args, data, year=None):
     """Allocate a complete sampled year without padding or dropping leap days."""
     args = copy.deepcopy(algo_args)
@@ -99,8 +110,10 @@ class CascadeReservoirRunner(OnPolicyHARunner):
             if not algo_args["algo"].get(key, False):
                 raise ValueError("Forced cascade actions require " + key)
         self.data, self.physical_config = data, physical_config
+        self.fixed_training_year = validate_fixed_training_year(
+            algo_args['experiment'].get('fixed_training_year'), data)
         self.requested_args = copy.deepcopy(algo_args)
-        self.algo_args = algo_args = configure_calendar(algo_args, data)
+        self.algo_args = algo_args = configure_calendar(algo_args, data, self.fixed_training_year)
         self.training_years = data.training_years
         self.year_rng = np.random.RandomState(seed)
         self.sampled_years = []
@@ -121,8 +134,9 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         for key in ("actor_num_mini_batch", "critic_num_mini_batch"):
             if self.length * self.n_envs % algo_args["algo"][key]:
                 raise ValueError("Choose minibatch count dividing rollout size; avoid dropping samples")
-        self.envs = [CascadeReservoirEnv(data, physical_config, start_year=self.training_years[0],
-                                       end_year=self.training_years[0], action_bins=self.action_bins)]
+        initial_year = self.training_years[0] if self.fixed_training_year is None else self.fixed_training_year
+        self.envs = [CascadeReservoirEnv(data, physical_config, start_year=initial_year,
+                                       end_year=initial_year, action_bins=self.action_bins)]
         env = self.envs[0]
         network_args = {**algo_args["model"], **algo_args["algo"]}
         self.actor = [HAPPO(network_args, env.observation_space[i], env.action_space[i], self.device) for i in range(5)]
@@ -137,6 +151,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         self.last_reward_metrics = EpisodeRewardMetrics().summary()
         self.completed_episodes = 0
         self.validation_history = []
+        self.fixed_year_history = []
         self.training_history = []
         self.episode_history = []
         self.episode_log = episode_log
@@ -159,6 +174,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
 
     def sample_training_year(self):
         # Independent of action sampling, optimizer shuffling and evaluation.
+        if self.fixed_training_year is not None:
+            return self.fixed_training_year
         return int(self.year_rng.choice(self.training_years))
 
     def _log_episode(self, rewards, energy, failure=None):
@@ -171,7 +188,10 @@ class CascadeReservoirRunner(OnPolicyHARunner):
 
     @torch.no_grad()
     def collect_episode(self, year=None):
-        """Sample one year with replacement; reset storage and collect every day."""
+        """Collect a complete sampled or fixed training year from initial storage."""
+        if (self.fixed_training_year is not None and year is not None and
+                year != self.fixed_training_year):
+            raise ValueError('Fixed-year diagnostic cannot collect a different training year')
         year = self.sample_training_year() if year is None else int(year)
         self.algo_args = configure_calendar(self.requested_args, self.data, year)
         self.length = self.algo_args["train"]["episode_length"]
@@ -249,6 +269,64 @@ class CascadeReservoirRunner(OnPolicyHARunner):
             gae_target_explained_variance=float(1. - np.var(targets - predictions) /
                                                max(float(np.var(targets)), 1e-8)))
 
+    def evaluate_checkpoint(self):
+        """Keep in-sample diagnostic checkpoints separate from held-out validation."""
+        if self.fixed_training_year is not None:
+            return self.evaluate_training_year()
+        return self.validate()
+
+    def evaluate_training_year(self):
+        """Evaluate the current actors on a fresh copy of the fixed training year.
+
+        Evaluation uses categorical modes, never adds samples to the training
+        buffers, and does not invoke multi-year/stochastic validation reports.
+        """
+        if self.fixed_training_year is None:
+            raise RuntimeError('A fixed training year is required for this diagnostic')
+        with torch.random.fork_rng(devices=[]):
+            row = evaluate_policy(self.actor, self.data, self.physical_config,
+                self.fixed_training_year, self.seed, self.iteration, self.training_steps,
+                deterministic=True, diagnostics=True)
+        power = float(row['energy_MWh']/self.envs[0].physics.reference_energy)
+        terms = dict(band='target_band', rise='daily_rise', fall='daily_fall')
+        costs = {name: float(row.get('episode_penalty_'+term, 0.)) for name, term in terms.items()}
+        total = float(row.get('episode_reward', power))
+        if (not np.isfinite([power, total]+list(costs.values())).all() or
+                not np.isclose(total, power-sum(costs.values()), rtol=1e-9, atol=1e-9)):
+            raise ValueError('Invalid fixed-year evaluation reward components')
+        if row['feasible'] is not True or row['violation_count'] != 0:
+            raise ValueError('Infeasible fixed-year evaluation')
+        percentages = {term: 100.*costs[name]/power if power > 0. else None
+                       for name, term in terms.items()}
+        percentages['total'] = 100.*sum(costs.values())/power if power > 0. else None
+        record = dict(record_type='fixed_year_evaluation', seed=self.seed,
+            episode=self.iteration, training_steps=self.training_steps,
+            year=self.fixed_training_year, deterministic=True,
+            actual_generation_TWh=float(row['energy_TWh']), power_reward=power,
+            total_reward=total, total_soft_penalty=sum(costs.values()),
+            **{name+'_penalty': value for name, value in costs.items()},
+            penalty_to_power_percent=percentages,
+            gamma=float(self.algo_args['algo']['gamma']),
+            gae_lambda=float(self.algo_args['algo']['gae_lambda']),
+            reward_penalties=dict(self.reward_settings),
+            feasible=row['feasible'], violation_count=row['violation_count'],
+            evaluation=row)
+        if self.diagnostics_enabled and self.diagnostics_history:
+            # These critic/actor statistics belong to the latest sampled
+            # training rollout, separately from this deterministic evaluation.
+            record['last_training_update_diagnostics'] = self.diagnostics_history[-1]
+        self.fixed_year_history.append(record)
+        score = total if self.reward_settings['enabled'] else float(row['energy_MWh'])
+        if score > self.best_score:
+            self.best_score, self.best_energy, self.best_iteration = score, float(row['energy_MWh']), self.iteration
+            self.best_actor_states = [copy.deepcopy(a.actor.state_dict()) for a in self.actor]
+        log_episode(record, self.episode_log)
+        print('seed={} episode={} fixed_training_year={} deterministic_generation={:.3f} TWh '
+              'power={:.6f} band={:.6f} rise={:.6f} fall={:.6f} total={:.6f} '
+              '(in-sample diagnostic)'.format(self.seed, self.iteration, self.fixed_training_year,
+                  row['energy_TWh'], power, costs['band'], costs['rise'], costs['fall'], total), flush=True)
+        return score
+
     def validate(self):
         rows = [evaluate_policy(self.actor, self.data, self.physical_config, year,
                                 self.seed, self.iteration, self.training_steps,
@@ -284,7 +362,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
     def run(self, episodes, eval_interval):
         if episodes < 1 or eval_interval < 1:
             raise ValueError("Positive training episodes/evaluation interval required")
-        self.validate()  # Honest untrained point on the learning curve.
+        self.evaluate_checkpoint()  # Honest untrained point on the learning curve.
         for k in range(1, episodes + 1):
             self.iteration = k
             if self.algo_args["train"]["use_linear_lr_decay"]:
@@ -315,7 +393,13 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                 if k % eval_interval == 0 or k == episodes:
                     print_update_window(self, min(eval_interval,k))
             if k % eval_interval == 0 or k == episodes:
-                self.validate()
+                self.evaluate_checkpoint()
+        if self.fixed_training_year is not None:
+            result = dict(seed=self.seed, fixed_training_year=self.fixed_training_year,
+                          best_episode=self.best_iteration, best_training_year_TWh=self.best_energy/1e6)
+            if self.reward_settings['enabled']:
+                result['best_training_year_reward'] = self.best_score
+            return result
         result = dict(seed=self.seed, best_episode=self.best_iteration, best_iteration=self.best_iteration,
                       best_validation_TWh=self.best_energy / 1e6)
         if self.reward_settings['enabled']:
@@ -324,6 +408,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
 
     def final_test(self):
         """Evaluate selected actors once on each user-defined typical year."""
+        if self.fixed_training_year is not None:
+            raise RuntimeError('Fixed-training-year diagnostics do not run held-out tests')
         if self.best_actor_states is None:
             raise RuntimeError("No validation-selected policy is available")
         for actor, weights in zip(self.actor, self.best_actor_states):

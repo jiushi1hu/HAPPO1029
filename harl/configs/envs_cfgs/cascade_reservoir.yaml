@@ -21,6 +21,6 @@ seasonal_constraints: true
 # the five normalized excesses are averaged before applying each weight.
 reward_penalties:
   enabled: true
-  target_band_weight: 0.10
+  target_band_weight: 0.0
   daily_rise_weight: 0.10
   daily_fall_weight: 0.10

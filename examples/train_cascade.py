@@ -1,4 +1,4 @@
-"""Annual HAPPO on 50 real inflow years, with validation and typical-year tests."""
+"""Annual HAPPO with multi-year training or a fixed-year learning check."""
 import argparse
 import copy
 import json
@@ -19,7 +19,8 @@ from harl.envs.cascade_reservoir.reservoir_physics import ReservoirPhysics
 from harl.envs.cascade_reservoir.evaluation import (
     reference_summary, reference_metadata, validate_operating_feasibility)
 from harl.runners.cascade_reservoir_runner import (
-    CascadeReservoirRunner, validate_discount_factor, validate_gae_lambda, validate_seed)
+    CascadeReservoirRunner, validate_discount_factor, validate_gae_lambda, validate_seed,
+    validate_fixed_training_year)
 from harl.envs.cascade_reservoir.reward import reward_settings
 
 
@@ -52,6 +53,9 @@ def main():
     parser.add_argument("--data-dir", type=Path, default=ROOT / "data/cascade_reservoir_new")
     parser.add_argument("--episodes", type=int)
     parser.add_argument("--eval-interval", type=int)
+    parser.add_argument('--fixed-training-year', type=int, metavar='YEAR',
+                        help='Train on one training-split year and evaluate it deterministically; '
+                             'skip held-out validation, final tests and reference runs')
     parser.add_argument('--action-distribution', choices=['categorical'], help='Categorical discrete indices')
     parser.add_argument('--action-bins', type=int, help='Number of discrete choices per reservoir (default: 200)')
     parser.add_argument("--seeds", nargs="+", type=int)
@@ -77,7 +81,7 @@ def main():
     parser.add_argument("--no-plot", action="store_true", help="Run without opening a figure window")
     parser.add_argument('--plot-details', action='store_true', help='Also open reward, training generation, and optimization windows')
     parser.add_argument('--episode-log', type=Path,
-                        help='Write per-episode metrics as JSONL to a new file (never overwrite)')
+                        help='Write episode metrics and fixed-year checkpoints as JSONL to a new file (never overwrite)')
     parser.add_argument("--diagnostics", action="store_true", help="Print training and validation diagnostics without saving files")
     parser.add_argument("--diagnostic-episodes", nargs="+", type=int, default=[0,20,100,150,400])
     parser.add_argument("--diagnostic-stochastic-repeats", type=int, default=3)
@@ -120,6 +124,8 @@ def main():
     if config['model']['action_distribution'] != 'categorical':
         parser.error('Cascade training requires categorical discrete actions')
     exp = config["experiment"]
+    if args.fixed_training_year is not None:
+        exp['fixed_training_year'] = args.fixed_training_year
     for key in ("episodes", "eval_interval", "seeds"):
         if getattr(args, key) is not None:
             exp[key] = getattr(args, key)
@@ -136,12 +142,23 @@ def main():
     exp.update(diagnostics=args.diagnostics, diagnostic_eval_episodes=args.diagnostic_episodes,
                diagnostic_stochastic_repeats=args.diagnostic_stochastic_repeats)
     data = CascadeData(args.data_dir, physical, exp)
+    try:
+        fixed_year = validate_fixed_training_year(exp.get('fixed_training_year'), data)
+    except ValueError as exc:
+        parser.error(str(exc))
+    exp['fixed_training_year'] = fixed_year
+    exp['episode_mode'] = 'fixed_training_year' if fixed_year is not None else 'random_training_year'
     physics = ReservoirPhysics(data, physical)
     seasonal_enabled = physical.get('seasonal_constraints', False)
     operation = data.load_seasonal_operation() if seasonal_enabled else None
     comparison = reference_metadata(physical)
     print(json.dumps(dict(period=[str(data.dates[0]), str(data.dates[-1])],
         training_years=list(data.training_years), training_year_count=len(data.training_years),
+        episode_mode=exp['episode_mode'], fixed_training_year=fixed_year,
+        active_training_years=[fixed_year] if fixed_year is not None else list(data.training_years),
+        checkpoint_evaluation=('deterministic evaluation on the fixed training year (in-sample)' if
+                               fixed_year is not None else 'held-out five-year validation'),
+        held_out_evaluation_enabled=fixed_year is None,
         validation_years=list(data.validation_years),
         test_years=dict(zip(data.test_labels, data.test_years)),
         episodes_per_seed=exp["episodes"], episode_days="365/366", release_mapping="quadratic",
@@ -170,8 +187,10 @@ def main():
         penalty_ratio_definition='100 * episode applied penalty / episode Power Reward; null if Power Reward is zero',
         hard_failure_rate_definition='failed episode attempts / attempted episodes, per seed; failures still raise',
         **comparison), indent=2), flush=True)
-    print('Checking annual operating feasibility for all supplied years ...', flush=True)
-    checked = validate_operating_feasibility(data, physical)
+    print('Checking annual operating feasibility for {} ...'.format(
+        'the fixed training year' if fixed_year is not None else 'all supplied years'), flush=True)
+    checked = (validate_operating_feasibility(data, physical, years=[fixed_year]) if fixed_year is not None
+               else validate_operating_feasibility(data, physical))
     print('Operating feasibility passed for {} years (physical bounds and deadlines only).'.format(
         len(checked)), flush=True)
     if args.check_data_only:
@@ -187,10 +206,15 @@ def main():
         if args.episode_log is not None:
             args.episode_log.parent.mkdir(parents=True, exist_ok=True)
             episode_log = stack.enter_context(args.episode_log.open('x', encoding='utf-8'))
-        references = reported_references(data, physics, data.validation_years,
-                                         config['model']['action_bins'], 'validation')
-        print('Validation reference mean = {:.3f} TWh/year ({})'.format(
-            np.mean([r['energy_TWh'] for r in references]), comparison['reference_label']), flush=True)
+        references = []
+        if fixed_year is None:
+            references = reported_references(data, physics, data.validation_years,
+                                             config['model']['action_bins'], 'validation')
+            print('Validation reference mean = {:.3f} TWh/year ({})'.format(
+                np.mean([r['energy_TWh'] for r in references]), comparison['reference_label']), flush=True)
+        else:
+            print('Fixed-year learning check: training and deterministic evaluation use {}. '
+                  'Held-out validation, final tests and reference runs are skipped.'.format(fixed_year), flush=True)
         runners = []
         for seed in exp["seeds"]:
             runner = CascadeReservoirRunner(data, physical, config, seed,
@@ -198,8 +222,9 @@ def main():
             runner.run(exp["episodes"], exp["eval_interval"])
             runners.append(runner)
         # Test years are used only after all validation-based selections finish.
-        tests = [] if args.skip_final_test else [row for runner in runners for row in runner.final_test()]
-        for year, label in ([] if args.skip_final_test else zip(data.test_years, data.test_labels)):
+        skip_tests = args.skip_final_test or fixed_year is not None
+        tests = [] if skip_tests else [row for runner in runners for row in runner.final_test()]
+        for year, label in ([] if skip_tests else zip(data.test_years, data.test_labels)):
             values = np.array([r["energy_TWh"] for r in tests if r["year"] == year])
             print("test {} ({}) mean={:.3f} TWh seed_SD={:.3f} TWh".format(
                 year, label, values.mean(), values.std(ddof=1) if len(values) > 1 else 0.), flush=True)
@@ -208,12 +233,14 @@ def main():
                 print('test {} mean_reward={:.6f} mean_penalty={:.6f}'.format(year,
                     np.mean([r['episode_reward'] for r in selected]),
                     np.mean([r['episode_penalty'] for r in selected])),flush=True)
-        if args.skip_final_test:
+        if skip_tests:
             print("Typical-year final tests skipped for this diagnostic run.", flush=True)
         else:
             references.extend(reported_references(data, physics, data.test_years,
                                                   config['model']['action_bins'], 'test'))
         payload = dict(gamma=config["algo"]["gamma"], gae_lambda=config["algo"]["gae_lambda"],
+                       fixed_training_year=fixed_year,
+                       fixed_year_histories=([r.fixed_year_history for r in runners] if fixed_year is not None else []),
                        validation_years=list(data.validation_years), test_years=list(data.test_years),
                        test_labels=list(data.test_labels), seeds=exp["seeds"],
                        histories=[r.validation_history for r in runners], tests=tests,

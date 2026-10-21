@@ -153,6 +153,59 @@ def make_validation_reward_figure(payload):
     return fig
 
 
+def make_fixed_year_figure(payload):
+    """Plot unsmoothed, deterministic in-sample checkpoints, including episode zero."""
+    import matplotlib.pyplot as plt
+    year = payload.get('fixed_training_year')
+    seeds, histories = payload['seeds'], payload.get('fixed_year_histories', [])
+    if year is None or not seeds or len(histories) != len(seeds) or not histories[0]:
+        raise ValueError('A fixed training year and one checkpoint history per seed are required')
+    grid = np.array([row['episode'] for row in histories[0]])
+    if grid[0] != 0 or np.any(np.diff(grid) <= 0):
+        raise ValueError('Fixed-year checkpoints must start at zero and increase')
+    for seed, history in zip(seeds, histories):
+        if not np.array_equal(grid, [row['episode'] for row in history]):
+            raise ValueError('Seeds must have matching fixed-year checkpoints')
+        if any(row['year'] != year or row['seed'] != seed or row.get('deterministic') is not True
+               for row in history):
+            raise ValueError('Fixed-year checkpoints must match the year, seed and deterministic policy')
+        if any(row.get('feasible') is not True or row.get('violation_count', 0) != 0 for row in history):
+            raise ValueError('Cannot plot infeasible fixed-year evaluations')
+    metrics = [('actual_generation_TWh', 'Actual generation', 'Generation (TWh/year)'),
+               ('power_reward', 'Power Reward', 'Undiscounted reward units'),
+               ('band_penalty', 'Band penalty', 'Undiscounted reward units'),
+               ('rise_penalty', 'Rise penalty', 'Undiscounted reward units'),
+               ('fall_penalty', 'Fall penalty', 'Undiscounted reward units'),
+               ('total_reward', 'Total Reward', 'Undiscounted reward units')]
+    values = {key: np.asarray([[row[key] for row in history] for history in histories], dtype=float)
+              for key, _, _ in metrics}
+    if not all(np.isfinite(series).all() for series in values.values()):
+        raise ValueError('Non-finite fixed-year evaluation metric')
+    if any((values[key] < 0.).any() for key, _, _ in metrics if key != 'total_reward'):
+        raise ValueError('Generation, Power Reward and penalty costs must be nonnegative')
+    costs = sum(values[key] for key in ('band_penalty', 'rise_penalty', 'fall_penalty'))
+    if not np.allclose(values['total_reward'], values['power_reward']-costs, rtol=1e-9, atol=1e-9):
+        raise ValueError('Fixed-year reward components do not sum to Total Reward')
+    fig, axes = plt.subplots(2, 3, figsize=(14, 7), constrained_layout=True)
+    fig.canvas.manager.set_window_title('HAPPO fixed-year deterministic learning check')
+    for ax, (key, title, ylabel) in zip(axes.flat, metrics):
+        series = values[key]
+        for seed, line in zip(seeds, series):
+            ax.plot(grid, line, alpha=.35, lw=.8, label='Seed {}'.format(seed))
+        mean = series.mean(axis=0)
+        ax.axhline(mean[0], color='#777777', ls='--', lw=1., label='Untrained mean (episode 0)')
+        ax.plot(grid, mean, color='#087f8c', lw=1.8, marker='o', ms=3, label='Deterministic mean')
+        if len(seeds) > 1:
+            sd = series.std(axis=0, ddof=1)
+            ax.fill_between(grid, mean-sd, mean+sd, color='#087f8c', alpha=.15, label='Seed +/-1 SD')
+        ax.set(title=title, xlabel='Training episodes (fixed year {})'.format(year), ylabel=ylabel)
+        ax.grid(alpha=.2)
+        ax.legend(fontsize=7)
+    fig.suptitle('Deterministic evaluation on training year {} | in-sample learning check\n'
+                 'Recorded checkpoints without smoothing; Total = Power - Band - Rise - Fall'.format(year))
+    return fig
+
+
 def make_training_figures(payload, window=20):
     """Extra windows from existing in-memory training metrics; no model changes."""
     import matplotlib.pyplot as plt
@@ -194,7 +247,9 @@ def make_training_figures(payload, window=20):
             sd = rolled.std(axis=0,ddof=1)
             ax.fill_between(grid,mean-sd,mean+sd,color='#087f8c',alpha=.15,
                             label='Smoothed seed +/-1 SD')
-        ax.set_xlabel('Training episodes (randomly sampled years)')
+        ax.set_xlabel('Training episodes (fixed year {})'.format(payload['fixed_training_year'])
+                      if payload.get('fixed_training_year') is not None else
+                      'Training episodes (randomly sampled years)')
         ax.grid(alpha=.2)
         ax.legend(fontsize=8)
 
@@ -210,13 +265,15 @@ def make_training_figures(payload, window=20):
     reward_fig.canvas.manager.set_window_title('HAPPO training reward')
     draw(ax,returns,'{}-episode trailing mean'.format(window),show_raw=True)
     objective = 'penalized return' if payload.get('reward_penalties',{}).get('enabled',False) else 'return'
-    ax.set(title='Stochastic training '+objective+' | sampled training years',
+    year_label = ('fixed training year {}'.format(payload['fixed_training_year'])
+                  if payload.get('fixed_training_year') is not None else 'sampled training years')
+    ax.set(title='Stochastic training '+objective+' | '+year_label,
            ylabel='Episode return (sum of daily rewards)')
 
     energy_fig, ax = plt.subplots(figsize=(10,6),constrained_layout=True)
     energy_fig.canvas.manager.set_window_title('HAPPO training generation')
     draw(ax,energy,'{}-episode trailing mean'.format(window),show_raw=True)
-    ax.set(title='Stochastic training generation | sampled training years',
+    ax.set(title='Stochastic training generation | '+year_label,
            ylabel='Annual cascade generation (TWh)')
 
     optimization_fig, axes = plt.subplots(2,2,figsize=(12,8),constrained_layout=True)
@@ -290,7 +347,9 @@ def make_reward_scale_figures(payload, window=20):
             sd = np.ma.masked_invalid(rolled).std(axis=0, ddof=1).filled(np.nan)
             ax.fill_between(grid, mean-sd, mean+sd, color='#087f8c', alpha=.15,
                             label='Seed +/-1 SD')
-        ax.set_xlabel('Training episodes (sampled years)')
+        ax.set_xlabel('Training episodes (fixed year {})'.format(payload['fixed_training_year'])
+                      if payload.get('fixed_training_year') is not None else
+                      'Training episodes (sampled years)')
         ax.grid(alpha=.2)
         ax.legend(fontsize=8)
 
@@ -303,7 +362,9 @@ def make_reward_scale_figures(payload, window=20):
     axes.flat[-1].axis('off')
     axes.flat[-1].text(.05,.6,'Total = Power - Band - Rise - Fall\n\nPenalties are positive applied costs.\nFailed episodes contain executed days only.',
                         transform=axes.flat[-1].transAxes, va='center', fontsize=10)
-    components_fig.suptitle('Training reward components | episode sums')
+    components_fig.suptitle('Training reward components | episode sums'+
+        (' | fixed year {}'.format(payload['fixed_training_year'])
+         if payload.get('fixed_training_year') is not None else ''))
 
     ratios_fig, axes = plt.subplots(2, 2, figsize=(11, 7), constrained_layout=True)
     ratios_fig.canvas.manager.set_window_title('HAPPO penalties relative to Power Reward')
@@ -329,9 +390,12 @@ def main():
         print("Interactive plotting backend available: " + backend, flush=True)
         return
     payload = json.load(sys.stdin)
-    make_figure(payload)
-    if payload.get('reward_penalties',{}).get('enabled',False):
-        make_validation_reward_figure(payload)
+    if payload.get('fixed_training_year') is not None:
+        make_fixed_year_figure(payload)
+    else:
+        make_figure(payload)
+        if payload.get('reward_penalties',{}).get('enabled',False):
+            make_validation_reward_figure(payload)
     if 'episode_histories' in payload:
         make_reward_scale_figures(payload)
     if args.plot_details:

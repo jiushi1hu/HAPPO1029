@@ -36,6 +36,7 @@ experiment:
   test_years: [1998, 1999, 1970, 1997, 2006]
   test_labels: [extremely_wet, wet, normal, dry, extremely_dry]
   episode_mode: random_training_year
+  fixed_training_year: null  # --fixed-training-year YEAR enables an in-sample learning check.
   episodes: 400  # Independent uniform year draws with replacement, per seed.
   eval_interval: 10
   seeds: [1, 2, 3, 4, 5]
