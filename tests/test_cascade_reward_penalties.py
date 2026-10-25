@@ -51,7 +51,7 @@ class RewardPenaltyTests(unittest.TestCase):
         self.assertAlmostEqual(row['reward'],-.3)
         self.assertEqual(row['generation_reward'],.7)
         self.assertAlmostEqual(row['reward_penalty_by_reservoir'].sum(),1.)
-        metrics=EpisodeRewardMetrics();metrics.update(row)
+        metrics=EpisodeRewardMetrics(1.);metrics.update(row)
         totals=metrics.summary(detailed=True)
         self.assertAlmostEqual(totals['episode_generation_reward']-totals['episode_penalty'],totals['episode_reward'])
         self.assertEqual(totals['soft_violation_days_by_reservoir']['daily_fall'],[0,0,1,0,0])
@@ -100,7 +100,7 @@ class RewardPenaltyTests(unittest.TestCase):
 
     def test_policy_and_reference_have_identical_cost_accounting_for_replayed_actions(self):
         data,config,seasonal=self.fixture();env=CascadeReservoirEnv(data,config);actions=[]
-        totals=EpisodeRewardMetrics()
+        totals=EpisodeRewardMetrics(1.)
         while env.index<env.stop:
             env.step_towards_storage(seasonal.reference['target_end_of_day_storage_m3'][env.index])
             actions.append(env.last_transition['actions'].copy());totals.update(env.last_transition)
@@ -110,8 +110,8 @@ class RewardPenaltyTests(unittest.TestCase):
             def prep_rollout(self):pass
             def act(self,obs,deterministic):
                 result=torch.tensor([[actions[self.day][self.agent]]]);self.day+=1;return result
-        row=evaluate_policy([ReplayActor(i) for i in range(5)],data,config,1965,1,0,0)
-        reference=reference_summary(data,ReservoirPhysics(data,config),[1965])[0]
+        row=evaluate_policy([ReplayActor(i) for i in range(5)],data,config,1965,1,0,0,gamma=1.)
+        reference=reference_summary(data,ReservoirPhysics(data,config),[1965],gamma=1.)[0]
         for key,value in totals.summary(detailed=True).items():
             self.assertEqual(row[key],value);self.assertEqual(reference[key],value)
         self.assertEqual(row['reward_penalties'],reference['reward_penalties'])
@@ -147,7 +147,7 @@ class RewardPenaltyTests(unittest.TestCase):
     def test_stochastic_validation_reports_reward_and_preserves_random_state(self):
         data,physical,_=self.fixture();cfg,_=load_configuration()
         runner=CascadeReservoirRunner(data,physical,cfg,17)
-        rows=[evaluate_policy(runner.actor,data,physical,1965,17,0,0)]
+        rows=[evaluate_policy(runner.actor,data,physical,1965,17,0,0,gamma=cfg['algo']['gamma'])]
         rng=torch.random.get_rng_state().clone()
         with redirect_stdout(io.StringIO()):report=validation_report(runner,rows)
         torch.testing.assert_close(rng,torch.random.get_rng_state(),rtol=0,atol=0)
@@ -200,8 +200,8 @@ class RewardPenaltyTests(unittest.TestCase):
             startup,_=json.JSONDecoder().raw_decode(output.getvalue())
             self.assertEqual(startup['reward_penalties']['enabled'],enabled)
             self.assertEqual(startup['seasonal_constraints'],seasonal)
-            self.assertEqual(startup['evaluation_metric'],'undiscounted annual '+
-                ('penalized return' if enabled else 'generation'))
+            self.assertEqual(startup['evaluation_metric'],'gamma-weighted annual '+
+                ('penalized return' if enabled else 'generation reward'))
         with patch('sys.argv',['train_cascade.py','--no-seasonal-constraints','--reward-penalties']), \
              patch('examples.train_cascade.load_configuration',return_value=(cfg,physical)), \
              patch('examples.train_cascade.CascadeData') as load,redirect_stderr(io.StringIO()):

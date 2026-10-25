@@ -5,7 +5,8 @@ from harl.envs.cascade_reservoir.cascade_reservoir_env import CascadeReservoirEn
 from harl.envs.cascade_reservoir.data_loader import IDS
 from harl.envs.cascade_reservoir.reservoir_physics import InfeasibleCascade
 from harl.envs.cascade_reservoir.terminal_storage import TerminalReleaseBounds
-from harl.envs.cascade_reservoir.reward import EpisodeRewardMetrics
+from harl.envs.cascade_reservoir.reward import (
+    EpisodeRewardMetrics, validate_discount_factor, reward_settings, REWARD_AGGREGATION)
 
 
 def reference_metadata(physical_config):
@@ -96,12 +97,14 @@ class SeasonalMetrics:
 
 
 @torch.no_grad()
-def evaluate_policy(actors, data, physical_config, year, seed, iteration, training_steps, deterministic=True, diagnostics=False):
+def evaluate_policy(actors, data, physical_config, year, seed, iteration, training_steps,
+                    deterministic=True, diagnostics=False, *, gamma):
+    gamma = validate_discount_factor(gamma)
     bins = actors[0].args.get('action_bins', 200)
     env = CascadeReservoirEnv(data, physical_config, start_year=year, end_year=year, action_bins=bins)
     initial = env.storage.copy()
     seasonal_metrics = SeasonalMetrics(env) if env.seasonal is not None else None
-    reward_metrics = EpisodeRewardMetrics()
+    reward_metrics = EpisodeRewardMetrics(gamma)
     energy, spill, residual = 0., 0., 0.
     energy_by_reservoir, spill_by_reservoir = np.zeros(5), np.zeros(5)
     action_sum, mapped_sum, active_count = np.zeros(5), np.zeros(5), np.zeros(5)
@@ -109,10 +112,10 @@ def evaluate_policy(actors, data, physical_config, year, seed, iteration, traini
     for actor in actors:
         actor.prep_rollout()
     for _ in range(env.stop - env.start):
-        obs = env.observation()[None, :]
+        obs = env.actor_observations()
         actions = []
-        for actor in actors:
-            action = actor.act(obs, deterministic=deterministic)
+        for i, actor in enumerate(actors):
+            action = actor.act(obs[i:i+1], deterministic=deterministic)
             actions.append(float(action.item()))
         env.step(np.asarray(actions))
         r = env.last_transition
@@ -137,14 +140,14 @@ def evaluate_policy(actors, data, physical_config, year, seed, iteration, traini
                energy_MWh=energy, energy_TWh=energy / 1e6,
                spill_volume_m3=spill, max_balance_residual_m3=residual,
                head_model=env.physics.head_model, head_data_status=env.physics.head_data_status,
-               feasible=True, violation_count=0)
+               feasible=True, violation_count=0, **env.observation_metadata())
     for i, name in enumerate(IDS):
         row[name + "_start_m3"] = float(initial[i])
         row[name + "_end_m3"] = float(env.storage[i])
     if seasonal_metrics is not None:
         row.update(seasonal_metrics.finish())
-    if env.reward_settings['enabled']:
-        row.update(reward_metrics.summary(detailed=True), reward_penalties=env.reward_settings)
+    row.update(reward_metrics.summary(detailed=True), reward_penalties=env.reward_settings,
+               reward_aggregation=REWARD_AGGREGATION)
     if diagnostics:
         row.update(energy_by_reservoir_TWh=(energy_by_reservoir/1e6).tolist(),
             spill_by_reservoir_billion_m3=(spill_by_reservoir/1e9).tolist(),
@@ -158,13 +161,14 @@ def evaluate_policy(actors, data, physical_config, year, seed, iteration, traini
     return row
 
 
-def reference_summary(data, physics, years, action_bins=200):
+def reference_summary(data, physics, years, action_bins=200, *, gamma):
     """Reference matched to the selected operating mode and physical model.
 
     Seasonal targets are soft: low-flow years can deviate from the prescribed
     curve while obeying the same hard constraints as the learned controller.
     The legacy analytic reference is retained only when seasonality is off.
     """
+    gamma = validate_discount_factor(gamma)
     rows = []
     for year in years:
         if physics.config.get('seasonal_constraints', False):
@@ -172,7 +176,7 @@ def reference_summary(data, physics, years, action_bins=200):
                                       action_bins=action_bins)
             initial = env.storage.copy()
             metrics = SeasonalMetrics(env)
-            reward_metrics = EpisodeRewardMetrics()
+            reward_metrics = EpisodeRewardMetrics(gamma)
             energy = np.zeros(5); spill = np.zeros(5); head = np.zeros(5)
             residual = 0.
             while env.index < env.stop:
@@ -188,8 +192,8 @@ def reference_summary(data, physics, years, action_bins=200):
                 mean_net_head_m=(head/(env.stop-env.start)).tolist(), head_model=physics.head_model,
                 head_data_status=physics.head_data_status, **reference_metadata(physics.config))
             row.update(metrics.finish())
-            if env.reward_settings['enabled']:
-                row.update(reward_metrics.summary(detailed=True), reward_penalties=env.reward_settings)
+            row.update(reward_metrics.summary(detailed=True), reward_penalties=env.reward_settings,
+                       reward_aggregation=REWARD_AGGREGATION)
             for i, name in enumerate(IDS):
                 row[name+'_start_m3'] = float(initial[i])
                 row[name+'_end_m3'] = float(env.storage[i])
@@ -197,6 +201,11 @@ def reference_summary(data, physics, years, action_bins=200):
             continue
         start, stop = data.indices(year, year)
         _, energy = physics.constant_storage(data.external[start:stop], data.initial_storage(year))
-        rows.append(dict(year=year, energy_TWh=float(energy.sum() / 1e6),
-                         head_model=physics.head_model, head_data_status=physics.head_data_status))
+        reward_metrics = EpisodeRewardMetrics(gamma)
+        for daily_energy in energy:
+            reward_metrics.update(dict(reward=float(daily_energy.sum()/physics.reference_energy)))
+        rows.append(dict(year=year, energy_MWh=float(energy.sum()), energy_TWh=float(energy.sum() / 1e6),
+                         head_model=physics.head_model, head_data_status=physics.head_data_status,
+                         reward_penalties=reward_settings(physics.config), reward_aggregation=REWARD_AGGREGATION,
+                         **reward_metrics.summary()))
     return rows

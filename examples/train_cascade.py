@@ -14,14 +14,16 @@ sys.path.insert(0, str(ROOT))
 
 import numpy as np
 import yaml
-from harl.envs.cascade_reservoir.data_loader import CascadeData, HEAD_MODELS, IDS
+from harl.envs.cascade_reservoir.data_loader import CascadeData, HEAD_MODELS, IDS, resolve_year_split
+from harl.envs.cascade_reservoir.cascade_reservoir_env import (
+    ACTOR_OBSERVATION_LAYOUT, actor_observation_features)
 from harl.envs.cascade_reservoir.reservoir_physics import ReservoirPhysics
 from harl.envs.cascade_reservoir.evaluation import (
     reference_summary, reference_metadata, validate_operating_feasibility)
 from harl.runners.cascade_reservoir_runner import (
     CascadeReservoirRunner, validate_discount_factor, validate_gae_lambda, validate_seed,
     validate_fixed_training_year)
-from harl.envs.cascade_reservoir.reward import reward_settings
+from harl.envs.cascade_reservoir.reward import reward_settings, REWARD_AGGREGATION
 
 
 def merge(base, override):
@@ -38,11 +40,11 @@ def load_configuration():
     return merge(read("algos_cfgs/happo.yaml"), read("algos_cfgs/happo_cascade.yaml")), read("envs_cfgs/cascade_reservoir.yaml")
 
 
-def reported_references(data, physics, years, action_bins, phase):
+def reported_references(data, physics, years, action_bins, phase, gamma):
     rows = []
     for year in years:
         print('Computing {} reference for {} ...'.format(phase, year), flush=True)
-        row = reference_summary(data, physics, [year], action_bins=action_bins)[0]
+        row = reference_summary(data, physics, [year], action_bins=action_bins, gamma=gamma)[0]
         print('REFERENCE_{} {}'.format(phase.upper(), json.dumps(row)), flush=True)
         rows.append(row)
     return rows
@@ -53,13 +55,20 @@ def main():
     parser.add_argument("--data-dir", type=Path, default=ROOT / "data/cascade_reservoir_new")
     parser.add_argument("--episodes", type=int)
     parser.add_argument("--eval-interval", type=int)
+    parser.add_argument('--training-years', nargs='+', type=int, metavar='YEAR',
+                        help='Explicit training years; unassigned years are unused')
+    parser.add_argument('--validation-years', nargs='+', type=int, metavar='YEAR',
+                        help='Held-out years whose mean reward selects the checkpoint')
+    parser.add_argument('--test-years', nargs='+', type=int, metavar='YEAR',
+                        help='Held-out years evaluated only after validation selection')
     parser.add_argument('--fixed-training-year', type=int, metavar='YEAR',
                         help='Train on one training-split year and evaluate it deterministically; '
                              'skip held-out validation, final tests and reference runs')
     parser.add_argument('--action-distribution', choices=['categorical'], help='Categorical discrete indices')
     parser.add_argument('--action-bins', type=int, help='Number of discrete choices per reservoir (default: 200)')
     parser.add_argument("--seeds", nargs="+", type=int)
-    parser.add_argument("--gamma", type=float, help="Training discount factor in [0, 1]; overrides YAML")
+    parser.add_argument("--gamma", type=float,
+                        help="Shared discount factor for training, evaluation and rewards in [0, 1]; overrides YAML")
     parser.add_argument("--gae-lambda", type=float,
                         help="GAE trace parameter; 1 uses full realized returns with the selected gamma")
     parser.add_argument("--head-model", choices=HEAD_MODELS,
@@ -68,7 +77,7 @@ def main():
     seasonal.add_argument('--seasonal-constraints', dest='seasonal_constraints', action='store_true',
                           help='Enforce supplied seasonal bounds and deadlines (default from YAML: enabled)')
     seasonal.add_argument('--no-seasonal-constraints', dest='seasonal_constraints', action='store_false',
-                          help='Use legacy global bounds, 18 observations and the constant-storage reference')
+                          help='Use global bounds, 11 local actor inputs, an 18-value critic state and the constant-storage reference')
     parser.set_defaults(seasonal_constraints=None)
     penalties = parser.add_mutually_exclusive_group()
     penalties.add_argument('--reward-penalties',dest='reward_penalties',action='store_true',
@@ -129,6 +138,17 @@ def main():
     for key in ("episodes", "eval_interval", "seeds"):
         if getattr(args, key) is not None:
             exp[key] = getattr(args, key)
+    for key in ('training_years', 'validation_years', 'test_years'):
+        if getattr(args, key) is not None:
+            exp[key] = getattr(args, key)
+    if args.test_years is not None:
+        # A custom test year must not inherit an unrelated wet/dry label.
+        exp.pop('test_labels', None)
+    try:
+        split = resolve_year_split(exp)
+    except ValueError as exc:
+        parser.error(str(exc))
+    exp['test_labels'] = split['test_labels']
     try:
         if not isinstance(exp['seeds'], (list, tuple)):
             raise ValueError('Seeds must be a nonempty sequence of integers')
@@ -157,7 +177,7 @@ def main():
         episode_mode=exp['episode_mode'], fixed_training_year=fixed_year,
         active_training_years=[fixed_year] if fixed_year is not None else list(data.training_years),
         checkpoint_evaluation=('deterministic evaluation on the fixed training year (in-sample)' if
-                               fixed_year is not None else 'held-out five-year validation'),
+                               fixed_year is not None else 'held-out validation on {} years'.format(len(data.validation_years))),
         held_out_evaluation_enabled=fixed_year is None,
         validation_years=list(data.validation_years),
         test_years=dict(zip(data.test_labels, data.test_years)),
@@ -169,7 +189,11 @@ def main():
         action_distribution=config['model']['action_distribution'],
         action_bins=config['model']['action_bins'],
         seasonal_constraints=seasonal_enabled,
-        observation_size=43 if seasonal_enabled else 18,
+        observation_size=len(actor_observation_features(seasonal_enabled)),
+        actor_observation_size=len(actor_observation_features(seasonal_enabled)),
+        actor_observation_layout=ACTOR_OBSERVATION_LAYOUT,
+        actor_observation_features=list(actor_observation_features(seasonal_enabled)),
+        critic_state_size=43 if seasonal_enabled else 18,
         terminal_storage_mode=physical.get('terminal_storage_mode', 'free'),
         operation_data_status=(None if operation is None else
             {name: operation.key_parameters[name]['value_status'] for name in IDS}),
@@ -178,19 +202,20 @@ def main():
         reward_penalties=penalty_settings,
         penalty_normalization='mean of excess metres / operating level range over five reservoirs',
         penalty_weight_status='assumed_sensitivity_only',
-        evaluation_metric=('undiscounted annual penalized return' if penalty_settings['enabled'] else
-                           'undiscounted annual generation'),
+        evaluation_metric=('gamma-weighted annual penalized return' if penalty_settings['enabled'] else
+                           'gamma-weighted annual generation reward'),
         generation_metric='undiscounted annual generation',
+        reward_aggregation=REWARD_AGGREGATION,
         result_storage="memory and console; optional episode JSONL",
         episode_log=None if args.episode_log is None else str(args.episode_log.resolve()),
-        reward_curve_units='undiscounted episode sums; penalties are positive costs',
+        reward_curve_units='gamma-weighted episode sums; penalties are positive costs',
         penalty_ratio_definition='100 * episode applied penalty / episode Power Reward; null if Power Reward is zero',
         hard_failure_rate_definition='failed episode attempts / attempted episodes, per seed; failures still raise',
         **comparison), indent=2), flush=True)
-    print('Checking annual operating feasibility for {} ...'.format(
-        'the fixed training year' if fixed_year is not None else 'all supplied years'), flush=True)
-    checked = (validate_operating_feasibility(data, physical, years=[fixed_year]) if fixed_year is not None
-               else validate_operating_feasibility(data, physical))
+    selected_years = ([fixed_year] if fixed_year is not None else
+                      sorted(set(data.training_years + data.validation_years + data.test_years)))
+    print('Checking annual operating feasibility for years {} ...'.format(selected_years), flush=True)
+    checked = validate_operating_feasibility(data, physical, years=selected_years)
     print('Operating feasibility passed for {} years (physical bounds and deadlines only).'.format(
         len(checked)), flush=True)
     if args.check_data_only:
@@ -209,7 +234,7 @@ def main():
         references = []
         if fixed_year is None:
             references = reported_references(data, physics, data.validation_years,
-                                             config['model']['action_bins'], 'validation')
+                                             config['model']['action_bins'], 'validation', config['algo']['gamma'])
             print('Validation reference mean = {:.3f} TWh/year ({})'.format(
                 np.mean([r['energy_TWh'] for r in references]), comparison['reference_label']), flush=True)
         else:
@@ -228,17 +253,17 @@ def main():
             values = np.array([r["energy_TWh"] for r in tests if r["year"] == year])
             print("test {} ({}) mean={:.3f} TWh seed_SD={:.3f} TWh".format(
                 year, label, values.mean(), values.std(ddof=1) if len(values) > 1 else 0.), flush=True)
-            if penalty_settings['enabled']:
-                selected = [r for r in tests if r['year']==year]
-                print('test {} mean_reward={:.6f} mean_penalty={:.6f}'.format(year,
-                    np.mean([r['episode_reward'] for r in selected]),
-                    np.mean([r['episode_penalty'] for r in selected])),flush=True)
+            selected = [r for r in tests if r['year']==year]
+            print('test {} mean_reward={:.6f} mean_penalty={:.6f} gamma={}'.format(year,
+                np.mean([r['episode_reward'] for r in selected]),
+                np.mean([r['episode_penalty'] for r in selected]),config['algo']['gamma']),flush=True)
         if skip_tests:
             print("Typical-year final tests skipped for this diagnostic run.", flush=True)
         else:
             references.extend(reported_references(data, physics, data.test_years,
-                                                  config['model']['action_bins'], 'test'))
+                                                  config['model']['action_bins'], 'test', config['algo']['gamma']))
         payload = dict(gamma=config["algo"]["gamma"], gae_lambda=config["algo"]["gae_lambda"],
+                       reward_aggregation=REWARD_AGGREGATION,
                        fixed_training_year=fixed_year,
                        fixed_year_histories=([r.fixed_year_history for r in runners] if fixed_year is not None else []),
                        validation_years=list(data.validation_years), test_years=list(data.test_years),

@@ -44,25 +44,35 @@ class HAPPO(OnPolicyBase):
             adv_targ,
             available_actions_batch,
             factor_batch,
+            objective_weights_batch,
         ) = sample
 
         old_action_log_probs_batch = check(old_action_log_probs_batch).to(**self.tpdv)
         adv_targ = check(adv_targ).to(**self.tpdv)
         active_masks_batch = check(active_masks_batch).to(**self.tpdv)
         factor_batch = check(factor_batch).to(**self.tpdv)
+        objective_weights_batch = check(objective_weights_batch).to(**self.tpdv)
+        if (objective_weights_batch.shape != active_masks_batch.shape or
+                not torch.isfinite(objective_weights_batch).all() or
+                (objective_weights_batch < 0).any()):
+            raise ValueError("Objective weights must be finite nonnegative sample scalars")
+        sample_weights = objective_weights_batch
+        if self.use_policy_active_masks:
+            sample_weights = sample_weights * active_masks_batch
 
-        # A mini-batch can contain only physically forced actions. Do not step
-        # Adam here: even a zero gradient could move parameters via momentum.
-        if self.use_policy_active_masks and active_masks_batch.sum().item() == 0:
+        # Forced actions and, for gamma=0, all days after the episode start
+        # have no objective contribution. Adam momentum must not move them.
+        if not (sample_weights > 0).any():
             zero = torch.zeros((), **self.tpdv)
             return zero, zero, zero, torch.ones_like(adv_targ)
 
         # Reshape to do evaluations for all steps in a single forward pass
-        action_log_probs, dist_entropy, _ = self.evaluate_actions(
+        action_log_probs, entropy_per_sample, _ = self.evaluate_actions(
             obs_batch,
             actions_batch,
             available_actions_batch,
             active_masks_batch,
+            return_entropy_per_sample=True,
         )
 
         # actor update
@@ -77,17 +87,14 @@ class HAPPO(OnPolicyBase):
             * adv_targ
         )
 
-        if self.use_policy_active_masks:
-            policy_action_loss = (
-                -torch.sum(factor_batch * torch.min(surr1, surr2), dim=-1, keepdim=True)
-                * active_masks_batch
-            ).sum() / active_masks_batch.sum()
-        else:
-            policy_action_loss = -torch.sum(
-                factor_batch * torch.min(surr1, surr2), dim=-1, keepdim=True
-            ).mean()
-
-        policy_loss = policy_action_loss
+        # Uniformly shuffled calendar rows estimate the episode-start objective
+        # only when each row retains gamma**t. Average over all sampled rows:
+        # dividing by a batch's active/discounted mass would change the time
+        # weighting (and cancels it entirely in a one-row mini-batch).
+        policy_loss = -(sample_weights * torch.sum(
+            factor_batch * torch.min(surr1, surr2), dim=-1, keepdim=True
+        )).mean()
+        dist_entropy = (sample_weights * entropy_per_sample.reshape(-1, 1)).mean()
 
         self.actor_optimizer.zero_grad()
 
@@ -129,9 +136,13 @@ class HAPPO(OnPolicyBase):
             std_advantages = np.nanstd(advantages_copy)
             advantages = (advantages - mean_advantages) / (std_advantages + 1e-5)
 
+        # Keep this separate from advantages, so normalization cannot remove
+        # the episode-start discount, and separate from HAPPO's likelihood factor.
+        objective_weights = actor_buffer.discount_weights(self.args["gamma"])
         for _ in range(self.ppo_epoch):
             data_generator = actor_buffer.feed_forward_generator_actor(
-                advantages, self.actor_num_mini_batch
+                advantages, self.actor_num_mini_batch,
+                objective_weights=objective_weights,
             )
 
             for sample in data_generator:

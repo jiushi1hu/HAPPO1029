@@ -35,8 +35,10 @@ class RewardScaleMetricsTests(unittest.TestCase):
         env = SimpleNamespace(start=0, index=2, stop=2,
             data=SimpleNamespace(dates=[date(1965,1,1)+timedelta(days=t) for t in range(3)]),
             physics=SimpleNamespace(reference_energy=100.), seasonal=object(),
-            reward_settings={'enabled':True}, terminal_storage_target=None)
-        metrics = EpisodeRewardMetrics()
+            reward_settings={'enabled':True}, terminal_storage_target=None,
+            observation_metadata=lambda:dict(actor_observation_layout='local_neighbors_v1',
+                                             actor_observation_size=16,critic_state_size=43))
+        metrics = EpisodeRewardMetrics(1.)
         for power,costs,excess in [(1.,(.1,.2,0.),([1,0,0,0,0],[0,3,0,0,0],[0]*5)),
                                    (2.,(.2,0.,.1),([2,0,1,0,0],[0]*5,[0,0,0,4,0]))]:
             components=dict(zip(('target_band','daily_rise','daily_fall'),costs))
@@ -57,6 +59,9 @@ class RewardScaleMetricsTests(unittest.TestCase):
         self.assertEqual(band['max_m'],2.)
         self.assertEqual(band['by_reservoir_days'],[2,0,1,0,0])
         self.assertEqual(row['hard_constraint_failure_rate'],0.)
+        self.assertEqual(row['actor_observation_layout'],'local_neighbors_v1')
+        self.assertEqual(row['actor_observation_size'],16)
+        self.assertEqual(row['critic_state_size'],43)
         stream,console=io.StringIO(),io.StringIO()
         with redirect_stdout(console):log_episode(row,stream)
         self.assertEqual(json.loads(stream.getvalue()),row)

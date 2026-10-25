@@ -2,7 +2,7 @@
 import json
 import numpy as np
 from harl.envs.cascade_reservoir.data_loader import IDS
-from harl.envs.cascade_reservoir.reward import PENALTY_TERMS
+from harl.envs.cascade_reservoir.reward import PENALTY_TERMS, REWARD_AGGREGATION
 
 
 def episode_record(env, rewards, energy_by_reservoir, seed, episode, gamma,
@@ -21,9 +21,12 @@ def episode_record(env, rewards, energy_by_reservoir, seed, episode, gamma,
     if energy.shape != (5,) or not np.isfinite(energy).all() or (energy < 0.).any():
         raise ValueError('Generation must be a finite nonnegative five-vector')
     totals = rewards.summary()
+    if rewards.gamma != gamma or rewards.steps != days:
+        raise ValueError('Episode accounting must use the training gamma and executed days')
     power = totals['episode_generation_reward']
     costs = {k: totals['episode_penalty_'+k] for k in PENALTY_TERMS}
-    if not np.isclose(power, energy.sum()/env.physics.reference_energy, rtol=1e-10, atol=1e-9):
+    if not np.isclose(rewards.undiscounted_generation_reward,
+                      energy.sum()/env.physics.reference_energy, rtol=1e-10, atol=1e-9):
         raise ValueError('Power Reward and actual generation disagree')
     if not np.isclose(totals['episode_reward'], power-sum(costs.values()), rtol=1e-10, atol=1e-9):
         raise ValueError('Reward components do not sum to Total Reward')
@@ -55,6 +58,7 @@ def episode_record(env, rewards, energy_by_reservoir, seed, episode, gamma,
         attempted_episodes=int(episode), failed_episodes_so_far=int(failed_episodes), failure=failure,
         soft_constraints_available=env.seasonal is not None, soft_exceedances=soft,
         gamma=float(gamma), gae_lambda=float(gae_lambda),
+        reward_aggregation=REWARD_AGGREGATION, **env.observation_metadata(),
         reward_penalties=dict(env.reward_settings), reference_energy_MWh=env.physics.reference_energy,
         feasibility_uses_actual_future_inflows=bool(env.seasonal is not None or
                                                    env.terminal_storage_target is not None))

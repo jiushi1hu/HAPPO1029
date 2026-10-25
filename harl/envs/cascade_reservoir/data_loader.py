@@ -20,6 +20,52 @@ OPERATION_PERIODS = ("drawdown", "flood_season", "impoundment", "dry_season")
 FLOW_COLUMNS = ("WDD_external_inflow_m3s",) + tuple(
     name + "_interval_inflow_m3s" for name in IDS[1:]
 )
+DEFAULT_VALIDATION_YEARS = (2020, 2021, 2022, 2023, 2024)
+DEFAULT_TEST_YEARS = (1998, 1999, 1970, 1997, 2006)
+DEFAULT_TEST_LABELS = ("extremely_wet", "wet", "normal", "dry", "extremely_dry")
+
+
+def resolve_year_split(experiment):
+    """Validate disjoint year lists before reading data or fitting a scaler.
+
+    Omitted training years retain the historical complement-of-holdouts default.
+    Explicit training years leave every other unassigned year unused.
+    """
+    available = set(range(1965, 2025))
+
+    def years(key, default):
+        values = experiment.get(key, default)
+        if not isinstance(values, (list, tuple)) or not values:
+            raise ValueError(key + ' must be a nonempty list of integer years')
+        if any(isinstance(y, (bool, np.bool_)) or not isinstance(y, (int, np.integer)) for y in values):
+            raise ValueError(key + ' must contain integer years')
+        values = tuple(int(y) for y in values)
+        if len(set(values)) != len(values):
+            raise ValueError(key + ' must contain unique years')
+        if not set(values) <= available:
+            raise ValueError(key + ' must lie within 1965--2024')
+        return values
+
+    validation = years('validation_years', DEFAULT_VALIDATION_YEARS)
+    tests = years('test_years', DEFAULT_TEST_YEARS)
+    if set(validation) & set(tests):
+        raise ValueError('Validation and test years must be disjoint')
+    reserved = set(validation) | set(tests)
+    training = (tuple(sorted(available - reserved)) if experiment.get('training_years') is None
+                else tuple(sorted(years('training_years', ()))))
+    if not training:
+        raise ValueError('training_years must be nonempty')
+    if set(training) & reserved:
+        raise ValueError('Training years must be disjoint from validation and test years')
+    labels = experiment.get('test_labels')
+    if labels is None:
+        labels = DEFAULT_TEST_LABELS if tests == DEFAULT_TEST_YEARS else tuple('test_'+str(y) for y in tests)
+    if (not isinstance(labels, (list, tuple)) or len(labels) != len(tests) or
+            any(not isinstance(label, str) or not label.strip() for label in labels) or
+            len(set(labels)) != len(labels)):
+        raise ValueError('Require one unique nonempty test label per test year')
+    return dict(training_years=training, validation_years=validation,
+                test_years=tests, test_labels=tuple(labels))
 
 
 def read_csv(path):
@@ -37,15 +83,8 @@ class CascadeData:
         if self.head_model not in HEAD_MODELS:
             raise ValueError("Unknown head model: " + str(self.head_model))
         experiment = experiment or {}
-        self.validation_years = tuple(int(y) for y in experiment.get("validation_years", range(2020, 2025)))
-        self.test_years = tuple(int(y) for y in experiment.get("test_years", [1998, 1999, 1970, 1997, 2006]))
-        self.test_labels = tuple(experiment.get("test_labels", ["extremely_wet", "wet", "normal", "dry", "extremely_dry"]))
-        if len(self.validation_years) != 5 or len(set(self.validation_years)) != 5:
-            raise ValueError("Require five unique validation years")
-        if len(self.test_years) != 5 or len(set(self.test_years)) != 5 or len(self.test_labels) != 5:
-            raise ValueError("Require five unique test years and five corresponding labels")
-        if set(self.validation_years) & set(self.test_years):
-            raise ValueError("Validation and test years must be disjoint")
+        for name, values in resolve_year_split(experiment).items():
+            setattr(self, name, values)
         if tuple(config["reservoir_ids"]) != IDS:
             raise ValueError("Reservoir order must be WDD/BHT/XLD/XJB/THR")
         rels = ["daily_incremental_inflows_1965_2024.csv", "initial_storage_1965_2024.csv",
@@ -64,12 +103,8 @@ class CascadeData:
         self.start_year, self.end_year = 1965, 2024
         self.years = np.array([d.year for d in self.dates])
         all_years = set(range(self.start_year, self.end_year + 1))
-        reserved = set(self.validation_years) | set(self.test_years)
-        if not reserved <= all_years:
-            raise ValueError("Holdout years lie outside the dataset")
-        self.training_years = tuple(sorted(all_years - reserved))
-        if len(self.training_years) != 50:
-            raise ValueError("Require exactly 50 training years")
+        selected = set(self.training_years + self.validation_years + self.test_years)
+        self.unused_years = tuple(sorted(all_years - selected))
         self.train_mask = np.isin(self.years, self.training_years)
         train_flow = self.external[self.train_mask]
         self.flow_mean = train_flow.mean(axis=0)

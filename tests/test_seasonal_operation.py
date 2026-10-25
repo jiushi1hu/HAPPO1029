@@ -386,14 +386,17 @@ class SeasonalExecutionTests(unittest.TestCase):
 
     def test_environment_enforces_all_deadlines_and_canonical_forced_actions(self):
         d,c,s=self.fixture();env=CascadeReservoirEnv(d,c)
-        self.assertEqual(env.observation_space[0].shape,(43,))
+        self.assertEqual(env.observation_space[0].shape,(16,))
+        self.assertEqual(env.share_observation_space[0].shape,(43,))
         for day in range(5):
             obs,state,reward,done,infos,_=env.step(np.full(5,199))
             r=env.last_transition
             self.assertTrue((env.storage>=s.storage_lower[day]-1e-7).all())
             self.assertTrue((env.storage<=s.storage_upper[day]+1e-7).all())
             np.testing.assert_allclose(r['storage_end']-r['storage_start'],(r['inflow']-r['release'])*DT,rtol=0,atol=1e-7)
-            self.assertTrue(np.isfinite(obs).all());np.testing.assert_array_equal(obs,state)
+            self.assertTrue(np.isfinite(obs).all())
+            np.testing.assert_array_equal(obs,env.actor_observations())
+            np.testing.assert_array_equal(state,np.tile(env.state(),(5,1)))
             self.assertEqual(infos[0]['seasonal_phase'],r['seasonal_phases'][0])
             self.assertEqual(infos[0]['flood_limit_active'],bool(s.flood_limit_active[day,0]))
             if day==0:self.assertGreaterEqual(r['low'][0],3.-1e-8)
@@ -403,22 +406,23 @@ class SeasonalExecutionTests(unittest.TestCase):
         np.testing.assert_allclose(env.storage,d.vmax,rtol=0,atol=1e-7)
         np.testing.assert_array_equal(env.last_transition['controls'],np.zeros(5))
         np.testing.assert_array_equal(env.last_transition['actions'],np.zeros(5))
-        np.testing.assert_array_equal(obs,np.zeros((5,43)))
+        np.testing.assert_array_equal(obs,np.zeros((5,16)))
+        np.testing.assert_array_equal(state,np.zeros((5,43)))
         self.assertTrue(done.all())
         env.reset();self.assertIsNone(env.last_transition);self.assertEqual(env.index,env.start)
 
     def test_observations_expose_rules_without_future_inflows(self):
-        d,c,_=self.fixture();env=CascadeReservoirEnv(d,c);obs=env.observation()
+        d,c,_=self.fixture();env=CascadeReservoirEnv(d,c);obs=env.state()
         np.testing.assert_array_equal(obs[18:23],np.zeros(5))
         np.testing.assert_array_equal(obs[23:28],np.ones(5))
         np.testing.assert_allclose(obs[28:33],np.full(5,2./366),rtol=0,atol=1e-8)
         self.assertAlmostEqual(float(obs[38]),.2,places=7)
         # Future flow changes do not enter the state vector or any rule feature.
         d.external[2:]+=1.
-        np.testing.assert_array_equal(env.observation(),obs)
+        np.testing.assert_array_equal(env.state(),obs)
         d.external[2:]-=1.
         # At day 3 the next event is the day-4 refill target.
-        env.step(np.zeros(5));env.step(np.zeros(5));obs=env.observation()
+        env.step(np.zeros(5));env.step(np.zeros(5));obs=env.state()
         np.testing.assert_array_equal(obs[33:38],np.ones(5))
         np.testing.assert_array_equal(obs[38:43],np.ones(5))
 
@@ -427,7 +431,7 @@ class SeasonalExecutionTests(unittest.TestCase):
         self.assertIsNone(env.terminal_storage_target)
         for _ in range(4):env.step(np.zeros(5))
         np.testing.assert_allclose(env.storage,d.vmax,rtol=0,atol=1e-7)
-        np.testing.assert_array_equal(env.observation()[28:33],np.full(5,-1.))
+        np.testing.assert_array_equal(env.state()[28:33],np.full(5,-1.))
         env.step(np.full(5,199))
         self.assertLess(env.storage.sum(),d.vmax.sum())
 
@@ -456,7 +460,8 @@ class SeasonalExecutionTests(unittest.TestCase):
     def test_loading_alone_does_not_enable_seasonal_execution(self):
         d,c,_=self.fixture();c['seasonal_constraints']=False
         env=CascadeReservoirEnv(d,c);env.step(np.zeros(5))
-        self.assertEqual(env.observation().shape,(18,))
+        self.assertEqual(env.state().shape,(18,))
+        self.assertEqual(env.actor_observations().shape,(5,11))
         np.testing.assert_array_equal(env.storage,d.vmax)
         self.assertNotIn('storage_upper_m3',env.last_transition)
         with self.assertRaises(ValueError):CascadeReservoirEnv(d,dict(c,seasonal_constraints='true'))
@@ -467,7 +472,7 @@ class SeasonalExecutionTests(unittest.TestCase):
         cfg,_=load_configuration()
         runner=CascadeReservoirRunner(d,c,cfg,seed=17)
         runner.collect_episode(1965)
-        self.assertEqual(runner.actor_buffer[0].obs.shape,(6,1,43))
+        self.assertEqual(runner.actor_buffer[0].obs.shape,(6,1,16))
         self.assertEqual(runner.critic_buffer.share_obs.shape,(6,1,43))
         self.assertTrue(np.isfinite(runner.critic_buffer.returns).all())
         np.testing.assert_allclose(runner.envs[0].storage,d.vmax,rtol=0,atol=1e-7)
@@ -484,7 +489,7 @@ class SeasonalEvaluationTests(unittest.TestCase):
             with self.subTest(bins=bins):
                 d,c,s=SeasonalExecutionTests().fixture()
                 d.validation_years=(1965,);d.test_years=()
-                reference=reference_summary(d,ReservoirPhysics(d,c),[1965],action_bins=bins)[0]
+                reference=reference_summary(d,ReservoirPhysics(d,c),[1965],action_bins=bins,gamma=1.)[0]
                 env=CascadeReservoirEnv(d,c,action_bins=bins);actions=[]
                 while env.index<env.stop:
                     env.step_towards_storage(s.reference['target_end_of_day_storage_m3'][env.index])
@@ -499,7 +504,7 @@ class SeasonalEvaluationTests(unittest.TestCase):
                     def act(self, obs, deterministic):
                         action=actions[self.day][self.agent];self.day+=1
                         return torch.tensor([[action]])
-                row=evaluate_policy([ReplayActor(i) for i in range(5)],d,c,1965,1,0,0,diagnostics=True)
+                row=evaluate_policy([ReplayActor(i) for i in range(5)],d,c,1965,1,0,0,diagnostics=True,gamma=1.)
                 self.assertAlmostEqual(row['energy_TWh'],reference['energy_TWh'],places=12)
                 self.assertEqual(row['violation_count'],0);self.assertTrue(row['feasible'])
                 self.assertEqual(reference['reference_type'],'seasonal_target_tracking')
@@ -536,7 +541,7 @@ class SeasonalEvaluationTests(unittest.TestCase):
     def test_reference_default_action_grid_can_be_overridden(self):
         d,c,_=SeasonalExecutionTests().fixture();p=ReservoirPhysics(d,c)
         with self.assertRaisesRegex(ValueError,'action_bins'):
-            reference_summary(d,p,[1965],action_bins=1)
+            reference_summary(d,p,[1965],action_bins=1,gamma=1.)
 
     def test_compliance_accounting_detects_a_corrupted_transition(self):
         d,c,s=SeasonalExecutionTests().fixture();env=CascadeReservoirEnv(d,c)

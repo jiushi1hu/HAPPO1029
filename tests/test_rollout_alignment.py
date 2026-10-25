@@ -22,11 +22,13 @@ class RecordingEnv(CascadeReservoirEnv):
         return super().reset()
 
     def step(self, actions):
-        before = self.observation().copy()
+        before = self.state().copy()
+        actor_before = self.actor_observations().copy()
         date = self.data.dates[self.index]
         result = super().step(actions)
         self.records.append(dict(
-            obs=before, date=date, sampled=actions.copy(), next_obs=self.observation().copy(),
+            obs=before, actor_obs=actor_before, date=date, sampled=actions.copy(),
+            next_obs=self.state().copy(), next_actor_obs=result[0].copy(),
             executed=self.last_transition['actions'].copy(),
             controls=self.last_transition['controls'].copy(),
             reward=result[2].copy(), done=result[3].copy()))
@@ -151,11 +153,11 @@ class RolloutAlignmentTests(unittest.TestCase):
                 np.testing.assert_array_equal(row['obs'], records[t - 1]['next_obs'])
             for i, b in enumerate(runner.actor_buffer):
                 obs, sampled, log_prob = actor_calls[i][t]
-                np.testing.assert_array_equal(obs[0], row['obs'])
+                np.testing.assert_array_equal(obs[0], row['actor_obs'][i])
                 self.assertEqual(float(b.masks[t+1,0,0]), float(not row['done'].all()))
                 np.testing.assert_array_equal(sampled[0], row['sampled'][i])
-                np.testing.assert_array_equal(b.obs[t, 0], row['obs'])
-                np.testing.assert_array_equal(b.obs[t + 1, 0], row['next_obs'])
+                np.testing.assert_array_equal(b.obs[t, 0], row['actor_obs'][i])
+                np.testing.assert_array_equal(b.obs[t + 1, 0], row['next_actor_obs'][i])
                 np.testing.assert_array_equal(b.actions[t, 0], row['executed'][i:i + 1])
                 np.testing.assert_array_equal(b.active_masks[t, 0], row['controls'][i:i + 1])
                 expected_lp = log_prob if row['controls'][i] else np.zeros_like(log_prob)

@@ -67,6 +67,7 @@ class OnPolicyBase:
         action,
         available_actions=None,
         active_masks=None,
+        return_entropy_per_sample=False,
     ):
         """Get action logprobs, entropy, and distributions for actor update.
         Args:
@@ -75,6 +76,8 @@ class OnPolicyBase:
             available_actions: (np.ndarray / torch.Tensor) denotes which actions are available to agent
                                     (if None, all actions available)
             active_masks: (np.ndarray / torch.Tensor) denotes whether an agent is active or dead.
+            return_entropy_per_sample: return an unreduced entropy vector so
+                the caller can apply episode-start weights and active masks.
         """
 
         (
@@ -82,7 +85,8 @@ class OnPolicyBase:
             dist_entropy,
             action_distribution,
         ) = self.actor.evaluate_actions(
-            obs, action, available_actions, active_masks
+            obs, action, available_actions, active_masks,
+            return_entropy_per_sample=return_entropy_per_sample,
         )
         return action_log_probs, dist_entropy, action_distribution
 

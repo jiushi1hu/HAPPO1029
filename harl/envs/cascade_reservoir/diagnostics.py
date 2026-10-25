@@ -104,7 +104,7 @@ def after_update(runner, before):
     require_finite('post-update values', prediction)
     result = dict(episode=runner.iteration, sampled_year=runner.sampled_years[-1],
         gamma=float(cb.gamma),
-        episode_reward=float(cb.rewards.astype(np.float64).sum()),
+        episode_reward=float(before['mc'][0,0,0]),
         discounted_episode_reward=float(before['mc'][0,0,0]),
         episode_energy_TWh=runner.last_rollout['episode_energy_TWh'],
         critic_update=parameter_update(runner.critic.critic, before['critic_parameters']),
@@ -205,22 +205,21 @@ def validation_report(runner, deterministic_rows):
             with torch.random.fork_rng(devices=[]):
                 torch.manual_seed(1000000+runner.seed*100000+repeat*10000+year)
                 row=evaluate_policy(runner.actor,runner.data,runner.physical_config,year,
-                    runner.seed,runner.iteration,runner.training_steps,deterministic=False)
+                    runner.seed,runner.iteration,runner.training_steps,deterministic=False,
+                    gamma=runner.algo_args['algo']['gamma'])
             values.append(row['energy_TWh'])
-            if runner.reward_settings['enabled']:
-                rewards.append(row['episode_reward'])
+            rewards.append(row['episode_reward'])
         samples.append(float(np.mean(values)))
         if rewards:reward_samples.append(float(np.mean(rewards)))
-    report=dict(episode=runner.iteration,
+    report=dict(episode=runner.iteration, gamma=runner.algo_args['algo']['gamma'],
         deterministic_mean_TWh=float(np.mean([r['energy_TWh'] for r in deterministic_rows])),
         stochastic_mean_TWh=float(np.mean(samples)),
         stochastic_repeat_means_TWh=samples,
         stochastic_repeat_sd_TWh=float(np.std(samples,ddof=1)) if repeats>1 else 0.,
         years=deterministic_rows)
-    if runner.reward_settings['enabled']:
-        report.update(deterministic_mean_reward=float(np.mean([r['episode_reward'] for r in deterministic_rows])),
-            stochastic_mean_reward=float(np.mean(reward_samples)),
-            stochastic_repeat_means_reward=reward_samples,
-            stochastic_repeat_sd_reward=float(np.std(reward_samples,ddof=1)) if repeats>1 else 0.)
+    report.update(deterministic_mean_reward=float(np.mean([r['episode_reward'] for r in deterministic_rows])),
+        stochastic_mean_reward=float(np.mean(reward_samples)),
+        stochastic_repeat_means_reward=reward_samples,
+        stochastic_repeat_sd_reward=float(np.std(reward_samples,ddof=1)) if repeats>1 else 0.)
     print('DIAG_VALIDATION '+json.dumps(report),flush=True)
     return report

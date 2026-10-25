@@ -93,8 +93,30 @@ class OnPolicyActorBuffer:
         if self.available_actions is not None:
             self.available_actions[0] = self.available_actions[-1].copy()
 
+    def discount_weights(self, gamma):
+        """Episode-start discount, distinct from discounted reward-to-go in GAE.
+
+        Cascade rollouts start at January 1 and contain one complete year.
+        Boundary masks also reset the clock independently in each environment
+        if a buffer contains more than one episode. Compute in float64 before
+        converting to the network dtype, rather than accumulating float32 error.
+        """
+        if isinstance(gamma, (bool, np.bool_)):
+            raise ValueError("gamma must be finite and between 0 and 1")
+        try:
+            gamma = float(gamma)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("gamma must be finite and between 0 and 1") from exc
+        if not np.isfinite(gamma) or not 0. <= gamma <= 1.:
+            raise ValueError("gamma must be finite and between 0 and 1")
+        weights = np.ones(self.masks[:-1].shape, dtype=np.float64)
+        for t in range(1, self.episode_length):
+            weights[t] = np.where(self.masks[t] > 0., gamma * weights[t - 1], 1.)
+        return weights.astype(np.float32)
+
     def feed_forward_generator_actor(
-        self, advantages, actor_num_mini_batch=None, mini_batch_size=None
+        self, advantages, actor_num_mini_batch=None, mini_batch_size=None,
+        objective_weights=None,
     ):
         """Training data generator for actor that uses MLP network."""
 
@@ -132,6 +154,12 @@ class OnPolicyActorBuffer:
         if self.factor is not None:
             factor = self.factor.reshape(-1, self.factor.shape[-1])
         advantages = advantages.reshape(-1, 1)
+        if objective_weights is not None:
+            objective_weights = np.asarray(objective_weights, dtype=np.float32)
+            if (objective_weights.shape != self.active_masks[:-1].shape or
+                    not np.isfinite(objective_weights).all() or (objective_weights < 0.).any()):
+                raise ValueError("Objective weights must be finite nonnegative rollout scalars")
+            objective_weights = objective_weights.reshape(-1, 1)
 
         
         for indices in sampler:
@@ -152,7 +180,11 @@ class OnPolicyActorBuffer:
                 adv_targ = advantages[indices]
 
             if self.factor is None:
-                yield obs_batch, actions_batch, masks_batch, active_masks_batch, old_action_log_probs_batch, adv_targ, available_actions_batch
+                sample = (obs_batch, actions_batch, masks_batch, active_masks_batch,
+                          old_action_log_probs_batch, adv_targ, available_actions_batch)
             else:
                 factor_batch = factor[indices]
-                yield obs_batch, actions_batch, masks_batch, active_masks_batch, old_action_log_probs_batch, adv_targ, available_actions_batch, factor_batch
+                sample = (obs_batch, actions_batch, masks_batch, active_masks_batch,
+                          old_action_log_probs_batch, adv_targ, available_actions_batch, factor_batch)
+            # Apply the same permutation to time weights and action likelihoods.
+            yield sample if objective_weights is None else sample + (objective_weights[indices],)

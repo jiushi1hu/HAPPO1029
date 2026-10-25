@@ -117,7 +117,8 @@ class FixedYearTrainingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp)/'fixed.jsonl'
             argv = ['train_cascade.py', '--fixed-training-year', '1965', '--episodes', '1',
-                    '--eval-interval', '1', '--seeds', '1', '--no-plot', '--episode-log', str(path)]
+                    '--eval-interval', '1', '--seeds', '1', '--gamma', '0.5',
+                    '--no-plot', '--episode-log', str(path)]
             output = io.StringIO()
             with patch('sys.argv', argv), \
                     patch('examples.train_cascade.load_configuration', return_value=(cfg, physical)), \
@@ -135,7 +136,9 @@ class FixedYearTrainingTests(unittest.TestCase):
         startup, _ = json.JSONDecoder().raw_decode(output.getvalue())
         self.assertEqual(startup['active_training_years'], [1965])
         self.assertFalse(startup['held_out_evaluation_enabled'])
-        self.assertEqual(startup['gamma'], .99)
+        self.assertEqual(startup['gamma'], .5)
+        self.assertTrue(all(row['gamma'] == .5 for row in rows))
+        self.assertTrue(all('reward_aggregation' in row for row in rows))
         check.assert_called_once_with(data, physical, years=[1965])
         for work in (references, validation, final_test):
             work.assert_not_called()

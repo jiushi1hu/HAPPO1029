@@ -64,7 +64,7 @@ class RunnerConfigurationTests(unittest.TestCase):
                     main()
                 startup, _ = json.JSONDecoder().raw_decode(output.getvalue())
                 self.assertEqual(startup['gamma'], .9 if override is None else override)
-                self.assertEqual(startup['evaluation_metric'], 'undiscounted annual generation')
+                self.assertEqual(startup['evaluation_metric'], 'gamma-weighted annual generation reward')
 
     def test_cli_rejects_invalid_gamma_before_loading_data(self):
         for value in ('-.01', '1.01', 'nan', 'inf', '-inf'):
@@ -197,7 +197,11 @@ class RunnerConfigurationTests(unittest.TestCase):
                     main()
                 startup,_=json.JSONDecoder().raw_decode(output.getvalue())
                 self.assertEqual(startup['seasonal_constraints'],enabled)
-                self.assertEqual(startup['observation_size'],43 if enabled else 18)
+                self.assertEqual(startup['observation_size'],16 if enabled else 11)
+                self.assertEqual(startup['actor_observation_size'],16 if enabled else 11)
+                self.assertEqual(startup['critic_state_size'],43 if enabled else 18)
+                self.assertEqual(startup['actor_observation_layout'],'local_neighbors_v1')
+                self.assertEqual(len(startup['actor_observation_features']),startup['observation_size'])
                 self.assertEqual(startup['reference_type'],'seasonal_target_tracking' if enabled else 'constant_storage')
                 self.assertEqual(check.call_args[0][1]['seasonal_constraints'],enabled)
                 reference.assert_not_called()
@@ -215,9 +219,11 @@ class RunnerConfigurationTests(unittest.TestCase):
                 def run(runner,*args):events.append(('run',runner.seed))
                 def final_test(runner):
                     events.append(('test',runner.seed))
-                    return [dict(year=y,typical_label=label,seed=runner.seed,energy_TWh=1.)
+                    return [dict(year=y,typical_label=label,seed=runner.seed,energy_TWh=1.,
+                                 episode_reward=1.,episode_penalty=0.)
                         for y,label in zip(self.data.test_years,self.data.test_labels)]
-            def references(data,physics,years,action_bins,phase):
+            def references(data,physics,years,action_bins,phase,gamma):
+                self.assertEqual(gamma,cfg['algo']['gamma'])
                 events.append((phase,tuple(years),action_bins))
                 return [dict(year=y,energy_TWh=2.) for y in years]
             argv=['train_cascade.py','--no-plot','--action-bins','37']+(['--skip-final-test'] if skip else [])

@@ -84,7 +84,7 @@ class PhysicsTests(unittest.TestCase):
         for _ in range(59):
             env.step(np.full(5, 100))
         self.assertEqual(d.dates[env.index].isoformat(), "1968-02-29")
-        self.assertAlmostEqual(float(env.observation()[-1]), 307/366., places=6)
+        self.assertAlmostEqual(float(env.state()[-1]), 307/366., places=6)
 
 
 class LearningTests(unittest.TestCase):
@@ -217,26 +217,28 @@ class LearningTests(unittest.TestCase):
         factor = np.array([2., .5, 3., 4., 1.5, .7, 9., 8.], dtype=np.float32)[:, None]
         active = np.array([1., 1., 1., 1., 1., 1., 0., 0.], dtype=np.float32)[:, None]
         lp = torch.tensor(np.log(ratios), requires_grad=True)
-        entropy = torch.tensor(-.3, requires_grad=True)
         n = len(ratios)
-        sample = (np.zeros((n,18), dtype=np.float32),
+        entropy = torch.full((n,), -.3, requires_grad=True)
+        weights = (.99 ** np.arange(n)).astype(np.float32)[:, None]
+        sample = (np.zeros((n,actor.obs_space.shape[0]), dtype=np.float32),
                   np.full((n,1), 100, dtype=np.int64),
                   np.ones((n,1), dtype=np.float32), active, np.zeros((n,1), dtype=np.float32),
-                  advantages, None, factor)
+                  advantages, None, factor, weights)
         # Explicit cases: positive A clips only above the upper bound;
         # negative A clips only below the lower bound.
         effective = np.where(advantages >= 0, np.minimum(ratios, 1+eps),
                              np.maximum(ratios, 1-eps))
-        expected_loss = -(active * factor * effective * advantages).sum() / active.sum()
+        expected_loss = -(weights * active * factor * effective * advantages).mean()
         differentiable = np.where(advantages >= 0, ratios < 1+eps, ratios > 1-eps)
-        expected_gradient = -active * factor * advantages * ratios * differentiable / active.sum()
+        expected_gradient = -weights * active * factor * advantages * ratios * differentiable / n
         with patch.object(actor, 'evaluate_actions', return_value=(lp, entropy, None)), \
                 patch.object(actor.actor_optimizer, 'step') as step:
             loss, _, _, actual_ratio = actor.update(sample)
         self.assertAlmostEqual(float(loss), float(expected_loss), places=5)
         np.testing.assert_allclose(actual_ratio.detach().numpy(), ratios, rtol=1e-6)
         np.testing.assert_allclose(lp.grad.numpy(), expected_gradient, atol=1e-6, rtol=1e-6)
-        self.assertAlmostEqual(float(entropy.grad), -actor.entropy_coef, places=7)
+        np.testing.assert_allclose(entropy.grad.numpy(),
+            -actor.entropy_coef * (weights * active)[:, 0] / n, rtol=1e-6)
         step.assert_called_once()
         # Even an existing Adam state must not advance for an all-forced batch.
         forced_sample = sample[:3] + (np.zeros_like(active),) + sample[4:]
@@ -271,10 +273,12 @@ class LearningTests(unittest.TestCase):
 
                 def wrap_update(i, original):
                     def update(sample):
-                        obs, _, _, active, old_lp, adv, _, factor = sample
+                        obs, _, _, active, old_lp, adv, _, factor, weights = sample
                         ix = r.length - np.rint(obs[:,-1]*366).astype(int)
                         np.testing.assert_array_equal(old_lp, old_stored[i][ix,0])
                         np.testing.assert_allclose(factor, expected_factor[ix,0], rtol=2e-5)
+                        np.testing.assert_allclose(weights[:,0], r.critic_buffer.gamma ** ix,
+                                                   rtol=1e-6)
                         with torch.no_grad():
                             lp, _, _ = r.actor[i].evaluate_actions(sample[0], sample[1],
                                                                   sample[6], active)
@@ -286,7 +290,7 @@ class LearningTests(unittest.TestCase):
                             ratio_change.append(float(np.abs(ratio[active_rows]-1).max()))
                         effective = np.where(adv >= 0, np.minimum(ratio, 1+r.actor[i].clip_param),
                                              np.maximum(ratio, 1-r.actor[i].clip_param))
-                        expected_loss = -(active*factor*effective*adv).sum()/active.sum()
+                        expected_loss = -(weights*active*factor*effective*adv).mean()
                         result = original(sample)
                         self.assertAlmostEqual(float(result[0]), float(expected_loss), places=5)
                         calls[i] += 1
@@ -351,7 +355,7 @@ class LearningTests(unittest.TestCase):
         self.assertEqual(r.critic_buffer.masks[-1, 0, 0], 0.)
         old = []
         for actor, b in zip(r.actor, r.actor_buffer):
-            lp, _, _ = actor.evaluate_actions(b.obs[:-1].reshape(-1,18),
+            lp, _, _ = actor.evaluate_actions(b.obs[:-1].reshape(-1,b.obs.shape[-1]),
                                             b.actions.reshape(-1,1))
             old.append(lp.detach().numpy())
             active = b.active_masks[:-1].reshape(-1) > 0
@@ -365,7 +369,7 @@ class LearningTests(unittest.TestCase):
         for i in order:
             actor, b = r.actor[i], r.actor_buffer[i]
             np.testing.assert_allclose(b.factor, factor, rtol=2e-5)
-            lp, _, _ = actor.evaluate_actions(b.obs[:-1].reshape(-1,18),
+            lp, _, _ = actor.evaluate_actions(b.obs[:-1].reshape(-1,b.obs.shape[-1]),
                                             b.actions.reshape(-1,1))
             factor *= np.where(b.active_masks[:-1]>0, np.exp(lp.detach().numpy()-old[i]).reshape(365,1,1), 1.)
         self.assertTrue(np.isfinite(float(critic["value_loss"])))
@@ -373,13 +377,15 @@ class LearningTests(unittest.TestCase):
 
     def test_mean_validation_selects_actors_and_test_years_used_only_at_end(self):
         r = self.r
-        def fake(actors, data, physical, year, seed, episode, steps):
-            return dict(year=year, seed=seed, energy_MWh=year*1e6, energy_TWh=float(year))
+        def fake(actors, data, physical, year, seed, episode, steps, *, gamma):
+            self.assertEqual(gamma,r.algo_args['algo']['gamma'])
+            return dict(year=year, seed=seed, energy_MWh=year*1e6, energy_TWh=float(year),
+                        episode_reward=float(year),episode_penalty=0.)
         target = "harl.runners.cascade_reservoir_runner.evaluate_policy"
         with patch(target, side_effect=fake) as f:
             score = r.validate()
             self.assertEqual([c.args[3] for c in f.call_args_list], list(self.data.validation_years))
-            self.assertEqual(score/1e6, 2022.)
+            self.assertEqual(score, 2022.)
             self.assertEqual(r.best_iteration, 0)
             f.reset_mock(); tests = r.final_test()
             self.assertEqual([c.args[3] for c in f.call_args_list], list(self.data.test_years))
@@ -387,8 +393,8 @@ class LearningTests(unittest.TestCase):
 
     def test_real_validation_is_frozen_and_reproducible(self):
         before = [{k:v.clone() for k,v in a.actor.state_dict().items()} for a in self.r.actor]
-        a = evaluate_policy(self.r.actor, self.data, self.physical, 2024, 9, 0, 0)
-        b = evaluate_policy(self.r.actor, self.data, self.physical, 2024, 9, 0, 0)
+        a = evaluate_policy(self.r.actor, self.data, self.physical, 2024, 9, 0, 0,gamma=self.r.algo_args['algo']['gamma'])
+        b = evaluate_policy(self.r.actor, self.data, self.physical, 2024, 9, 0, 0,gamma=self.r.algo_args['algo']['gamma'])
         self.assertEqual(a, b)
         for actor, state in zip(self.r.actor, before):
             for key in state:

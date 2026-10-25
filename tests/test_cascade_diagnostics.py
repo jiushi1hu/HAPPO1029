@@ -62,7 +62,7 @@ class DiagnosticTests(unittest.TestCase):
                 self.assertGreater(report['critic_update']['parameter_delta_l2'],0.)
                 self.assertEqual(report['gamma'],r.critic_buffer.gamma)
                 self.assertAlmostEqual(report['episode_reward'],
-                    float(r.critic_buffer.rewards.astype(np.float64).sum()))
+                    float(captured['mc'][0,0,0]))
                 self.assertAlmostEqual(report['discounted_episode_reward'],float(captured['mc'][0,0,0]))
                 self.assertTrue(np.isfinite(report['critic_mc_post']['rmse']))
             outcomes.append(dict(actions=actions,actors=[copy.deepcopy(a.actor.state_dict()) for a in r.actor],
@@ -78,8 +78,10 @@ class DiagnosticTests(unittest.TestCase):
         r=self.runner();r.algo_args['experiment']['diagnostic_stochastic_repeats']=2
         state=torch.get_rng_state().clone()
         def fake(*args,**kwargs):
-            return dict(energy_TWh=float(torch.rand(())))
-        rows=[dict(energy_TWh=1.) for _ in self.data.validation_years]
+            self.assertEqual(kwargs['gamma'],r.algo_args['algo']['gamma'])
+            value=float(torch.rand(()))
+            return dict(energy_TWh=value,episode_reward=value)
+        rows=[dict(energy_TWh=1.,episode_reward=1.) for _ in self.data.validation_years]
         with patch('harl.envs.cascade_reservoir.diagnostics.evaluate_policy',side_effect=fake) as evaluate,redirect_stdout(io.StringIO()):
             a=validation_report(r,rows)
             b=validation_report(r,rows)
@@ -91,7 +93,8 @@ class DiagnosticTests(unittest.TestCase):
         r=self.runner()
         rows=[]
         for enabled in [False,True]:
-            rows.append(evaluate_policy(r.actor,self.data,self.physical,2024,1,0,0,diagnostics=enabled))
+            rows.append(evaluate_policy(r.actor,self.data,self.physical,2024,1,0,0,diagnostics=enabled,
+                                        gamma=r.algo_args['algo']['gamma']))
         for key,value in rows[0].items():self.assertEqual(value,rows[1][key])
         d=rows[1]
         self.assertAlmostEqual(sum(d['energy_by_reservoir_TWh']),d['energy_TWh'],places=9)

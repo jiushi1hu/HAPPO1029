@@ -192,7 +192,7 @@ class VariableHeadTests(unittest.TestCase):
                     expected = 24.*np.minimum(np.minimum(release, d.turbine_cap)*1000.*9.81*.9*h/1e6,
                                               d.power_cap)
                     np.testing.assert_allclose(energy, expected)
-                    row = reference_summary(d, p, [year])[0]
+                    row = reference_summary(d, p, [year],gamma=1.)[0]
                     self.assertAlmostEqual(row['energy_TWh'], expected.sum()/1e6)
                     self.assertEqual(row['head_model'], mode)
 
@@ -222,7 +222,8 @@ class VariableHeadTests(unittest.TestCase):
         cfg = copy.deepcopy(self.cfg)
         cfg['model']['hidden_sizes'] = [8, 8]
         runner = CascadeReservoirRunner(self.data, self.config, cfg, 1)
-        row = evaluate_policy(runner.actor, self.data, self.config, 2024, 1, 0, 0, diagnostics=True)
+        row = evaluate_policy(runner.actor, self.data, self.config, 2024, 1, 0, 0, diagnostics=True,
+                              gamma=runner.algo_args['algo']['gamma'])
         self.assertEqual(row['head_model'], 'storage_sensitivity')
         self.assertEqual(row['head_data_status'], 'assumed_sensitivity_only')
         low, mean, high = [np.array(row[key]) for key in ('min_net_head_m', 'mean_net_head_m', 'max_net_head_m')]

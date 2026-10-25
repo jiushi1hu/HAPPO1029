@@ -14,6 +14,19 @@ def select_interactive_backend():
     return backend
 
 
+def reward_units(payload):
+    gamma = float(payload.get('gamma', 1.))
+    if not np.isfinite(gamma) or not 0. <= gamma <= 1.:
+        raise ValueError('Reward plots require gamma in [0, 1]')
+    return '{} episode reward units (gamma={:g})'.format(
+        'Undiscounted' if gamma == 1. else 'Discounted', gamma)
+
+
+def check_reward_gamma(payload, rows):
+    if 'gamma' in payload and any(row.get('gamma') != payload['gamma'] for row in rows):
+        raise ValueError('All reward records must use the same gamma as the experiment')
+
+
 def comparison_data(payload):
     """Reject mixed operating modes rather than plotting an unfair comparison."""
     seasonal = payload.get('seasonal_constraints', False)
@@ -28,6 +41,7 @@ def comparison_data(payload):
     rows = list(payload['references']) + list(payload['tests'])
     for history in payload['histories']:
         rows.extend(row for checkpoint in history for row in checkpoint.get('years', []))
+    check_reward_gamma(payload, rows)
     for row in rows:
         row_penalties = row.get('reward_penalties',{'enabled':False})
         if (row_penalties.get('enabled',False) != penalties.get('enabled',False) or
@@ -68,6 +82,7 @@ def validation_series(payload, metric):
         raise ValueError("Validation episode checkpoints must be increasing")
     values = []
     for history in histories:
+        check_reward_gamma(payload, history)
         if not np.array_equal(grid, [r["episode"] for r in history]):
             raise ValueError("Seeds must have matching episode checkpoints")
         if any(metric not in r for r in history):
@@ -100,6 +115,8 @@ def make_figure(payload):
     ax.legend(frameon=False, fontsize=9); ax.grid(axis="y", alpha=.2)
     if payload.get('reward_penalties',{}).get('enabled',False):
         operating_mode += ' | selected by penalized return'
+    elif 'gamma' in payload:
+        operating_mode += ' | selected by generation reward (gamma={:g})'.format(payload['gamma'])
     if not payload["tests"]:
         bx.axis("off")
         bx.text(.5,.5,"Final typical-year tests skipped\n(diagnostic run)",
@@ -131,7 +148,7 @@ def make_figure(payload):
 
 
 def make_validation_reward_figure(payload):
-    """Plot recorded, undiscounted validation returns used for model selection."""
+    """Plot recorded gamma-weighted validation returns used for selection."""
     import matplotlib.pyplot as plt
     seeds, grid, values = validation_series(payload, 'mean_reward')
     mean = values.mean(axis=0)
@@ -147,7 +164,7 @@ def make_validation_reward_figure(payload):
     years = payload['validation_years']
     ax.set(title='{}-{} mean annual validation net reward'.format(min(years),max(years)),
            xlabel='Training episodes (one episode = one randomly sampled year)',
-           ylabel='Undiscounted annual net reward (reward units)')
+           ylabel=reward_units(payload))
     ax.grid(alpha=.2)
     ax.legend(frameon=False, fontsize=9, ncol=2)
     return fig
@@ -164,6 +181,7 @@ def make_fixed_year_figure(payload):
     if grid[0] != 0 or np.any(np.diff(grid) <= 0):
         raise ValueError('Fixed-year checkpoints must start at zero and increase')
     for seed, history in zip(seeds, histories):
+        check_reward_gamma(payload, history)
         if not np.array_equal(grid, [row['episode'] for row in history]):
             raise ValueError('Seeds must have matching fixed-year checkpoints')
         if any(row['year'] != year or row['seed'] != seed or row.get('deterministic') is not True
@@ -171,12 +189,13 @@ def make_fixed_year_figure(payload):
             raise ValueError('Fixed-year checkpoints must match the year, seed and deterministic policy')
         if any(row.get('feasible') is not True or row.get('violation_count', 0) != 0 for row in history):
             raise ValueError('Cannot plot infeasible fixed-year evaluations')
+    units = reward_units(payload)
     metrics = [('actual_generation_TWh', 'Actual generation', 'Generation (TWh/year)'),
-               ('power_reward', 'Power Reward', 'Undiscounted reward units'),
-               ('band_penalty', 'Band penalty', 'Undiscounted reward units'),
-               ('rise_penalty', 'Rise penalty', 'Undiscounted reward units'),
-               ('fall_penalty', 'Fall penalty', 'Undiscounted reward units'),
-               ('total_reward', 'Total Reward', 'Undiscounted reward units')]
+               ('power_reward', 'Power Reward', units),
+               ('band_penalty', 'Band penalty', units),
+               ('rise_penalty', 'Rise penalty', units),
+               ('fall_penalty', 'Fall penalty', units),
+               ('total_reward', 'Total Reward', units)]
     values = {key: np.asarray([[row[key] for row in history] for history in histories], dtype=float)
               for key, _, _ in metrics}
     if not all(np.isfinite(series).all() for series in values.values()):
@@ -216,6 +235,7 @@ def make_training_figures(payload, window=20):
     if not len(grid) or not np.array_equal(grid, np.arange(1,len(grid)+1)):
         raise ValueError('Complete training episodes starting at one required')
     for rows in histories:
+        check_reward_gamma(payload, rows)
         if not np.array_equal(grid,[r['iteration'] for r in rows]):
             raise ValueError('Seeds must have matching training episodes')
     reference = float(payload['reference_energy_MWh'])
@@ -256,8 +276,8 @@ def make_training_figures(payload, window=20):
     energy = values('episode_energy_TWh')
     if all('episode_reward' in row for rows in histories for row in rows):
         returns = values('episode_reward')
-    elif payload.get('reward_penalties',{}).get('enabled',False):
-        raise ValueError('Penalized reward plots require actual episode_reward values')
+    elif payload.get('reward_penalties',{}).get('enabled',False) or payload.get('gamma', 1.) != 1.:
+        raise ValueError('Reward plots require actual episode_reward values; annual energy cannot determine discounted returns')
     else:
         # Backward compatibility for generation-only historical payloads.
         returns = energy*1e6/reference
@@ -268,7 +288,7 @@ def make_training_figures(payload, window=20):
     year_label = ('fixed training year {}'.format(payload['fixed_training_year'])
                   if payload.get('fixed_training_year') is not None else 'sampled training years')
     ax.set(title='Stochastic training '+objective+' | '+year_label,
-           ylabel='Episode return (sum of daily rewards)')
+           ylabel=reward_units(payload))
 
     energy_fig, ax = plt.subplots(figsize=(10,6),constrained_layout=True)
     energy_fig.canvas.manager.set_window_title('HAPPO training generation')
@@ -305,6 +325,7 @@ def make_reward_scale_figures(payload, window=20):
     if not len(grid) or not np.array_equal(grid, np.arange(1, len(grid)+1)):
         raise ValueError('Complete episode metrics starting at one required')
     for seed, history in zip(payload['seeds'], histories):
+        check_reward_gamma(payload, history)
         if not np.array_equal(grid, [r['episode'] for r in history]):
             raise ValueError('Seeds must have matching episode metrics')
         if any(r['seed'] != seed for r in history):
@@ -358,11 +379,11 @@ def make_reward_scale_figures(payload, window=20):
     for ax, name, series in zip(axes.flat, ['Power Reward', 'Band penalty', 'Rise penalty',
                                           'Fall penalty', 'Total Reward'], [power]+costs+[total]):
         draw(ax, series, average(series))
-        ax.set(title=name, ylabel='Undiscounted episode reward units')
+        ax.set(title=name, ylabel=reward_units(payload))
     axes.flat[-1].axis('off')
     axes.flat[-1].text(.05,.6,'Total = Power - Band - Rise - Fall\n\nPenalties are positive applied costs.\nFailed episodes contain executed days only.',
                         transform=axes.flat[-1].transAxes, va='center', fontsize=10)
-    components_fig.suptitle('Training reward components | episode sums'+
+    components_fig.suptitle('Training reward components | gamma-weighted episode sums'+
         (' | fixed year {}'.format(payload['fixed_training_year'])
          if payload.get('fixed_training_year') is not None else ''))
 
@@ -372,7 +393,7 @@ def make_reward_scale_figures(payload, window=20):
         return np.divide(100.*numerator, denominator, out=np.full_like(denominator, np.nan),
                          where=denominator > 0.)
     for ax, name, cost in zip(axes.flat, ['Band', 'Rise', 'Fall', 'All soft penalties'], costs+[sum(costs)]):
-        # Ratios of window sums preserve energy weighting. Averaging episode
+        # Ratios of window sums preserve discounted Power Reward weighting. Averaging episode
         # percentages would over-weight low-generation years.
         draw(ax, percent(cost, power), percent(rolling_sum(cost), rolling_sum(power)))
         ax.set(title=name+' / Power Reward', ylabel='Applied penalty / Power Reward (%)')
@@ -394,7 +415,8 @@ def main():
         make_fixed_year_figure(payload)
     else:
         make_figure(payload)
-        if payload.get('reward_penalties',{}).get('enabled',False):
+        if (payload.get('reward_penalties',{}).get('enabled',False) or
+                all('mean_reward' in row for history in payload['histories'] for row in history)):
             make_validation_reward_figure(payload)
     if 'episode_histories' in payload:
         make_reward_scale_figures(payload)

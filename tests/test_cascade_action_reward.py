@@ -161,8 +161,8 @@ class DiscreteActionTests(unittest.TestCase):
             np.testing.assert_allclose(r.envs[0].storage,self.data.initial_storage(year),atol=1e-3,rtol=0)
             self.assertLess(r.last_rollout['max_balance_residual_m3'],1e-3)
         state = [{k:v.clone() for k,v in a.actor.state_dict().items()} for a in r.actor]
-        a = evaluate_policy(r.actor,self.data,self.physical,2024,1,0,0,diagnostics=True)
-        b = evaluate_policy(r.actor,self.data,self.physical,2024,1,0,0,diagnostics=True)
+        a = evaluate_policy(r.actor,self.data,self.physical,2024,1,0,0,diagnostics=True,gamma=r.algo_args['algo']['gamma'])
+        b = evaluate_policy(r.actor,self.data,self.physical,2024,1,0,0,diagnostics=True,gamma=r.algo_args['algo']['gamma'])
         self.assertEqual(a,b)
         for actor,weights in zip(r.actor,state):
             for key,value in weights.items():
@@ -252,7 +252,7 @@ class RolloutActionTests(unittest.TestCase):
         runner=CascadeReservoirRunner(data,physical,copy.deepcopy(self.config),1)
         runner.collect_episode(1965)
         for actor,buffer in zip(runner.actor,runner.actor_buffer):
-            lp,_,_=actor.evaluate_actions(buffer.obs[:-1].reshape(-1,18),
+            lp,_,_=actor.evaluate_actions(buffer.obs[:-1].reshape(-1,buffer.obs.shape[-1]),
                 buffer.actions.reshape(-1,1))
             active=buffer.active_masks[:-1].reshape(-1)>0
             self.assertTrue(active.any());self.assertFalse(active.all())

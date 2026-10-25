@@ -210,8 +210,10 @@ class EnvironmentPhysicalTests(unittest.TestCase):
         env = CascadeReservoirEnv(self.data, self.config, start_year=1968, end_year=1968)
         original = env.storage.copy()
         obs, state, available = env.reset()
-        self.assertEqual(obs.shape, (5, 18)); self.assertEqual(obs.dtype, np.float32)
-        np.testing.assert_array_equal(obs, state); self.assertIsNone(available)
+        self.assertEqual(obs.shape, (5, 11)); self.assertEqual(obs.dtype, np.float32)
+        self.assertEqual(state.shape, (5, 18)); self.assertIsNone(available)
+        np.testing.assert_array_equal(obs, env.actor_observations())
+        np.testing.assert_array_equal(state, np.tile(env.state(), (5,1)))
         self.assertIsNone(env.last_transition)
         before_index = env.index
         with self.assertRaises(ValueError):
@@ -220,23 +222,24 @@ class EnvironmentPhysicalTests(unittest.TestCase):
         np.testing.assert_array_equal(env.storage, original)
         obs, state, reward, done, info, _ = env.step(np.zeros((5, 1)))
         row = env.last_transition
-        np.testing.assert_allclose(obs[0,:5], (row['storage_end']-self.data.vmin)/(self.data.vmax-self.data.vmin), atol=1e-7)
-        np.testing.assert_allclose(obs[0,5:10], (self.data.external[env.index]-self.data.flow_mean)/self.data.flow_std, atol=1e-7)
-        np.testing.assert_allclose(obs[0,10:15], row['release']/self.data.release_cap, atol=1e-7)
-        np.testing.assert_array_equal(obs, state)
+        np.testing.assert_allclose(state[0,:5], (row['storage_end']-self.data.vmin)/(self.data.vmax-self.data.vmin), atol=1e-7)
+        np.testing.assert_allclose(state[0,5:10], (self.data.external[env.index]-self.data.flow_mean)/self.data.flow_std, atol=1e-7)
+        np.testing.assert_allclose(state[0,10:15], row['release']/self.data.release_cap, atol=1e-7)
+        np.testing.assert_array_equal(obs, env.actor_observations())
         np.testing.assert_allclose(reward, row['reward']); self.assertFalse(done.any())
         self.assertTrue(all(not item['bad_transition'] for item in info))
         for _ in range(365):
             obs, state, _, done, _, _ = env.step(np.zeros(5))
         self.assertTrue(done.all()); self.assertEqual(env.index, env.stop)
-        np.testing.assert_array_equal(obs, np.zeros((5,18)))
+        np.testing.assert_array_equal(obs, np.zeros((5,11)))
+        np.testing.assert_array_equal(state, np.zeros((5,18)))
         with self.assertRaises(RuntimeError):
             env.step(np.zeros(5))
         env.reset()
         np.testing.assert_array_equal(env.storage, original)
         np.testing.assert_array_equal(env.previous_release, np.zeros(5))
         self.assertEqual(env.index, env.start); self.assertIsNone(env.last_transition)
-        self.assertAlmostEqual(float(env.observation()[-1]), 1.)
+        self.assertAlmostEqual(float(env.state()[-1]), 1.)
 
 
 if __name__ == '__main__':

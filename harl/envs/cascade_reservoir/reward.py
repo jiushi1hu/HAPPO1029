@@ -3,6 +3,21 @@ import numpy as np
 from harl.envs.cascade_reservoir.data_loader import IDS, OPERATION_PERIODS
 
 PENALTY_TERMS = ('target_band', 'daily_rise', 'daily_fall')
+REWARD_AGGREGATION = 'sum(gamma**t * daily_reward), t=0 at episode start'
+
+
+def validate_discount_factor(value):
+    """Validate the one discount used by training, evaluation and accounting."""
+    message = "Discount factor gamma must be finite and between 0 and 1"
+    if isinstance(value, (bool, np.bool_)):
+        raise ValueError(message)
+    try:
+        gamma = float(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise ValueError(message) from exc
+    if not np.isfinite(gamma) or not 0. <= gamma <= 1.:
+        raise ValueError(message)
+    return gamma
 
 
 def reward_settings(config):
@@ -92,10 +107,18 @@ class OperationReward:
 
 
 class EpisodeRewardMetrics:
-    """Use the same reward/cost totals in training, evaluation and references."""
+    """Sum gamma**t times each reward/cost, with t=0 at episode start.
 
-    def __init__(self):
+    Daily rewards passed to GAE remain unchanged. Physical exceedance counts
+    and the internal energy reconciliation are never discounted.
+    """
+
+    def __init__(self, gamma):
+        self.gamma = validate_discount_factor(gamma)
+        self.discount = 1.
+        self.steps = 0
         self.reward = self.generation_reward = self.penalty = 0.
+        self.undiscounted_generation_reward = 0.
         self.components = dict.fromkeys(PENALTY_TERMS,0.)
         self.by_reservoir = np.zeros(len(IDS))
         self.violation_days = {k: np.zeros(len(IDS),dtype=int) for k in PENALTY_TERMS}
@@ -104,20 +127,24 @@ class EpisodeRewardMetrics:
         self.violation_any_days = dict.fromkeys(PENALTY_TERMS, 0)
 
     def update(self, transition):
-        self.reward += float(transition['reward'])
-        self.generation_reward += float(transition.get('generation_reward',transition['reward']))
-        self.penalty += float(transition.get('reward_penalty',0.))
-        self.by_reservoir += transition.get('reward_penalty_by_reservoir',0.)
+        generation = float(transition.get('generation_reward',transition['reward']))
+        self.reward += self.discount * float(transition['reward'])
+        self.generation_reward += self.discount * generation
+        self.undiscounted_generation_reward += generation
+        self.penalty += self.discount * float(transition.get('reward_penalty',0.))
+        self.by_reservoir += self.discount * transition.get('reward_penalty_by_reservoir',0.)
         for term in PENALTY_TERMS:
-            self.components[term] += transition.get('reward_penalty_components',{}).get(term,0.)
+            self.components[term] += self.discount * transition.get('reward_penalty_components',{}).get(term,0.)
             excess = transition.get('soft_violations_m',{}).get(term,np.zeros(5))
             self.violation_days[term] += excess > 0.
             self.violation_sum[term] += excess
             self.violation_max[term] = np.maximum(self.violation_max[term], excess)
             self.violation_any_days[term] += int(np.any(excess > 0.))
+        self.steps += 1
+        self.discount *= self.gamma
 
     def summary(self, detailed=False):
-        result = dict(episode_reward=self.reward, episode_generation_reward=self.generation_reward,
+        result = dict(gamma=self.gamma, episode_reward=self.reward, episode_generation_reward=self.generation_reward,
                       episode_penalty=self.penalty)
         result.update({'episode_penalty_'+k:v for k,v in self.components.items()})
         if detailed:

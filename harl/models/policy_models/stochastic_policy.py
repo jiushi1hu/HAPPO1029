@@ -66,7 +66,8 @@ class StochasticPolicy(nn.Module):
         return actions, action_log_probs
 
     def evaluate_actions(
-        self, obs, action, available_actions=None, active_masks=None
+        self, obs, action, available_actions=None, active_masks=None,
+        return_entropy_per_sample=False,
     ):
         """Compute action log probability, distribution entropy, and action distribution.
         Args:
@@ -75,6 +76,8 @@ class StochasticPolicy(nn.Module):
             available_actions: (np.ndarray / torch.Tensor) denotes which actions are available to agent
                                                               (if None, all actions available)
             active_masks: (np.ndarray / torch.Tensor) denotes whether an agent is active or dead.
+            return_entropy_per_sample: return unreduced row entropies for the
+                caller to weight; defaults to the existing aggregate entropy.
         Returns:
             action_log_probs: (torch.Tensor) log probabilities of the input actions.
             dist_entropy: (torch.Tensor) action distribution entropy for the given inputs.
@@ -95,6 +98,7 @@ class StochasticPolicy(nn.Module):
             action,
             available_actions,
             active_masks=active_masks if self.use_policy_active_masks else None,
+            return_entropy_per_sample=return_entropy_per_sample,
         )
 
         return action_log_probs, dist_entropy, action_distribution

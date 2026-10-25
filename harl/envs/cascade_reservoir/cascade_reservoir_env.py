@@ -1,4 +1,4 @@
-"""Full-state reservoir simulation with explicit calendar bounds and reset."""
+"""Local actor observations and a centralized state for the reservoir cascade."""
 import calendar
 import numpy as np
 from gym.spaces import Box, Discrete
@@ -7,10 +7,31 @@ from harl.envs.cascade_reservoir.terminal_storage import TerminalReleaseBounds
 from harl.envs.cascade_reservoir.reward import OperationReward, reward_settings
 
 SEASONAL_PHASES = ("drawdown", "flood_control", "impoundment", "post_refill")
+ACTOR_OBSERVATION_LAYOUT = "local_neighbors_v1"
+LOCAL_NEIGHBOR_FEATURES = (
+    "storage_fraction", "external_inflow_standardized", "previous_release_fraction",
+    "upstream_storage_fraction", "upstream_external_inflow_standardized",
+    "upstream_previous_release_fraction", "downstream_storage_fraction",
+    "downstream_headroom_fraction",
+)
+LOCAL_RULE_FEATURES = (
+    "storage_lower_fraction", "storage_upper_fraction", "deadline_days_remaining",
+    "deadline_storage_lower_fraction", "deadline_storage_upper_fraction",
+)
+TIME_FEATURES = ("season_sin", "season_cos", "episode_days_remaining")
+
+
+def actor_observation_features(seasonal_constraints):
+    return LOCAL_NEIGHBOR_FEATURES + (LOCAL_RULE_FEATURES if seasonal_constraints else ()) + TIME_FEATURES
 
 
 class CascadeReservoirEnv:
     n_agents = 5
+    observation_layout = ACTOR_OBSERVATION_LAYOUT
+
+    def observation_metadata(self):
+        return dict(actor_observation_layout=self.observation_layout,
+                    actor_observation_size=self.observation_size, critic_state_size=self.state_size)
 
     def __init__(self, data, config, end_year=None, start_year=None, action_bins=200):
         self.data = data
@@ -34,9 +55,11 @@ class CascadeReservoirEnv:
         # A finite-horizon policy needs time-to-go, not just day of year.
         # Keep the scale fixed across training, validation and test horizons.
         self.time_scale_days = 366  # Fixed annual scale, including leap days.
-        self.observation_size = 43 if self.seasonal_constraints else 18
+        self.observation_features = actor_observation_features(self.seasonal_constraints)
+        self.observation_size = len(self.observation_features)
+        self.state_size = 43 if self.seasonal_constraints else 18
         self.observation_space = [Box(-np.inf, np.inf, (self.observation_size,), dtype=np.float32) for _ in range(5)]
-        self.share_observation_space = self.observation_space
+        self.share_observation_space = [Box(-np.inf, np.inf, (self.state_size,), dtype=np.float32) for _ in range(5)]
         if (isinstance(action_bins, bool) or
                 not isinstance(action_bins, (int, np.integer)) or action_bins < 2):
             raise ValueError('action_bins must be an integer >= 2')
@@ -91,9 +114,10 @@ class CascadeReservoirEnv:
         self.last_transition = None
         return self._observations()
 
-    def observation(self):
+    def state(self):
+        """Centralized critic input; never passed directly to reservoir actors."""
         if self.index == self.stop:
-            return np.zeros(self.observation_size, dtype=np.float32)
+            return np.zeros(self.state_size, dtype=np.float32)
         day = self.data.dates[self.index]
         phase = 2. * np.pi * (day.timetuple().tm_yday - 1) / (366 if calendar.isleap(day.year) else 365)
         parts = [
@@ -127,9 +151,34 @@ class CascadeReservoirEnv:
                           deadline_days, deadline_lower, deadline_upper])
         return np.concatenate(parts).astype(np.float32)
 
+    def actor_observations(self):
+        """Own state/rules, immediate neighbors, and known calendar timing only.
+
+        All actors decide before today's upstream releases are resolved, so the
+        upstream release is yesterday's executed release. External inflows use
+        the existing current-day-known forcing convention, not future samples.
+        Headroom is signed room below today's end-storage ceiling: it can be
+        negative on a drawdown deadline. No system aggregates enter this input.
+        """
+        if self.index == self.stop:
+            return np.zeros((5, self.observation_size), dtype=np.float32)
+        state = self.state()
+        storage, external, release = state[:5], state[5:10], state[10:15]
+        upper = state[23:28] if self.seasonal is not None else np.ones(5)
+        observations = []
+        for i in range(5):
+            upstream = (storage[i-1], external[i-1], release[i-1]) if i else (0., 0., 0.)
+            downstream = ((storage[i+1], upper[i+1]-storage[i+1]) if i < 4 else (0., 1.))
+            local = [storage[i], external[i], release[i], *upstream, *downstream]
+            if self.seasonal is not None:
+                local.extend(state[start+i] for start in (18, 23, 28, 33, 38))
+            local.extend(state[15:18])
+            observations.append(local)
+        return np.asarray(observations, dtype=np.float32)
+
     def _observations(self):
-        obs = np.repeat(self.observation()[None, :], 5, axis=0)
-        return obs, obs.copy(), None
+        state = np.repeat(self.state()[None, :], 5, axis=0)
+        return self.actor_observations(), state, None
 
     def normalize_actions(self, actions):
         actions = np.asarray(actions, dtype=np.float64)

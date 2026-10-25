@@ -112,6 +112,41 @@ class PlotTests(unittest.TestCase):
             with self.subTest(issue=issue),self.assertRaises(ValueError):
                 make_validation_reward_figure(bad)
 
+    def test_reward_labels_and_records_share_the_experiment_gamma(self):
+        for gamma in (0., .5, 1.):
+            payload = self.validation_reward_payload()
+            payload['gamma'] = gamma
+            for history in payload['histories']:
+                for row in history:
+                    row['gamma'] = gamma
+            fig = make_validation_reward_figure(payload)
+            self.assertIn('gamma={:g}'.format(gamma), fig.axes[0].get_ylabel())
+            self.assertIn('Undiscounted' if gamma == 1. else 'Discounted', fig.axes[0].get_ylabel())
+            plt.close(fig)
+            payload['histories'][0][0]['gamma'] = .25
+            with self.assertRaisesRegex(ValueError, 'same gamma'):
+                make_validation_reward_figure(payload)
+
+        payload = self.fixed_year_payload()
+        payload['gamma'] = .5
+        for history in payload['fixed_year_histories']:
+            for row in history:
+                row['gamma'] = .5
+        fig = make_fixed_year_figure(payload)
+        self.assertIn('TWh', fig.axes[0].get_ylabel())
+        self.assertTrue(all('Discounted' in ax.get_ylabel() for ax in fig.axes[1:]))
+        plt.close(fig)
+
+        payload = self.reward_scale_payload()
+        payload['gamma'] = .5
+        for history in payload['episode_histories']:
+            for row in history:
+                row['gamma'] = .5
+        figures = make_reward_scale_figures(payload)
+        self.assertIn('gamma=0.5', figures[0].axes[0].get_ylabel())
+        for fig in figures:
+            plt.close(fig)
+
     def seasonal_payload(self):
         metadata=dict(seasonal_constraints=True,action_bins=37,head_model='storage_sensitivity',
                       head_data_status='assumed_sensitivity_only',terminal_storage_mode='initial',
@@ -122,6 +157,30 @@ class PlotTests(unittest.TestCase):
                         for y in (2020,1998)],
             tests=[dict(year=1998,typical_label='wet',seed=1,energy_TWh=95.,**metadata)],
             reference_type='seasonal_target_tracking',reference_label='Seasonal rule reference',**metadata)
+
+    def test_custom_two_year_validation_and_single_test_plot(self):
+        payload = self.seasonal_payload()
+        metadata = dict(payload['references'][0], gamma=.99)
+        payload.update(seeds=[1, 2, 3], gamma=.99, validation_years=[2012, 2013],
+                       test_years=[2014], test_labels=['test_2014'])
+        payload['references'] = [dict(metadata, year=y) for y in (2012, 2013, 2014)]
+        payload['histories'] = [[dict(episode=0, mean_TWh=100.+seed,
+            mean_reward=10.+seed, gamma=.99,
+            years=[dict(metadata, year=y) for y in (2012, 2013)])] for seed in payload['seeds']]
+        payload['tests'] = [dict(metadata, year=2014, typical_label='test_2014',
+                                 seed=seed) for seed in payload['seeds']]
+        with patch('matplotlib.figure.Figure.savefig') as save:
+            fig = make_figure(payload)
+            reward = make_validation_reward_figure(payload)
+            fig.canvas.draw()
+            reward.canvas.draw()
+            self.assertIn('2012-2013', fig.axes[0].get_title())
+            self.assertIn('2014', fig.axes[1].get_xticklabels()[0].get_text())
+            self.assertEqual(len(fig.axes[1].patches), 2)
+            self.assertIn('2012-2013', reward.axes[0].get_title())
+            save.assert_not_called()
+            plt.close(fig)
+            plt.close(reward)
 
     def test_seasonal_reference_labels_and_shared_comparison_mode(self):
         payload=self.seasonal_payload()

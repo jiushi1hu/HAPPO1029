@@ -9,6 +9,8 @@ train:
   use_linear_lr_decay: false
   use_proper_time_limits: true
 model:
+  # Actor inputs: 16 local/neighbor features (11 without seasonal rules).
+  # The centralized critic separately receives 43/18 system-state values.
   hidden_sizes: [128, 128]
   activation_func: tanh
   use_feature_normalization: false
@@ -17,7 +19,7 @@ model:
   action_distribution: categorical
   action_bins: 200
 algo:
-  gamma: 0.99 #折扣因子的设置
+  gamma: 0.99  # GAE, gamma**t actor/entropy weights, accounting and selection; 1 = annual total.
   gae_lambda: 0.95
   share_param: false
   fixed_order: false
@@ -32,6 +34,7 @@ algo:
   normalize_shared_advantages: true
   mask_inactive_factors: true
 experiment:
+  training_years: null  # Default: all years outside holdouts; --training-years selects an explicit subset.
   validation_years: [2020, 2021, 2022, 2023, 2024]
   test_years: [1998, 1999, 1970, 1997, 2006]
   test_labels: [extremely_wet, wet, normal, dry, extremely_dry]

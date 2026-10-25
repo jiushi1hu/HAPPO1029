@@ -101,7 +101,8 @@ class ACTLayer(nn.Module):
 
         return action_logits
 
-    def evaluate_actions(self, x, action, available_actions=None, active_masks=None):
+    def evaluate_actions(self, x, action, available_actions=None, active_masks=None,
+                         return_entropy_per_sample=False):
         """Compute action log probability, distribution entropy, and action distribution.
         Args:
             x: (torch.Tensor) input to network.
@@ -109,6 +110,8 @@ class ACTLayer(nn.Module):
             available_actions: (torch.Tensor) denotes which actions are available to agent
                                                               (if None, all actions available)
             active_masks: (torch.Tensor) denotes whether an agent is active or dead.
+            return_entropy_per_sample: return unreduced joint entropy for each
+                row; the caller then applies objective weights and active masks.
         Returns:
             action_log_probs: (torch.Tensor) log probabilities of the input actions.
             dist_entropy: (torch.Tensor) action distribution entropy for the given inputs.
@@ -123,6 +126,9 @@ class ACTLayer(nn.Module):
                 action_log_probs.append(
                     action_distribution.log_probs(act.unsqueeze(-1))
                 )
+                if return_entropy_per_sample:
+                    dist_entropy.append(action_distribution.entropy())
+                    continue
                 if active_masks is not None:
                     dist_entropy.append(
                         (action_distribution.entropy() * active_masks)
@@ -135,6 +141,8 @@ class ACTLayer(nn.Module):
             action_log_probs = torch.cat(action_log_probs, dim=-1).sum(
                 dim=-1, keepdim=True
             )
+            if return_entropy_per_sample:
+                return action_log_probs, torch.stack(dist_entropy, dim=-1).sum(-1), None
             dist_entropy = (
                 torch.cat(dist_entropy, dim=-1).sum(dim=-1, keepdim=True).mean()
             )
@@ -142,6 +150,8 @@ class ACTLayer(nn.Module):
         else:
             action_distribution = self.action_out(x, available_actions)
             action_log_probs = action_distribution.log_probs(action)
+            if return_entropy_per_sample:
+                return action_log_probs, action_distribution.entropy(), action_distribution
             if active_masks is not None:
                 if self.action_type == "Discrete":
                     dist_entropy = (
