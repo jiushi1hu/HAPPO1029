@@ -1,6 +1,5 @@
 import torch
 import torch.nn as nn
-from harl.models.base.cnn import CNNBase
 from harl.models.base.mlp import MLPBase
 from harl.utils.envs_tools import check, get_shape_from_obs_space
 from harl.utils.models_tools import init, get_init_method
@@ -23,8 +22,7 @@ class VNet(nn.Module):
         init_method = get_init_method(self.initialization_method)
 
         cent_obs_shape = get_shape_from_obs_space(cent_obs_space)
-        base = CNNBase if len(cent_obs_shape) == 3 else MLPBase
-        self.base = base(args, cent_obs_shape)
+        self.base = MLPBase(args, cent_obs_shape)
 
         def init_(m):
             return init(m, init_method, lambda x: nn.init.constant_(x, 0))

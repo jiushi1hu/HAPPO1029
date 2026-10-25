@@ -204,7 +204,7 @@ def reference_summary(data, physics, years, action_bins=200, *, gamma):
         release, energy = physics.constant_storage(data.external[start:stop], data.initial_storage(year))
         reward_metrics = EpisodeRewardMetrics(gamma)
         settings = reward_settings(physics.config)
-        operation_reward = OperationReward(data, None, settings, timestep_seconds=physics.dt)
+        operation_reward = OperationReward(data, settings, timestep_seconds=physics.dt)
         for daily_release, daily_energy in zip(release, energy):
             transition = dict(reward=float(daily_energy.sum()/physics.reference_energy),
                               power=daily_energy/24., release=daily_release)

@@ -1,6 +1,5 @@
 """Annual HAPPO with multi-year training or a fixed-year learning check."""
 import argparse
-import copy
 import json
 import os
 from pathlib import Path
@@ -27,18 +26,11 @@ from harl.runners.cascade_reservoir_runner import (
 from harl.envs.cascade_reservoir.reward import reward_settings, REWARD_AGGREGATION, REWARD_DEFINITION
 
 
-def merge(base, override):
-    result = copy.deepcopy(base)
-    for key, value in override.items():
-        result[key] = merge(result[key], value) if isinstance(value, dict) and key in result else copy.deepcopy(value)
-    return result
-
-
 def load_configuration():
     config_dir = ROOT / "harl/configs"
     def read(rel):
         return yaml.safe_load((config_dir / rel).read_text(encoding="utf-8"))
-    return merge(read("algos_cfgs/happo.yaml"), read("algos_cfgs/happo_cascade.yaml")), read("envs_cfgs/cascade_reservoir.yaml")
+    return read("algos_cfgs/happo_cascade.yaml"), read("envs_cfgs/cascade_reservoir.yaml")
 
 
 def reported_references(data, physics, years, action_bins, phase, gamma):

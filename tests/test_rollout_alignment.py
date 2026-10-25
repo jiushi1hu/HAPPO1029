@@ -202,8 +202,9 @@ class RolloutAlignmentTests(unittest.TestCase):
             b.update_factor(ids + 1000)
             for batches in (1, length):  # Full-year batch and one sample per batch.
                 seen = []
-                for obs, actions, masks, active, lp, adv, available, factor in \
-                        b.feed_forward_generator_actor(ids + 2000, batches):
+                objective_weights = b.discount_weights(cb.gamma)
+                for obs, actions, masks, active, lp, adv, available, factor, weights in \
+                        b.feed_forward_generator_actor(ids + 2000, batches, objective_weights):
                     ix = indices(obs)
                     seen.extend(ix.tolist())
                     for actual, expected in ((obs, b.obs[ix, 0]),
@@ -212,10 +213,8 @@ class RolloutAlignmentTests(unittest.TestCase):
                         np.testing.assert_array_equal(actual, expected)
                     np.testing.assert_array_equal(adv[:, 0], ix + 2000)
                     np.testing.assert_array_equal(factor[:, 0], ix + 1000)
-                    if b.available_actions is None:
-                        self.assertIsNone(available)
-                    else:
-                        np.testing.assert_array_equal(available,b.available_actions[ix,0])
+                    np.testing.assert_array_equal(weights,objective_weights[ix,0])
+                    np.testing.assert_array_equal(available,b.available_actions[ix,0])
                 self.assertEqual(sorted(seen), list(range(length)))
         for batches in (1, length):
             seen = []

@@ -1,7 +1,6 @@
 import torch
 import torch.nn as nn
 from harl.utils.envs_tools import check
-from harl.models.base.cnn import CNNBase
 from harl.models.base.mlp import MLPBase
 from harl.models.base.act import ACTLayer
 from harl.utils.envs_tools import get_shape_from_obs_space
@@ -20,22 +19,19 @@ class StochasticPolicy(nn.Module):
         """
         super(StochasticPolicy, self).__init__()
         self.hidden_sizes = args["hidden_sizes"]
-        self.args = args
         self.gain = args["gain"]
         self.initialization_method = args["initialization_method"]
         self.use_policy_active_masks = args["use_policy_active_masks"]
         self.tpdv = dict(dtype=torch.float32, device=device)
 
         obs_shape = get_shape_from_obs_space(obs_space)
-        base = CNNBase if len(obs_shape) == 3 else MLPBase
-        self.base = base(args, obs_shape)
+        self.base = MLPBase(args, obs_shape)
 
         self.act = ACTLayer(
             action_space,
             self.hidden_sizes[-1],
             self.initialization_method,
             self.gain,
-            args,
         )
 
         self.to(device)

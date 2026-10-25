@@ -33,20 +33,8 @@ class OnPolicyHARunner(OnPolicyBaseRunner):
             )
 
         # Optional team normalization before controllability masks are applied.
-        if self.state_type == "EP" and self.algo_args["algo"].get("normalize_shared_advantages", False):
+        if self.algo_args["algo"].get("normalize_shared_advantages", False):
             advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-5)
-
-        # normalize advantages for FP
-        if self.state_type == "FP":
-            active_masks_collector = [
-                self.actor_buffer[i].active_masks for i in range(self.num_agents)
-            ]
-            active_masks_array = np.stack(active_masks_collector, axis=2)
-            advantages_copy = advantages.copy()
-            advantages_copy[active_masks_array[:-1] == 0.0] = np.nan
-            mean_advantages = np.nanmean(advantages_copy)
-            std_advantages = np.nanstd(advantages_copy)
-            advantages = (advantages - mean_advantages) / (std_advantages + 1e-5)
 
         if self.fixed_order:
             agent_order = list(range(self.num_agents))
@@ -81,14 +69,9 @@ class OnPolicyHARunner(OnPolicyBaseRunner):
             )
 
             # update actor
-            if self.state_type == "EP":
-                actor_train_info = self.actor[agent_id].train(
-                    self.actor_buffer[agent_id], advantages.copy(), "EP"
-                )
-            elif self.state_type == "FP":
-                actor_train_info = self.actor[agent_id].train(
-                    self.actor_buffer[agent_id], advantages[:, :, agent_id].copy(), "FP"
-                )
+            actor_train_info = self.actor[agent_id].train(
+                self.actor_buffer[agent_id], advantages.copy(), "EP"
+            )
 
             # compute action log probs for updated agent
             new_actions_logprob, _, _ = self.actor[agent_id].evaluate_actions(

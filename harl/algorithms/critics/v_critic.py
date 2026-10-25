@@ -17,7 +17,6 @@ class VCritic:
     """
 
     def __init__(self, args, cent_obs_space, device=torch.device("cpu")):
-        self.args = args
         self.device = device
         self.tpdv = dict(dtype=torch.float32, device=device)
 
@@ -31,7 +30,6 @@ class VCritic:
         self.use_max_grad_norm = args["use_max_grad_norm"]
         self.use_clipped_value_loss = args["use_clipped_value_loss"]
         self.use_huber_loss = args["use_huber_loss"]
-        self.use_policy_active_masks = args["use_policy_active_masks"]
 
         self.critic_lr = args["critic_lr"]
         self.opti_eps = args["opti_eps"]

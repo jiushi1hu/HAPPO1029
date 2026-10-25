@@ -12,7 +12,6 @@ water_density_kg_m3: 1000.0
 gravity_m_s2: 9.81
 timestep_seconds: 86400.0
 release_mapping: quadratic
-state_type: EP
 terminal_storage_mode: initial
 # Supplied scenario rules, including end-of-day flood ceilings and refill deadlines.
 seasonal_constraints: true

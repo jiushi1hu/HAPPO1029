@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 import numpy as np
 import torch
-from gym.spaces import Box, Discrete, MultiDiscrete
+from gym.spaces import Box, Discrete
 
 from examples.train_cascade import load_configuration
 from harl.algorithms.actors.happo import HAPPO
@@ -193,23 +193,16 @@ class ActorObjectiveAlignmentTests(unittest.TestCase):
             with self.subTest(weights=weights), self.assertRaises(ValueError):
                 actor.update(sample[:-1] + (weights,))
 
-    def test_unreduced_entropy_supports_joint_discrete_and_continuous_actions(self):
-        cfg, _ = load_configuration()
-        for space in (Discrete(3), MultiDiscrete([2, 3]),
-                      Box(-1., 1., shape=(2,), dtype=np.float32)):
-            with self.subTest(space=space):
-                layer = ACTLayer(space, 8, 'orthogonal_', .01, cfg['model'])
-                features = torch.zeros(3, 8)
-                actions, _ = layer(features)
-                lp, entropy, _ = layer.evaluate_actions(features, actions,
-                    active_masks=torch.zeros(3, 1), return_entropy_per_sample=True)
-                self.assertEqual(tuple(lp.shape), (3, 1) if isinstance(space, (Discrete, MultiDiscrete)) else (3, 2))
-                self.assertEqual(tuple(entropy.shape), (3,))
-                if isinstance(space, MultiDiscrete):
-                    torch.testing.assert_close(entropy, torch.full((3,), math.log(6.)))
-                elif isinstance(space, Discrete):
-                    torch.testing.assert_close(entropy, torch.full((3,), math.log(3.)))
-                self.assertTrue(torch.isfinite(entropy).all())
+    def test_unreduced_categorical_entropy_is_available_before_masking(self):
+        layer = ACTLayer(Discrete(3), 8, 'orthogonal_', .01)
+        features = torch.zeros(3, 8)
+        actions, _ = layer(features)
+        lp, entropy, _ = layer.evaluate_actions(features, actions,
+            active_masks=torch.zeros(3, 1), return_entropy_per_sample=True)
+        self.assertEqual(tuple(lp.shape), (3, 1))
+        self.assertEqual(tuple(entropy.shape), (3,))
+        torch.testing.assert_close(entropy, torch.full((3,), math.log(3.)))
+        self.assertTrue(torch.isfinite(entropy).all())
 
 
 if __name__ == '__main__':

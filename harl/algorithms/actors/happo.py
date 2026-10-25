@@ -171,6 +171,8 @@ class HAPPO(OnPolicyBase):
         Returns:
             train_info: (dict) contains information regarding training update (e.g. loss, grad norms, etc).
         """
+        if state_type != "EP":
+            raise ValueError("Cascade HAPPO requires a centralized EP critic state")
         train_info = {}
         train_info["policy_loss"] = 0
         train_info["dist_entropy"] = 0
@@ -183,7 +185,7 @@ class HAPPO(OnPolicyBase):
         if np.all(actor_buffer.active_masks[:-1] == 0.0):
             return dict(train_info, **budget_info)
 
-        if state_type == "EP" and not self.args.get("normalize_shared_advantages", False):
+        if not self.args.get("normalize_shared_advantages", False):
             advantages_copy = advantages.copy()
             advantages_copy[actor_buffer.active_masks[:-1] == 0.0] = np.nan
             mean_advantages = np.nanmean(advantages_copy)

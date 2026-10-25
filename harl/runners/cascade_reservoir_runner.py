@@ -115,8 +115,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         self.year_rng = np.random.RandomState(seed)
         self.sampled_years = []
         self.seed = seed
-        self.num_agents, self.state_type = 5, "EP"
-        self.share_param = False
+        self.num_agents = 5
         self.fixed_order = algo_args["algo"]["fixed_order"]
         self.action_aggregation = "prod"
         self.device = torch.device("cpu")

@@ -34,9 +34,9 @@ class RewardPenaltyTests(unittest.TestCase):
     def test_exact_penalty_arithmetic_normalization_and_negative_reward(self):
         data,config,seasonal=self.fixture()
         config['reward_penalties'].update(guaranteed_output_weight=2.,ecological_flow_weight=3.)
-        reward=OperationReward(data,seasonal,reward_settings(config))
+        reward=OperationReward(data,reward_settings(config))
         row=dict(power=np.array([0.,2.,1.5,4.,.75]),release=np.array([0.,6.,1.5,2.,.25]),reward=.7)
-        reward.apply(row,0)
+        reward.apply(row)
         for key,expected in dict(guaranteed_output=[1.,0.,.5,0.,.25],
                                  ecological_flow=[1.,0.,.5,0.,.75]).items():
             np.testing.assert_allclose(row['normalized_service_shortfalls'][key],expected,rtol=0,atol=1e-14)
@@ -57,7 +57,7 @@ class RewardPenaltyTests(unittest.TestCase):
         data,config,seasonal=self.fixture()
         row=dict(power=data.service_requirements.guaranteed_output_mw.copy(),
                  release=2*data.service_requirements.ecological_flow_m3s,reward=.7)
-        OperationReward(data,seasonal,reward_settings(config)).apply(row,0)
+        OperationReward(data,reward_settings(config)).apply(row)
         self.assertEqual(row['reward'],.7);self.assertEqual(row['reward_penalty'],0.)
 
     def test_disabled_penalties_preserve_transition_and_zero_weights_preserve_reward(self):
@@ -90,7 +90,7 @@ class RewardPenaltyTests(unittest.TestCase):
         self.assertTrue(reward_settings(dict(config,seasonal_constraints=False))['enabled'])
         del data.service_requirements
         with self.assertRaisesRegex(ValueError,'require service requirement data'):
-            OperationReward(data,None,reward_settings(config))
+            OperationReward(data,reward_settings(config))
 
     def test_inactive_requirements_use_fixed_active_denominators_and_total_release(self):
         data,config,_=self.fixture()
@@ -98,13 +98,13 @@ class RewardPenaltyTests(unittest.TestCase):
         data.service_requirements.ecological_flow_m3s[:]=[0.,4.,0.,0.,0.]
         row=dict(power=np.array([0.,1.,0.,0.,0.]),release=np.array([0.,4.,0.,0.,0.]),
                  turbine=np.zeros(5),reward=.2)
-        OperationReward(data,None,reward_settings(config)).apply(row)
+        OperationReward(data,reward_settings(config)).apply(row)
         self.assertEqual(row['reward_penalty_components']['guaranteed_output'],.5)
         self.assertEqual(row['reward_penalty_components']['ecological_flow'],0.)
         self.assertEqual(row['normalized_service_shortfalls']['guaranteed_output'][0],0.)
         data.service_requirements.guaranteed_output_mw[:]=0.
         data.service_requirements.ecological_flow_m3s[:]=0.
-        OperationReward(data,None,reward_settings(config)).apply(row)
+        OperationReward(data,reward_settings(config)).apply(row)
         self.assertEqual(row['reward_penalty'],0.)
 
     def test_hard_infeasibility_still_raises_without_punishing_and_continuing(self):

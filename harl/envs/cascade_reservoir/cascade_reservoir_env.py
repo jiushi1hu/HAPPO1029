@@ -41,7 +41,7 @@ class CascadeReservoirEnv:
             raise ValueError('seasonal_constraints must be a boolean')
         self.reward_settings = reward_settings(config)
         self.seasonal = data.load_seasonal_operation() if self.seasonal_constraints else None
-        self.operation_reward = OperationReward(data, self.seasonal, self.reward_settings,
+        self.operation_reward = OperationReward(data, self.reward_settings,
                                                timestep_seconds=self.physics.dt)
         self.terminal_storage_mode = config.get('terminal_storage_mode', 'free')
         if self.terminal_storage_mode not in ('free', 'initial'):
@@ -267,7 +267,7 @@ class CascadeReservoirEnv:
         # Forced actions have no policy contribution; zero is a valid placeholder index.
         result['actions'] = np.where(result['controls'] > 0, actions.reshape(5), 0).astype(np.int64)
         result["levels_end"] = self.data.levels(result["storage_end"])
-        self.operation_reward.apply(result, self.index)
+        self.operation_reward.apply(result)
         infos = [dict(bad_transition=False) for _ in range(5)]
         if self.seasonal is not None:
             offset = self.index-self.start

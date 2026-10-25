@@ -4,21 +4,19 @@ import unittest
 
 import numpy as np
 import torch
-from gym.spaces import Box, Discrete
+from gym.spaces import Box, Discrete, MultiDiscrete, MultiBinary
 
 from cascade_test_utils import load_configuration
 from harl.envs.cascade_reservoir.data_loader import CascadeData
 from harl.models.base.act import ACTLayer
-from harl.models.base.distributions import FixedCategorical, FixedNormal
+from harl.models.base.distributions import FixedCategorical
 from harl.runners.cascade_reservoir_runner import CascadeReservoirRunner
 
 
 class DiscretePolicyTests(unittest.TestCase):
     def test_sampling_likelihoods_argmax_and_gradients(self):
-        cfg, _ = load_configuration()
-        args = {**cfg['model'], **cfg['algo']}
         torch.manual_seed(3)
-        layer = ACTLayer(Discrete(200), 4, 'orthogonal_', .01, args)
+        layer = ACTLayer(Discrete(200), 4, 'orthogonal_', .01)
         features = torch.randn(100, 4)
         actions, old_log_probs = layer(features)
         log_probs, entropy, dist = layer.evaluate_actions(features, actions)
@@ -34,11 +32,10 @@ class DiscretePolicyTests(unittest.TestCase):
         self.assertTrue(all(p.grad is not None and torch.isfinite(p.grad).all()
                             for p in layer.parameters()))
 
-    def test_generic_gaussian_action_layer_is_unchanged(self):
-        cfg, _ = load_configuration()
-        args = {**cfg['model'], **cfg['algo']}
-        layer = ACTLayer(Box(-1., 1., (1,), dtype=np.float32), 4, 'orthogonal_', .01, args)
-        self.assertIsInstance(layer.action_out(torch.zeros(1, 4)), FixedNormal)
+    def test_unsupported_action_spaces_are_rejected(self):
+        for space in (Box(-1., 1., (1,), dtype=np.float32), MultiDiscrete([2, 3]), MultiBinary(2)):
+            with self.subTest(space=space), self.assertRaisesRegex(ValueError, 'require Discrete'):
+                ACTLayer(space, 4, 'orthogonal_', .01)
 
     def test_lambda_one_uses_selected_discount_without_critic_bootstrap(self):
         cfg, physical = load_configuration()

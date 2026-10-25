@@ -105,22 +105,6 @@ class OnPolicyBase:
         )
         return actions
 
-    def update(self, sample):
-        """Update actor network.
-        Args:
-            sample: (Tuple) contains data batch with which to update networks.
-        """
-        pass
-
-    def train(self, actor_buffer, advantages, state_type):
-        """Perform a training update using minibatch GD.
-        Args:
-            actor_buffer: (OnPolicyActorBuffer) buffer containing training data related to actor.
-            advantages: (np.ndarray) advantages.
-            state_type: (str) type of state.
-        """
-        pass
-
     def prep_training(self):
         """Prepare for training."""
         self.actor.train()

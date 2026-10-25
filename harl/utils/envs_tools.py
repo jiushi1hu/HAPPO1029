@@ -12,33 +12,23 @@ def check(value):
 def get_shape_from_obs_space(obs_space):
     """Get shape from observation space.
     Args:
-        obs_space: (gym.spaces or list) observation space
+        obs_space: one-dimensional gym.spaces.Box observation space
     Returns:
         obs_shape: (tuple) observation shape
     """
-    if obs_space.__class__.__name__ == "Box":
-        obs_shape = obs_space.shape
-    elif obs_space.__class__.__name__ == "list":
-        obs_shape = obs_space
-    else:
-        raise NotImplementedError
-    return obs_shape
+    if obs_space.__class__.__name__ != "Box" or len(obs_space.shape) != 1:
+        raise ValueError("Cascade networks require one-dimensional Box observations")
+    return obs_space.shape
 
 
 def get_shape_from_act_space(act_space):
     """Get shape from action space.
     Args:
-        act_space: (gym.spaces) action space
+        act_space: gym.spaces.Discrete action space
     Returns:
-        act_shape: (tuple) action shape
+        int: scalar discrete action width
     """
-    if act_space.__class__.__name__ == "Discrete":
-        act_shape = 1
-    elif act_space.__class__.__name__ == "MultiDiscrete":
-        act_shape = act_space.shape[0]
-    elif act_space.__class__.__name__ == "Box":
-        act_shape = act_space.shape[0]
-    elif act_space.__class__.__name__ == "MultiBinary":
-        act_shape = act_space.shape[0]
-    return act_shape
+    if act_space.__class__.__name__ != "Discrete":
+        raise ValueError("Cascade controls require Discrete actions")
+    return 1
 

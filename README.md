@@ -67,6 +67,13 @@ PYTHONDONTWRITEBYTECODE=1 /opt/anaconda3/envs/harl/bin/python examples/train_cas
 
 examples/train_cascade.py 为训练入口；examples/plot_cascade.py 为弹窗绘图入口。harl/envs/cascade_reservoir 负责真实数据读取、年度环境、硬约束与发电、冻结策略评估；harl/runners 组织年度采样和原有顺序 HAPPO 更新；harl/algorithms、common、models、utils 保留所需算法与公共组件。配置位于 harl/configs，回归检查位于 tests。
 
+当前算法配置集中在 `harl/configs/algos_cfgs/happo_cascade.yaml`，直接列出全部有效默认值；
+不再合并通用游戏配置。未使用的 CNN 图像网络、Gaussian／MultiDiscrete 动作分支、
+FP 状态路径、算法注册表和无调用的缓存／工具接口已移除。actor、critic 只接收
+一维 Box 观测，动作层只接受标量 Discrete；保留 MLP 参数结构及顺序 HAPPO 更新。
+固定年诊断、单年和六年批量采样、KL 对照实验、分期／非分期物理模式及历史日志绘图
+仍是可用路径。两项服务奖励不再接收已无用途的分期对象或日期索引参数。
+
 合成数据生成入口、旧版文件读取格式、单个验证／测试年配置、模型／图片导出和可选 LP 输出入口已移除；逐回合日志支持按需导出 JSONL。自然入流、物理参数及硬运行边界保持原样。统一运行时期表用于核对日历，逐库分期边界与截止日期由补充分期表给出。
 
 分期运行已接入数据读取、剩余时域可达性、物理动作执行、环境观测、评估参考和绘图。默认物理配置为 `seasonal_constraints: true`，环境读取四个补充分期 CSV，并在每一步同时执行当日日末边界和剩余时域约束。也可通过 `data.load_seasonal_operation()` 或 `load_seasonal_operation: true` 只读取数据，这两种方式不会单独启用动作约束。输入按日期和水库 ID 对齐，并检查缺失、重复、库容—水位关系、参考节点、闰年及跨表一致性；来源状态原样保留。当前关键参数仍标记为 `scenario_reference_not_official_operating_rule`，日参考为软情景目标；启用约束不代表已核实为官方运行规程。

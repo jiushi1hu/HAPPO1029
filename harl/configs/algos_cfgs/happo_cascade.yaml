@@ -1,6 +1,5 @@
-# Deep overrides of happo.yaml; all other algorithm behavior is reused.
+# Complete configuration for annual cascade HAPPO; no generic game defaults.
 device:
-  cuda: false
   torch_threads: 1
 train:
   n_rollout_threads: 1  # Annual environments collected sequentially; batching is below.
@@ -14,8 +13,12 @@ model:
   hidden_sizes: [128, 128]
   activation_func: tanh
   use_feature_normalization: false
+  initialization_method: orthogonal_
+  gain: 0.01
   lr: 0.0003
   critic_lr: 0.0003
+  opti_eps: 0.00001
+  weight_decay: 0
   action_distribution: categorical
   action_bins: 200
 algo:
@@ -28,9 +31,16 @@ algo:
   critic_epoch: 5
   actor_num_mini_batch: 1  # Keep all days; same update count in leap/non-leap years.
   critic_num_mini_batch: 1
+  clip_param: 0.2
   use_clipped_value_loss: false
   use_huber_loss: false
+  huber_delta: 10.0
+  value_loss_coef: 1
+  use_max_grad_norm: true
   max_grad_norm: 0.5
+  use_gae: true
+  use_policy_active_masks: true
+  action_aggregation: prod
   entropy_coef: 0.001
   normalize_shared_advantages: true
   mask_inactive_factors: true

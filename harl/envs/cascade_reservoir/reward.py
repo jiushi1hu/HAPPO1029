@@ -64,7 +64,7 @@ class OperationReward:
     violating reservoirs. Seasonality does not gate these service penalties.
     """
 
-    def __init__(self, data, seasonal, settings, timestep_seconds=86400.):
+    def __init__(self, data, settings, timestep_seconds=86400.):
         self.settings = dict(settings)
         self.requirements = getattr(data, 'service_requirements', None)
         if self.requirements is None and settings['enabled']:
@@ -82,7 +82,7 @@ class OperationReward:
                    for v in self.thresholds.values()):
                 raise ValueError('Service requirements must be finite nonnegative five-vectors')
 
-    def apply(self, transition, index=None):
+    def apply(self, transition):
         if self.requirements is None:
             return
         actual = dict(guaranteed_output=np.asarray(transition['power']),

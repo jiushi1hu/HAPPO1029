@@ -21,9 +21,6 @@ class OnPolicyCriticBufferEP:
         self.use_proper_time_limits = args["use_proper_time_limits"]
 
         share_obs_shape = get_shape_from_obs_space(share_obs_space)
-        if isinstance(share_obs_shape[-1], list):
-            share_obs_shape = share_obs_shape[:1]
-
         # Buffer for share observations
         self.share_obs = np.zeros(
             (self.episode_length + 1, self.n_rollout_threads, *share_obs_shape),
@@ -66,16 +63,6 @@ class OnPolicyCriticBufferEP:
         self.bad_masks[self.step + 1] = bad_masks.copy()
 
         self.step = (self.step + 1) % self.episode_length
-
-    def after_update(self):
-        """After an update, copy the data at the last step to the first position of the buffer."""
-        self.share_obs[0] = self.share_obs[-1].copy()
-        self.masks[0] = self.masks[-1].copy()
-        self.bad_masks[0] = self.bad_masks[-1].copy()
-
-    def get_mean_rewards(self):
-        """Get mean rewards for logging."""
-        return np.mean(self.rewards)
 
     def compute_returns(self, next_value, value_normalizer=None):
         """Compute returns either as discounted sum of rewards, or using GAE.
@@ -183,24 +170,20 @@ class OnPolicyCriticBufferEP:
                     )
 
     def feed_forward_generator_critic(
-        self, critic_num_mini_batch=None, mini_batch_size=None
+        self, critic_num_mini_batch
     ):
         """Training data generator for critic that uses MLP network.
         Args:
             critic_num_mini_batch: (int) Number of mini batches for critic.
-            mini_batch_size: (int) Size of mini batch for critic.
         """
 
         # get episode_length, n_rollout_threads, mini_batch_size
         episode_length, n_rollout_threads = self.rewards.shape[0:2]
         batch_size = n_rollout_threads * episode_length
-        if mini_batch_size is None:
-            assert batch_size >= critic_num_mini_batch, (
-                f"The number of processes ({n_rollout_threads}) "
-                f"* number of steps ({episode_length}) = {n_rollout_threads * episode_length} "
-                f"is required to be greater than or equal to the number of critic mini batches ({critic_num_mini_batch})."
-            )
-            mini_batch_size = batch_size // critic_num_mini_batch
+        assert batch_size >= critic_num_mini_batch, (
+            f"The rollout size ({batch_size}) must be at least the critic minibatch count ({critic_num_mini_batch})."
+        )
+        mini_batch_size = batch_size // critic_num_mini_batch
 
         # shuffle indices
         rand = torch.randperm(batch_size).numpy()
