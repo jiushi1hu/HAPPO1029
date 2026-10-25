@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT))
 
 import numpy as np
 import yaml
+from harl.algorithms.actors.happo import validate_policy_optimization
 from harl.envs.cascade_reservoir.data_loader import CascadeData, HEAD_MODELS, IDS, resolve_year_split
 from harl.envs.cascade_reservoir.cascade_reservoir_env import (
     ACTOR_OBSERVATION_LAYOUT, actor_observation_features)
@@ -22,8 +23,8 @@ from harl.envs.cascade_reservoir.evaluation import (
     reference_summary, reference_metadata, validate_operating_feasibility)
 from harl.runners.cascade_reservoir_runner import (
     CascadeReservoirRunner, validate_discount_factor, validate_gae_lambda, validate_seed,
-    validate_fixed_training_year)
-from harl.envs.cascade_reservoir.reward import reward_settings, REWARD_AGGREGATION
+    validate_fixed_training_year, validate_rollout_episodes)
+from harl.envs.cascade_reservoir.reward import reward_settings, REWARD_AGGREGATION, REWARD_DEFINITION
 
 
 def merge(base, override):
@@ -53,8 +54,10 @@ def reported_references(data, physics, years, action_bins, phase, gamma):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=ROOT / "data/cascade_reservoir_new")
-    parser.add_argument("--episodes", type=int)
-    parser.add_argument("--eval-interval", type=int)
+    parser.add_argument("--episodes", type=int, help='Total annual episodes per seed')
+    parser.add_argument('--rollout-episodes', type=int,
+                        help='Annual trajectories per HAPPO update (default: 6; 1 restores the baseline)')
+    parser.add_argument("--eval-interval", type=int, help='Evaluate every N HAPPO updates (default: 1)')
     parser.add_argument('--training-years', nargs='+', type=int, metavar='YEAR',
                         help='Explicit training years; unassigned years are unused')
     parser.add_argument('--validation-years', nargs='+', type=int, metavar='YEAR',
@@ -66,6 +69,10 @@ def main():
                              'skip held-out validation, final tests and reference runs')
     parser.add_argument('--action-distribution', choices=['categorical'], help='Categorical discrete indices')
     parser.add_argument('--action-bins', type=int, help='Number of discrete choices per reservoir (default: 200)')
+    parser.add_argument('--ppo-epochs', type=int, help='Maximum policy optimization epochs per collected batch')
+    kl = parser.add_mutually_exclusive_group()
+    kl.add_argument('--target-kl', type=float, help='Stop further actor epochs after mean exact rollout KL exceeds this value')
+    kl.add_argument('--no-kl-limit', action='store_true', help='Disable actor KL early stopping for baseline comparisons')
     parser.add_argument("--seeds", nargs="+", type=int)
     parser.add_argument("--gamma", type=float,
                         help="Shared discount factor for training, evaluation and rewards in [0, 1]; overrides YAML")
@@ -99,7 +106,15 @@ def main():
     if args.episode_log is not None and args.episode_log.exists():
         parser.error('episode-log must name a new file; existing paths are not overwritten')
     config, physical = load_configuration()
+    if args.ppo_epochs is not None:
+        config['algo']['ppo_epoch'] = args.ppo_epochs
+    if args.target_kl is not None:
+        config['algo']['target_kl'] = args.target_kl
+    elif args.no_kl_limit:
+        config['algo']['target_kl'] = None
     try:
+        config['algo']['ppo_epoch'], config['algo']['target_kl'] = validate_policy_optimization(
+            config['algo']['ppo_epoch'], config['algo'].get('target_kl'))
         config["algo"]["gamma"] = validate_discount_factor(
             config["algo"]["gamma"] if args.gamma is None else args.gamma)
         config["algo"]["gae_lambda"] = validate_gae_lambda(
@@ -117,9 +132,6 @@ def main():
     physical['reward_penalties'] = dict(physical.get('reward_penalties',{}))
     if args.reward_penalties is not None:
         physical['reward_penalties']['enabled'] = args.reward_penalties
-    elif args.seasonal_constraints is False:
-        # The explicit legacy switch restores the generation-only objective.
-        physical['reward_penalties']['enabled'] = False
     try:
         penalty_settings = reward_settings(physical)
     except ValueError as exc:
@@ -138,6 +150,8 @@ def main():
     for key in ("episodes", "eval_interval", "seeds"):
         if getattr(args, key) is not None:
             exp[key] = getattr(args, key)
+    if args.rollout_episodes is not None:
+        exp['rollout_episodes'] = args.rollout_episodes
     for key in ('training_years', 'validation_years', 'test_years'):
         if getattr(args, key) is not None:
             exp[key] = getattr(args, key)
@@ -150,6 +164,7 @@ def main():
         parser.error(str(exc))
     exp['test_labels'] = split['test_labels']
     try:
+        exp['rollout_episodes'] = validate_rollout_episodes(exp.get('rollout_episodes',1))
         if not isinstance(exp['seeds'], (list, tuple)):
             raise ValueError('Seeds must be a nonempty sequence of integers')
         exp['seeds'] = [validate_seed(seed) for seed in exp['seeds']]
@@ -171,6 +186,8 @@ def main():
     physics = ReservoirPhysics(data, physical)
     seasonal_enabled = physical.get('seasonal_constraints', False)
     operation = data.load_seasonal_operation() if seasonal_enabled else None
+    if penalty_settings['enabled'] and getattr(data, 'service_requirements', None) is None:
+        data.load_service_requirements()
     comparison = reference_metadata(physical)
     print(json.dumps(dict(period=[str(data.dates[0]), str(data.dates[-1])],
         training_years=list(data.training_years), training_year_count=len(data.training_years),
@@ -182,6 +199,13 @@ def main():
         validation_years=list(data.validation_years),
         test_years=dict(zip(data.test_labels, data.test_years)),
         episodes_per_seed=exp["episodes"], episode_days="365/366", release_mapping="quadratic",
+        rollout_episodes_per_update=exp['rollout_episodes'],
+        updates_per_seed=(exp['episodes']+exp['rollout_episodes']-1)//exp['rollout_episodes'],
+        eval_interval_updates=exp['eval_interval'],
+        ppo_epochs_max=config['algo']['ppo_epoch'],
+        actor_target_kl=config['algo']['target_kl'],
+        actor_kl_definition='mean exact KL(old || new) over controllable old-rollout states',
+        collection_mode='sequential_independent_annual_episodes_under_frozen_policy',
         reference_energy_MWh=physics.reference_energy,
         head_model=physics.head_model, head_data_status=physics.head_data_status,
         head_time_step_rule=("mean of starting and ending forebay elevations"
@@ -197,11 +221,17 @@ def main():
         terminal_storage_mode=physical.get('terminal_storage_mode', 'free'),
         operation_data_status=(None if operation is None else
             {name: operation.key_parameters[name]['value_status'] for name in IDS}),
+        reference_year_overrides=([] if operation is None else [
+            dict(reservoir_id=name, year=year, value_status=nodes[0]['value_status'])
+            for (name, year), nodes in sorted(operation.reference_year_nodes.items())]),
+        service_requirements=(None if data.service_requirements is None else
+                              data.service_requirements.metadata()),
         gamma=config["algo"]["gamma"],
         gae_lambda=config["algo"]["gae_lambda"],
         reward_penalties=penalty_settings,
-        penalty_normalization='mean of excess metres / operating level range over five reservoirs',
-        penalty_weight_status='assumed_sensitivity_only',
+        reward_definition=REWARD_DEFINITION,
+        penalty_normalization='mean of positive relative shortfalls over the fixed active set for each requirement',
+        penalty_weight_status='prespecified_tradeoff_weights',
         evaluation_metric=('gamma-weighted annual penalized return' if penalty_settings['enabled'] else
                            'gamma-weighted annual generation reward'),
         generation_metric='undiscounted annual generation',
@@ -263,6 +293,10 @@ def main():
             references.extend(reported_references(data, physics, data.test_years,
                                                   config['model']['action_bins'], 'test', config['algo']['gamma']))
         payload = dict(gamma=config["algo"]["gamma"], gae_lambda=config["algo"]["gae_lambda"],
+                       rollout_episodes_per_update=exp['rollout_episodes'],
+                       ppo_epochs_max=config['algo']['ppo_epoch'], actor_target_kl=config['algo']['target_kl'],
+                       learning_curve_x_axis='training_steps',
+                       reward_definition=REWARD_DEFINITION,
                        reward_aggregation=REWARD_AGGREGATION,
                        fixed_training_year=fixed_year,
                        fixed_year_histories=([r.fixed_year_history for r in runners] if fixed_year is not None else []),

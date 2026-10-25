@@ -10,6 +10,8 @@ import numpy as np
 IDS = ("WDD", "BHT", "XLD", "XJB", "THR")
 HEAD_MODELS = ("fixed", "storage_sensitivity")
 HEAD_SENSITIVITY_FILE = "reservoir_head_sensitivity.csv"
+SERVICE_REQUIREMENTS_FILE = "reservoir_service_requirements.csv"
+REFERENCE_OVERRIDE_FILE = "reservoir_reference_year_nodes.csv"
 SEASONAL_FILES = (
     "reservoir_five_key_operation_parameters.csv",
     "reservoir_period_operation_parameters.csv",
@@ -174,12 +176,26 @@ class CascadeData:
         self.head_sensitivity = None
         if self.head_model == "storage_sensitivity":
             self._load_head_sensitivity(config)
+        self.service_requirements = None
+        load_services = config.get("load_service_requirements", False)
+        if not isinstance(load_services, bool):
+            raise ValueError("load_service_requirements must be a boolean")
+        if load_services:
+            self.load_service_requirements()
         self.seasonal_operation = None
         load_seasonal = config.get("load_seasonal_operation", False)
         if not isinstance(load_seasonal, bool):
             raise ValueError("load_seasonal_operation must be a boolean")
         if load_seasonal:
             self.load_seasonal_operation()
+
+    def load_service_requirements(self):
+        """Load constant service thresholds without applying penalties or bounds."""
+        if self.service_requirements is None:
+            requirements = ServiceRequirementsData(self)
+            self.hashes[SERVICE_REQUIREMENTS_FILE] = requirements.sha256
+            self.service_requirements = requirements
+        return self.service_requirements
 
     def load_seasonal_operation(self):
         """Explicitly load seasonal inputs without activating environment rules.
@@ -265,6 +281,65 @@ class CascadeData:
         return np.asarray(result)
 
 
+class ServiceRequirementsData:
+    """Fixed daily service thresholds in hydraulic order, with paper provenance.
+
+    Zero explicitly disables one requirement. Loading never activates a reward
+    or adds a release/power lower bound. Thresholds do not depend on year splits.
+    """
+
+    def __init__(self, data):
+        path = data.root / SERVICE_REQUIREMENTS_FILE
+        if not path.is_file():
+            raise ValueError("Service requirements require " + str(path))
+        required = ("reservoir_id", "paper_reservoir_id", "guaranteed_output_mw",
+                    "ecological_flow_m3s", "source_doi", "source_table")
+        with path.open(encoding="utf-8-sig", newline="") as stream:
+            reader = csv.DictReader(stream)
+            headers = reader.fieldnames or []
+            if len(headers) != len(set(headers)) or not set(required) <= set(headers):
+                raise ValueError("Missing or duplicate service requirement columns")
+            records = {}
+            for row in reader:
+                if None in row or any(row.get(k) is None or not row[k].strip() for k in required):
+                    raise ValueError("Missing service requirement value at row " + str(reader.line_num))
+                row = {k: row[k].strip() for k in required}
+                name = row["reservoir_id"]
+                if name not in IDS or name in records:
+                    raise ValueError("Invalid or duplicate service requirement reservoir: " + name)
+                paper_name = "TGR" if name == "THR" else name
+                if row["paper_reservoir_id"] != paper_name:
+                    raise ValueError("Inconsistent paper reservoir mapping: " + name)
+                records[name] = row
+        if set(records) != set(IDS):
+            raise ValueError("Service requirements must contain exactly one row per reservoir")
+        for field, cap in (("guaranteed_output_mw", data.power_cap),
+                           ("ecological_flow_m3s", data.release_cap)):
+            try:
+                values = np.array([float(records[name][field]) for name in IDS], dtype=np.float64)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("Invalid service requirement: " + field) from exc
+            if not np.isfinite(values).all() or (values < 0).any():
+                raise ValueError("Service requirements must be finite and nonnegative: " + field)
+            if (values > cap).any():
+                raise ValueError("Service requirement exceeds configured capacity: " + field)
+            values.setflags(write=False)
+            setattr(self, field, values)
+        self.paper_reservoir_ids = tuple(records[name]["paper_reservoir_id"] for name in IDS)
+        self.sources = {name: {k: records[name][k] for k in ("source_doi", "source_table")}
+                        for name in IDS}
+        self.sha256 = hashlib.sha256(path.read_bytes()).hexdigest()
+
+    def metadata(self):
+        """Return JSON-compatible values and provenance without exposing arrays."""
+        return dict(file=SERVICE_REQUIREMENTS_FILE, sha256=self.sha256,
+                    reservoir_ids=list(IDS), paper_reservoir_ids=list(self.paper_reservoir_ids),
+                    guaranteed_output_mw=self.guaranteed_output_mw.tolist(),
+                    ecological_flow_m3s=self.ecological_flow_m3s.tolist(),
+                    time_basis="constant_daily_requirement", value_status="paper_reported",
+                    sources={name: dict(source) for name, source in self.sources.items()})
+
+
 class SeasonalOperationData:
     """End-of-day constraints and separate soft references in hydraulic order.
 
@@ -284,6 +359,7 @@ class SeasonalOperationData:
         self.key_parameters = {}
         self.period_parameters = {}
         self.reference_nodes = {}
+        self.reference_year_nodes = {}
         shape = (len(data.dates), len(IDS))
         self.storage_lower = np.broadcast_to(data.vmin, shape).copy()
         self.storage_upper = np.broadcast_to(data.vmax, shape).copy()
@@ -292,6 +368,7 @@ class SeasonalOperationData:
         self._load_keys()
         self._load_periods()
         self._load_nodes()
+        self._load_year_nodes()
         self._load_daily_reference()
         for array in (self.storage_lower, self.storage_upper,
                       self.flood_limit_active, self.refill_deadline,
@@ -450,6 +527,74 @@ class SeasonalOperationData:
                     any(a["month_day"] >= b["month_day"] for a, b in zip(nodes, nodes[1:]))):
                 raise ValueError("Invalid reference node sequence/dates: " + id)
             self.reference_nodes[id] = tuple(nodes)
+        # Period summaries describe the recurring path, even when every year
+        # of a reservoir has a separately supplied dated path.
+        year = self.data.start_year
+        origin = datetime(year, 1, 1).date()
+        for (id, period), record in self.period_parameters.items():
+            node_days, node_v = self._reference_path(id, year)
+            x, y = [(datetime(year, *self._month_day(record[k])).date()-origin).days
+                    for k in ("start_month_day", "end_month_day")]
+            if (abs(np.interp(x, node_days, node_v)-record["reference_start_storage_m3"]) > 1.1 or
+                    abs(np.interp(y+1, node_days, node_v)-record["reference_end_storage_m3"]) > 1.1):
+                raise ValueError("Period summary disagrees with recurring reference nodes: " + str((id, period)))
+
+    def _reference_path(self, reservoir, year):
+        """Start-of-day boundary nodes; dated paths override recurring defaults."""
+        a, b = self.data.indices(year, year)
+        origin = self.data.dates[a]
+        nodes = self.reference_year_nodes.get((reservoir, year))
+        if nodes is not None:
+            return ([(r["date"]-origin).days for r in nodes],
+                    [r["storage"] for r in nodes])
+        nodes = self.reference_nodes[reservoir]
+        return ([(datetime(year, *r["month_day"]).date()-origin).days for r in nodes] + [b-a],
+                [r["storage"] for r in nodes] + [nodes[0]["storage"]])
+
+    def _load_year_nodes(self):
+        """Optional, explicitly sourced annual paths, independently checked against daily data.
+
+        A path includes both January 1 boundaries. Interpolation remains in
+        storage, and these soft targets never replace the hard key-date rules.
+        """
+        if not (self.data.root / REFERENCE_OVERRIDE_FILE).exists():
+            return
+        fields = ("reservoir_id", "year", "node_sequence", "date",
+                  "reference_target_level_m", "reference_target_storage_m3", "value_status")
+        for row in self._rows(REFERENCE_OVERRIDE_FILE, fields):
+            id = row["reservoir_id"]
+            year, sequence = [self._number(row, k) for k in fields[1:3]]
+            if (id not in IDS or year != int(year) or sequence != int(sequence) or
+                    not self.data.start_year <= year <= self.data.end_year):
+                raise ValueError("Invalid year-specific reference key: " + str((id, year, sequence)))
+            year = int(year)
+            try:
+                day = datetime.strptime(row["date"], "%Y-%m-%d").date()
+            except ValueError as exc:
+                raise ValueError("Invalid year-specific reference date: " + row["date"]) from exc
+            if (day.isoformat() != row["date"] or
+                    not datetime(year, 1, 1).date() <= day <= datetime(year+1, 1, 1).date()):
+                raise ValueError("Year-specific reference date outside its year: " + row["date"])
+            level, volume = [self._number(row, k) for k in fields[4:6]]
+            j = IDS.index(id)
+            if (not self.data.vmin[j] <= volume <= self.data.vmax[j] or
+                    abs(self._volume(id, level)-volume) > 1.):
+                raise ValueError("Year-specific reference level/storage outside bounds or inconsistent: " +
+                                 str((id, row["date"])))
+            record = dict(row, date=day, level=level, storage=volume, sequence=int(sequence))
+            self.reference_year_nodes.setdefault((id, year), []).append(record)
+        for (id, year), records in self.reference_year_nodes.items():
+            nodes = sorted(records, key=lambda r: r["sequence"])
+            if (len(nodes) < 2 or [r["sequence"] for r in nodes] != list(range(1, len(nodes)+1)) or
+                    nodes[0]["date"] != datetime(year, 1, 1).date() or
+                    nodes[-1]["date"] != datetime(year+1, 1, 1).date() or
+                    any(a["date"] >= b["date"] for a, b in zip(nodes, nodes[1:]))):
+                raise ValueError("Invalid year-specific reference sequence/dates: " + str((id, year)))
+            initial = self.data.initial_storage(year)[IDS.index(id)]
+            if abs(nodes[0]["storage"]-initial) > 1. or abs(nodes[-1]["storage"]-initial) > 1.:
+                raise ValueError("Year-specific reference must match initial storage and annual closure: " +
+                                 str((id, year)))
+            self.reference_year_nodes[(id, year)] = tuple(nodes)
 
     def _load_daily_reference(self):
         fields = ("target_start_of_day_level_m", "target_end_of_day_level_m",
@@ -491,37 +636,53 @@ class SeasonalOperationData:
             raise ValueError("Daily reference storage change/rate mismatch")
         for j, id in enumerate(IDS):
             p = self.data.anchors[id]
-            for volumes, levels in ((start[:, j], ref[fields[0]][:, j]), (end[:, j], ref[fields[1]][:, j])):
-                if ((volumes < self.data.vmin[j]-1.).any() or (volumes > self.data.vmax[j]+1.).any() or
-                        not np.allclose(levels, np.interp(volumes, p[:, 1], p[:, 0]), rtol=0., atol=1e-6)):
-                    raise ValueError("Daily reference level/storage mismatch: " + id)
+            for boundary, volumes, levels in (("start", start[:, j], ref[fields[0]][:, j]),
+                                               ("end", end[:, j], ref[fields[1]][:, j])):
+                bad = ((volumes < self.data.vmin[j]-1.) | (volumes > self.data.vmax[j]+1.) |
+                       ~np.isclose(levels, np.interp(volumes, p[:, 1], p[:, 0]), rtol=0., atol=1e-6))
+                if bad.any():
+                    t = int(np.flatnonzero(bad)[0])
+                    raise ValueError("Daily reference level/storage mismatch: {} {} {}: "
+                                     "storage={} m3, allowed=[{}, {}] m3, level={} m".format(
+                                         id, self.data.dates[t], boundary, volumes[t],
+                                         self.data.vmin[j], self.data.vmax[j], levels[t]))
             low, high = self.data.levels(self.data.vmin)[j], self.data.levels(self.data.vmax)[j]
             for year in range(self.data.start_year, self.data.end_year+1):
                 a, b = self.data.indices(year, year)
-                nodes = self.reference_nodes[id]
                 origin = self.data.dates[a]
-                node_days = [(datetime(year, *r["month_day"]).date()-origin).days for r in nodes] + [b-a]
-                node_v = [r["storage"] for r in nodes] + [nodes[0]["storage"]]
-                if (not np.allclose(start[a:b, j], np.interp(np.arange(b-a), node_days, node_v), rtol=0., atol=1.1) or
-                        not np.allclose(end[a:b, j], np.interp(np.arange(1,b-a+1), node_days, node_v), rtol=0., atol=1.1) or
+                node_days, node_v = self._reference_path(id, year)
+                expected_start = np.interp(np.arange(b-a), node_days, node_v)
+                expected_end = np.interp(np.arange(1,b-a+1), node_days, node_v)
+                if (not np.allclose(start[a:b, j], expected_start, rtol=0., atol=1.1) or
+                        not np.allclose(end[a:b, j], expected_end, rtol=0., atol=1.1) or
                         abs(start[a, j]-self.data.initial_storage(year)[j]) > 1.):
-                    raise ValueError("Daily reference disagrees with nodes/initial storage: " + id)
+                    raise ValueError("Daily reference disagrees with nodes/initial storage: {} {}".format(id, year))
+                if (id, year) in self.reference_year_nodes:
+                    change = end[a:b, j]-start[a:b, j]
+                    subphases = np.where(change > 1., "refill", np.where(change < -1., "drawdown", "hold"))
+                    if not np.array_equal(self.reference_subphases[a:b, j], subphases):
+                        raise ValueError("Year-specific reference subphase mismatch: {} {}".format(id, year))
                 for period in OPERATION_PERIODS:
                     r = self.period_parameters[(id, period)]
                     x, y = [a+(datetime(year, *self._month_day(r[k])).date()-origin).days
                             for k in ("start_month_day", "end_month_day")]
+                    # The period table summarizes the recurring default. Dated
+                    # overrides supply that year's period endpoints instead.
+                    period_start, period_end = (expected_start[x-a], expected_end[y-a]) if (
+                        id, year) in self.reference_year_nodes else (
+                            r["reference_start_storage_m3"], r["reference_end_storage_m3"])
                     if (any(p != period for p in self.data.period_labels[x:y+1]) or
                             not np.array_equal(ref["period_day_index"][x:y+1, j], np.arange(1,y-x+2)) or
                             not np.allclose(ref["period_progress_fraction"][x:y+1, j],
                                             np.arange(1,y-x+2)/(y-x+1), rtol=0., atol=1e-6) or
-                            abs(start[x, j]-r["reference_start_storage_m3"]) > 1. or
-                            abs(end[y, j]-r["reference_end_storage_m3"]) > 1.):
+                            abs(start[x, j]-period_start) > 1. or
+                            abs(end[y, j]-period_end) > 1.):
                         raise ValueError("Daily reference disagrees with period summary: " + str((id,period)))
                     band = r["suggested_target_half_band_m"]
                     reference_ceiling = np.where(ref["reference_flood_limit_active"][x:y+1,j] > 0,
                                                  r["reservoir_flood_limit_level_m"], high)
-                    for k, expected in (("soft_target_lower_level_m", np.maximum(low, ref[fields[1]][x:y+1,j]-band)),
-                                        ("soft_target_upper_level_m", np.minimum(reference_ceiling, ref[fields[1]][x:y+1,j]+band))):
+                    for k, expected in (("soft_target_lower_level_m", np.clip(ref[fields[1]][x:y+1,j]-band, low, reference_ceiling)),
+                                        ("soft_target_upper_level_m", np.clip(ref[fields[1]][x:y+1,j]+band, low, reference_ceiling))):
                         if not np.allclose(ref[k][x:y+1,j], expected, rtol=0., atol=1e-6):
                             raise ValueError("Daily reference target band mismatch: " + id)
                     for k in fields[-4:]:

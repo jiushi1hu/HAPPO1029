@@ -51,6 +51,10 @@ class DiagnosticTests(unittest.TestCase):
                         self.assertAlmostEqual(a['expected_sampled_mapping_fraction'],
                             float((probs*grid**2).sum(-1).mean()),places=6)
                         self.assertAlmostEqual(a['mean_u'],float((probs*grid).sum(-1).mean()),places=6)
+                        ordered=np.sort(probs,axis=-1)
+                        self.assertAlmostEqual(a['mean_max_action_probability'],float(ordered[:,-1].mean()),places=6)
+                        self.assertAlmostEqual(a['mean_top_two_probability_gap'],float((ordered[:,-1]-ordered[:,-2]).mean()),places=6)
+                        self.assertTrue(0. <= a['mode_change_fraction'] <= 1.)
                         self.assertAlmostEqual(a['eval_mapping_fraction'],
                             float(np.mean((probs.argmax(-1)/199.)**2)),places=6)
                     self.assertGreater(a['parameter_delta_l2'],0.)

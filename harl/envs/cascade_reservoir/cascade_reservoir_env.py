@@ -41,7 +41,8 @@ class CascadeReservoirEnv:
             raise ValueError('seasonal_constraints must be a boolean')
         self.reward_settings = reward_settings(config)
         self.seasonal = data.load_seasonal_operation() if self.seasonal_constraints else None
-        self.operation_reward = OperationReward(data, self.seasonal, self.reward_settings)
+        self.operation_reward = OperationReward(data, self.seasonal, self.reward_settings,
+                                               timestep_seconds=self.physics.dt)
         self.terminal_storage_mode = config.get('terminal_storage_mode', 'free')
         if self.terminal_storage_mode not in ('free', 'initial'):
             raise ValueError('Terminal storage mode must be free or initial')

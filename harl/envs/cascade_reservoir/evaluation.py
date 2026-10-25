@@ -6,7 +6,8 @@ from harl.envs.cascade_reservoir.data_loader import IDS
 from harl.envs.cascade_reservoir.reservoir_physics import InfeasibleCascade
 from harl.envs.cascade_reservoir.terminal_storage import TerminalReleaseBounds
 from harl.envs.cascade_reservoir.reward import (
-    EpisodeRewardMetrics, validate_discount_factor, reward_settings, REWARD_AGGREGATION)
+    EpisodeRewardMetrics, OperationReward, validate_discount_factor, reward_settings,
+    REWARD_AGGREGATION, reward_metadata)
 
 
 def reference_metadata(physical_config):
@@ -146,7 +147,7 @@ def evaluate_policy(actors, data, physical_config, year, seed, iteration, traini
         row[name + "_end_m3"] = float(env.storage[i])
     if seasonal_metrics is not None:
         row.update(seasonal_metrics.finish())
-    row.update(reward_metrics.summary(detailed=True), reward_penalties=env.reward_settings,
+    row.update(reward_metrics.summary(detailed=True), **reward_metadata(data), reward_penalties=env.reward_settings,
                reward_aggregation=REWARD_AGGREGATION)
     if diagnostics:
         row.update(energy_by_reservoir_TWh=(energy_by_reservoir/1e6).tolist(),
@@ -192,7 +193,7 @@ def reference_summary(data, physics, years, action_bins=200, *, gamma):
                 mean_net_head_m=(head/(env.stop-env.start)).tolist(), head_model=physics.head_model,
                 head_data_status=physics.head_data_status, **reference_metadata(physics.config))
             row.update(metrics.finish())
-            row.update(reward_metrics.summary(detailed=True), reward_penalties=env.reward_settings,
+            row.update(reward_metrics.summary(detailed=True), **reward_metadata(data), reward_penalties=env.reward_settings,
                        reward_aggregation=REWARD_AGGREGATION)
             for i, name in enumerate(IDS):
                 row[name+'_start_m3'] = float(initial[i])
@@ -200,12 +201,17 @@ def reference_summary(data, physics, years, action_bins=200, *, gamma):
             rows.append(row)
             continue
         start, stop = data.indices(year, year)
-        _, energy = physics.constant_storage(data.external[start:stop], data.initial_storage(year))
+        release, energy = physics.constant_storage(data.external[start:stop], data.initial_storage(year))
         reward_metrics = EpisodeRewardMetrics(gamma)
-        for daily_energy in energy:
-            reward_metrics.update(dict(reward=float(daily_energy.sum()/physics.reference_energy)))
+        settings = reward_settings(physics.config)
+        operation_reward = OperationReward(data, None, settings, timestep_seconds=physics.dt)
+        for daily_release, daily_energy in zip(release, energy):
+            transition = dict(reward=float(daily_energy.sum()/physics.reference_energy),
+                              power=daily_energy/24., release=daily_release)
+            operation_reward.apply(transition)
+            reward_metrics.update(transition)
         rows.append(dict(year=year, energy_MWh=float(energy.sum()), energy_TWh=float(energy.sum() / 1e6),
                          head_model=physics.head_model, head_data_status=physics.head_data_status,
-                         reward_penalties=reward_settings(physics.config), reward_aggregation=REWARD_AGGREGATION,
-                         **reward_metrics.summary()))
+                         reward_penalties=settings, reward_aggregation=REWARD_AGGREGATION,
+                         **reward_metadata(data), **reward_metrics.summary(detailed=True)))
     return rows

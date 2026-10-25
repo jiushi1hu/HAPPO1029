@@ -1,9 +1,18 @@
 """Dimensionless soft-operation penalties and shared episode accounting."""
 import numpy as np
-from harl.envs.cascade_reservoir.data_loader import IDS, OPERATION_PERIODS
+from harl.envs.cascade_reservoir.data_loader import IDS
 
-PENALTY_TERMS = ('target_band', 'daily_rise', 'daily_fall')
+PENALTY_TERMS = ('guaranteed_output', 'ecological_flow')
+REWARD_DEFINITION = 'generation_minus_mean_service_shortfalls_v1'
+SHORTFALL_UNITS = dict(guaranteed_output='MW', ecological_flow='m3/s')
+INTEGRAL_FIELDS = dict(guaranteed_output='shortfall_energy_MWh', ecological_flow='deficit_volume_m3')
 REWARD_AGGREGATION = 'sum(gamma**t * daily_reward), t=0 at episode start'
+
+
+def reward_metadata(data):
+    requirements = getattr(data, 'service_requirements', None)
+    return dict(reward_definition=REWARD_DEFINITION,
+                service_requirements=None if requirements is None else requirements.metadata())
 
 
 def validate_discount_factor(value):
@@ -34,7 +43,7 @@ def reward_settings(config):
     settings = dict(enabled=enabled)
     for term in PENALTY_TERMS:
         key = term+'_weight'
-        value = raw.get(key, .1)
+        value = raw.get(key, 1.)
         if isinstance(value, (bool, np.bool_)):
             raise ValueError(key+' must be finite and nonnegative')
         try:
@@ -44,66 +53,64 @@ def reward_settings(config):
         if not np.isfinite(value) or value < 0:
             raise ValueError(key+' must be finite and nonnegative')
         settings[key] = value
-    if enabled and not config.get('seasonal_constraints', False):
-        raise ValueError('Reward penalties require seasonal_constraints=true')
     return settings
 
 
 class OperationReward:
-    """Penalize soft deviations without relaxing physical feasibility.
+    """One team reward: generation minus mean relative service shortfalls.
 
-    Each excess is measured in metres, divided by that reservoir's global
-    operating level range, averaged over five reservoirs, then weighted. The
-    weights are scenario choices, not monetary costs or calibrated estimates.
+    Each denominator is a fixed positive requirement. Zero disables that
+    reservoir's requirement; means use the fixed active set, never just the
+    violating reservoirs. Seasonality does not gate these service penalties.
     """
 
-    def __init__(self, data, seasonal, settings):
-        self.data, self.seasonal, self.settings = data, seasonal, dict(settings)
-        if seasonal is None:
-            if settings['enabled']:
-                raise ValueError('Reward penalties require seasonal operating data')
-            return
-        self.level_range = data.levels(data.vmax)-data.levels(data.vmin)
-        if not np.isfinite(self.level_range).all() or (self.level_range <= 0).any():
-            raise ValueError('Penalty normalization requires positive operating level ranges')
-        self.rate_limits = {}
-        for period in OPERATION_PERIODS:
-            self.rate_limits[period] = tuple(np.array([
-                seasonal.period_parameters[(name,period)][field] for name in IDS], dtype=float)
-                for field in ('suggested_soft_daily_rise_limit_m', 'suggested_soft_daily_fall_limit_m'))
-        lower = seasonal.reference['soft_target_lower_level_m']
-        upper = seasonal.reference['soft_target_upper_level_m']
-        if (not np.isfinite(lower).all() or not np.isfinite(upper).all() or (lower > upper).any()):
-            raise ValueError('Soft target bands must be finite and ordered')
+    def __init__(self, data, seasonal, settings, timestep_seconds=86400.):
+        self.settings = dict(settings)
+        self.requirements = getattr(data, 'service_requirements', None)
+        if self.requirements is None and settings['enabled']:
+            loader = getattr(data, 'load_service_requirements', None)
+            if loader is None:
+                raise ValueError('Reward penalties require service requirement data')
+            self.requirements = loader()
+        self.dt = float(timestep_seconds)
+        if not np.isfinite(self.dt) or self.dt <= 0.:
+            raise ValueError('Service shortfall accounting requires a positive time step')
+        if self.requirements is not None:
+            self.thresholds = dict(guaranteed_output=np.array(self.requirements.guaranteed_output_mw),
+                                   ecological_flow=np.array(self.requirements.ecological_flow_m3s))
+            if any(v.shape != (len(IDS),) or not np.isfinite(v).all() or (v < 0.).any()
+                   for v in self.thresholds.values()):
+                raise ValueError('Service requirements must be finite nonnegative five-vectors')
 
-    def apply(self, transition, index):
-        if self.seasonal is None:
+    def apply(self, transition, index=None):
+        if self.requirements is None:
             return
-        level = transition['levels_end']
-        delta = level-self.data.levels(transition['storage_start'])
-        rise, fall = self.rate_limits[self.data.period_labels[index]]
-        reference = self.seasonal.reference
-        excess = dict(target_band=np.maximum(reference['soft_target_lower_level_m'][index]-level,0.)+
-                                  np.maximum(level-reference['soft_target_upper_level_m'][index],0.),
-                      daily_rise=np.maximum(delta-rise,0.), daily_fall=np.maximum(-delta-fall,0.))
-        # Ignore interpolation roundoff below one nanometre, consistently in
-        # reward calculations and reported soft-deviation counts.
-        excess = {k: np.where(v > 1e-9,v,0.) for k,v in excess.items()}
-        normalized = {k: v/self.level_range for k,v in excess.items()}
-        # Measure exceedances even in a generation-only ablation. Applied costs
-        # remain exactly zero when disabled; observations and physics are unchanged.
-        costs = {k: self.settings[k+'_weight']*float(v.mean()) if self.settings['enabled'] else 0.
-                 for k,v in normalized.items()}
+        actual = dict(guaranteed_output=np.asarray(transition['power']),
+                      ecological_flow=np.asarray(transition['release']))
+        if any(v.shape != (len(IDS),) or not np.isfinite(v).all() or (v < 0.).any()
+               for v in actual.values()):
+            raise ValueError('Service reward requires actual finite nonnegative power and release')
+        active = {k: threshold > 0. for k, threshold in self.thresholds.items()}
+        excess, normalized, by_reservoir = {}, {}, {}
+        for k, threshold in self.thresholds.items():
+            raw = np.maximum(threshold-actual[k], 0.)
+            # Ignore only relative floating-point roundoff, in costs and counts.
+            excess[k] = np.where(raw > 1e-10*np.maximum(threshold, 1.), raw, 0.)
+            normalized[k] = np.divide(excess[k], threshold, out=np.zeros(len(IDS)), where=active[k])
+            weight = self.settings[k+'_weight'] if self.settings['enabled'] else 0.
+            by_reservoir[k] = weight*normalized[k]/max(int(active[k].sum()), 1)
+        costs = {k: float(v.sum()) for k, v in by_reservoir.items()}
         penalty = float(sum(costs.values()))
-        generation_reward = transition['reward']
+        generation_reward = transition.get('generation_reward', transition['reward'])
         reward = generation_reward-penalty
         if not np.isfinite(reward):
             raise FloatingPointError('Non-finite penalized reward')
         transition.update(generation_reward=generation_reward, reward=reward, reward_penalty=penalty,
-            reward_penalty_components=costs, soft_violations_m=excess,
-            normalized_soft_violations=normalized,
-            reward_penalty_by_reservoir=sum((self.settings[k+'_weight'] if self.settings['enabled'] else 0.)*v/len(IDS)
-                                           for k,v in normalized.items()))
+            reward_penalty_components=costs, service_shortfalls=excess,
+            normalized_service_shortfalls=normalized, service_active_masks=active,
+            service_shortfall_integrals=dict(guaranteed_output=excess['guaranteed_output']*self.dt/3600.,
+                                            ecological_flow=excess['ecological_flow']*self.dt),
+            reward_penalty_by_reservoir=sum(by_reservoir.values()))
 
 
 class EpisodeRewardMetrics:
@@ -122,9 +129,12 @@ class EpisodeRewardMetrics:
         self.components = dict.fromkeys(PENALTY_TERMS,0.)
         self.by_reservoir = np.zeros(len(IDS))
         self.violation_days = {k: np.zeros(len(IDS),dtype=int) for k in PENALTY_TERMS}
-        self.violation_sum = {k: np.zeros(len(IDS)) for k in PENALTY_TERMS}
         self.violation_max = {k: np.zeros(len(IDS)) for k in PENALTY_TERMS}
         self.violation_any_days = dict.fromkeys(PENALTY_TERMS, 0)
+        self.active_days = {k: np.zeros(len(IDS), dtype=int) for k in PENALTY_TERMS}
+        self.relative_sum = {k: np.zeros(len(IDS)) for k in PENALTY_TERMS}
+        self.relative_max = {k: np.zeros(len(IDS)) for k in PENALTY_TERMS}
+        self.integrals = {k: np.zeros(len(IDS)) for k in PENALTY_TERMS}
 
     def update(self, transition):
         generation = float(transition.get('generation_reward',transition['reward']))
@@ -135,9 +145,13 @@ class EpisodeRewardMetrics:
         self.by_reservoir += self.discount * transition.get('reward_penalty_by_reservoir',0.)
         for term in PENALTY_TERMS:
             self.components[term] += self.discount * transition.get('reward_penalty_components',{}).get(term,0.)
-            excess = transition.get('soft_violations_m',{}).get(term,np.zeros(5))
+            excess = transition.get('service_shortfalls',{}).get(term,np.zeros(len(IDS)))
+            relative = transition.get('normalized_service_shortfalls',{}).get(term,np.zeros(len(IDS)))
+            self.active_days[term] += transition.get('service_active_masks',{}).get(term,False)
+            self.relative_sum[term] += relative
+            self.relative_max[term] = np.maximum(self.relative_max[term], relative)
+            self.integrals[term] += transition.get('service_shortfall_integrals',{}).get(term,0.)
             self.violation_days[term] += excess > 0.
-            self.violation_sum[term] += excess
             self.violation_max[term] = np.maximum(self.violation_max[term], excess)
             self.violation_any_days[term] += int(np.any(excess > 0.))
         self.steps += 1
@@ -149,6 +163,26 @@ class EpisodeRewardMetrics:
         result.update({'episode_penalty_'+k:v for k,v in self.components.items()})
         if detailed:
             result.update(penalty_by_reservoir=self.by_reservoir.tolist(),
-                soft_violation_days_by_reservoir={k:v.tolist() for k,v in self.violation_days.items()},
-                soft_violation_sum_m_by_reservoir={k:v.tolist() for k,v in self.violation_sum.items()})
+                          service_shortfalls=self.shortfall_summary())
+        return result
+
+    def shortfall_summary(self):
+        """Undiscounted service reliability, severity, and physical deficits."""
+        result = {}
+        for term in PENALTY_TERMS:
+            days, active = self.violation_days[term], self.active_days[term]
+            count, eligible = int(days.sum()), int(active.sum())
+            integral = INTEGRAL_FIELDS[term]
+            result[term] = dict(reservoir_day_count=count, active_reservoir_days=eligible,
+                reservoir_day_rate=count/eligible if eligible else None,
+                compliance_rate=1.-count/eligible if eligible else None,
+                days_any_reservoir=int(self.violation_any_days[term]),
+                shortfall_unit=SHORTFALL_UNITS[term], max_shortfall=float(self.violation_max[term].max()),
+                mean_relative_shortfall=float(self.relative_sum[term].sum())/eligible if eligible else None,
+                max_relative_shortfall=float(self.relative_max[term].max()),
+                by_reservoir_days=days.tolist(), by_reservoir_active_days=active.tolist(),
+                by_reservoir_compliance_rate=[1.-int(d)/int(a) if a else None for d,a in zip(days,active)],
+                by_reservoir_max_shortfall=self.violation_max[term].tolist(),
+                **{integral:float(self.integrals[term].sum()),
+                   'by_reservoir_'+integral:self.integrals[term].tolist()})
         return result

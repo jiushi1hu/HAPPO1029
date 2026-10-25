@@ -79,7 +79,13 @@ class SeasonalInputTests(unittest.TestCase):
 
     def test_soft_reference_is_not_a_hard_daily_bound(self):
         d,s=self.data,self.seasonal
-        self.assertEqual(int((s.reference['reference_target_feasible_zero_lag']==0).sum()),31)
+        # Release-balance flags describe the supplied paths, including dated
+        # overrides. They do not certify compliance with hard seasonal bounds.
+        ref = s.reference
+        required_q = np.cumsum(d.external, axis=1)-np.cumsum(
+            (ref['target_end_of_day_storage_m3']-ref['target_start_of_day_storage_m3'])/DT, axis=1)
+        np.testing.assert_array_equal(ref['reference_target_feasible_zero_lag'],
+                                      ((required_q >= -1e-5) & (required_q <= d.release_cap+1e-5)).astype(float))
         # WDD's preferred band at the deadline extends above the hard ceiling.
         t=self.index('2023-05-31')
         self.assertEqual(s.reference['soft_target_upper_level_m'][t,0],953.)
@@ -319,6 +325,7 @@ class SeasonalExecutionTests(unittest.TestCase):
         refill=np.zeros((5,5),dtype=bool);refill[3]=True
         targets=np.tile(d.vmax,(5,1));targets[:3,0]=np.array([6.,2.,9.])*DT
         seasonal=SimpleNamespace(storage_lower=lower,storage_upper=upper,
+            reference_year_nodes={},
             flood_limit_active=flood,refill_deadline=refill,
             reference={'target_end_of_day_storage_m3':targets,
                        'target_end_of_day_level_m':targets/DT,

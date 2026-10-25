@@ -6,10 +6,16 @@
 
 数据直接读取 data/cascade_reservoir_new 下的五个原始 CSV，覆盖 1965—2024 年；默认另读取同目录的 reservoir_head_sensitivity.csv 水头敏感性假设表。
 
+两项服务约束的数据按 Xie 等（2026，DOI: 10.1016/j.jhydrol.2026.136160）Table A.1 接入 `reservoir_service_requirements.csv`：按 WDD/BHT/XLD/XJB/THR 顺序，保证出力为 `[2290.0, 4567.5, 5345.7, 2750.0, 4990.0]` MW，生态流量为 `[900, 1160, 1160, 1200, 6000]` m³/s。论文 TGR 显式映射为本仓库 THR，数值固定用于各日和各年。默认 `load_service_requirements: true` 会加载、校验并在启动信息中报告阈值、来源及 SHA-256；开启服务惩罚时也必须加载这张表。单位、语义和来源见同目录 `reservoir_service_requirements.md`。
+
 - 验证：2020、2021、2022、2023、2024；以五年的平均折扣净奖励选择模型，gamma 与训练一致，发电量单独报告。关闭软约束惩罚后仍以同一 gamma 加权的发电奖励选择模型。
 - 最终测试：1998（特丰）、1999（丰）、1970（平）、1997（枯）、2006（特枯）。类别由用户指定。
 - 训练：其余 50 年；来水标准化只使用这些训练年份。
 - 一个 episode 是一个完整自然年，等概率随机抽年，允许重复。平年 365 天、闰年 366 天；每年按该年初始库容表重置，当前各年均为统一上限库容。
+
+默认每次 HAPPO 更新先冻结 actor、critic 和 ValueNorm，顺序采集 `rollout_episodes: 6` 个独立年度轨迹，再合并有效数据更新一次。每个年度仍独立重置环境、计算 GAE 和从 `gamma**0` 开始折扣；闰日不填充、不丢弃，跨年 terminal mask 阻断 bootstrap 与回报串联。年度均匀抽样允许同一批重复年份，且只从训练划分抽取。这是批量采集，不是新增六个并行进程。
+
+`--episodes` 仍表示每个种子的年度 episode 总数；`--eval-interval` 现在明确以 **HAPPO 更新轮数** 为单位。默认 `300 / 6 = 50` 轮、每轮验证一次；不足六个年度的末批也会更新。`--rollout-episodes 1` 可恢复旧的一年一更新基线。相同采样步数下，六年一批会减少更新轮数；这是一项待比较的稳定性实验，不保证收敛。其他网络、奖励、阈值、优化器、学习率、gamma 和 GAE lambda 没有随本次批量采集改变。
 
 各库使用 categorical 离散策略，默认从 200 个动作索引 k∈{0,…,199} 中选择，归一化为 u=k/199。二次下泄映射为 Q_exec = Q_low + (Q_high - Q_low) × u²。可行下泄区间由五库水量平衡、硬约束及年末库容目标可达性共同计算；同一动作索引对应的实际流量随状态改变，并非 200 个固定流量值。HAPPO 按所选离散索引计算概率；训练时采样，验证和最终测试时选取概率最大的索引。可用 --action-bins 调整离散动作数量。
 
@@ -19,30 +25,31 @@
 
 ## 奖励与软约束成本
 
-默认奖励为 `r_t = E_t / 1624800 - C_target,t - C_rise,t - C_fall,t`。`E_t` 为五库当日总发电量（MWh）；三个成本分别对应日末水位超出软目标带、当日净水位上升超过建议值、当日净水位下降超过建议值。每项先按库计算超出量（米），除以该库全局运行水位范围，再取五库均值并乘权重；目标带内和建议速率以内的成本为零。升降速率按日末与日初水位差计算，不能代表日内瞬时变化。
+默认团队奖励为 `r_t = E_t / 1624800 - C_guaranteed_output,t - C_ecological_flow,t`。`E_t` 为五库当日总发电量（MWh）；保证出力缺额为 `max(P_G - P_actual, 0) / P_G`，生态缺流为 `max(Q_E - Q_release, 0) / Q_E`。每项在固定的有效水库集合上取均值并乘其权重；本表两项均为五库有效。零阈值显式关闭相应水库的该项要求，分母改为该项有效水库数量，全部关闭时该项为零。达标时惩罚为零；总奖励允许负值。只忽略相对阈值 `1e-10` 以下的浮点舍入缺额，计费与违规天数使用同一容差。
 
-`harl/configs/envs_cfgs/cascade_reservoir.yaml` 的 `reward_penalties` 控制开关与权重。`target_band_weight`、`daily_rise_weight`、`daily_fall_weight` 初值均为 0.10，是可调整的敏感性情景参数，尚未校准，也不是货币成本。软目标带来自日参考表，升降建议值按水库和统一时期标签读取分期参数表。CSV 的 `weight_flood_safety`、`weight_generation`、`weight_storage`、`weight_downstream_support` 仅作情景元数据；缺少相应损失函数定义，不直接套用为这三个惩罚系数。
+`harl/configs/envs_cfgs/cascade_reservoir.yaml` 的 `reward_penalties` 控制开关与权重。`guaranteed_output_weight`、`ecological_flow_weight` 默认均为 `1.0`，是预设权衡参数，不是货币成本。保证出力按实际执行的日均功率计算，生态流量按实际总下泄（过机加弃水）计算；日尺度达标不等于全天瞬时达标。旧水位目标带、日升速和日降速不再计入奖励，旧权重键会报错以防误用。分期 CSV 中的目标曲线仍供规则参考控制器使用，其余软建议和权重仅保留为数据元信息。本奖励沿用论文的相对缺额和线性扣罚形式，采用本仓库统一团队奖励；没有额外叠加论文的局部／全局发电混合项、航运或动作修正成本。
 
-硬约束继续由可行动作区间执行，包括水量平衡、库容边界、下泄能力、功率／过机能力、汛限、蓄水截止和年末闭合；不可行时直接报错，不通过付出惩罚来放宽。软目标偏差和建议速率超限可发生，并扣减实际奖励，仍与硬约束违规计数区分。即使硬约束迫使软目标或速率偏离，也如实记录并计费；枯水年不保证软成本为零。
+硬约束继续由可行动作区间执行，包括水量平衡、库容边界、下泄能力、功率／过机能力、汛限、蓄水截止和年末闭合；不可行时直接报错，不通过付出惩罚来放宽。保证出力和生态流量在本实现中为软要求，即使受硬约束或枯水影响无法满足，也如实记录缺额并扣罚，不添加出力／流量硬下限。关闭分期硬约束不会关闭这两项服务惩罚。
 
-训练 buffer、GAE 和 critic 均使用扣除成本后的日奖励。默认模型选择使用五个验证年按训练 gamma 加权的年度净奖励均值；策略与参考采用完全相同的折扣与成本口径。训练历史及评估提供净奖励、发电奖励、总成本、三项成本，评估另提供逐库成本、软超限天数与累计超出米数。各图中的 TWh 仍是实际发电量；`--plot-details` 的奖励图直接绘制折扣净奖励，不再由发电量反算。奖励或权重改变后需要重新训练。
+训练 buffer、GAE 和 critic 均使用扣除成本后的同一日奖励，五个 actor 共用该团队目标。默认模型选择使用五个验证年按训练 gamma 加权的年度净奖励均值；策略、分期规则参考和恒库容参考采用相同阈值、折扣与成本口径。逐库及全系统另报告未折扣的达标率、缺额天数、最大相对缺额、出力缺额电量（MWh）与生态缺水体积（m³）。各图中的 TWh 仍是实际发电量。本次保留 `gamma=0.99`；如研究目标为等权年度净奖励，可显式设 `--gamma 1`。服务惩罚并不保证零缺额，奖励或权重改变后需要重新训练。
 
 ## 运行
 
 ```bash
 cd /Users/hujingxin/Documents/Code_python/HARL-main
 PYTHONDONTWRITEBYTECODE=1 /opt/anaconda3/envs/harl/bin/python examples/train_cascade.py \
-  --episodes 400 \
-  --eval-interval 10 \
+  --episodes 300 \
+  --rollout-episodes 6 \
+  --eval-interval 1 \
   --seeds 1 2 3 4 5 \
   --plot-python /Library/Frameworks/Python.framework/Versions/3.9/bin/python3
 ```
 
 Custom subsets are supported with `--training-years`, `--validation-years`, and `--test-years`. For example, use `--training-years 2007 2008 2009 2010 2011 --validation-years 2012 2013 --test-years 2014 --seeds 1 2 3` with the command above, and omit `--fixed-training-year`. All three lists must be nonempty, unique, within 1965--2024, and mutually disjoint. Explicit training years leave unassigned years unused; inflow normalization is fitted only on the selected training years. Episodes sample from that list, checkpoint selection uses the mean reward over the selected validation years, and the selected actors are tested only after every seed finishes training. Custom CLI test years receive neutral labels such as `test_2014`. With no year-list overrides, the original 50/5/5 partition and wet/dry labels remain unchanged. A YAML `experiment.training_years` list has the same meaning; `null` keeps the complement-of-holdouts default. YAML test labels, when provided, must match the test-year list.
 
-使用恒定典型水头时添加 `--head-model fixed`，它只关闭变水头；分期约束仍由独立开关控制。添加 `--no-reward-penalties` 可保留分期硬约束而恢复纯发电奖励及按发电量选模，`--reward-penalties` 可显式开启。使用原全局边界和恒库容参考时添加 `--no-seasonal-constraints`，此时 actor 使用 11 维局部输入、critic 使用 18 维系统状态，并关闭软约束惩罚；此模式不能显式开启依赖分期数据的惩罚。`--seasonal-constraints` 可显式开启分期硬约束。默认模式的补充表缺失、与原始参数／配置不一致时直接报错，不自动退回旧模式。
+使用恒定典型水头时添加 `--head-model fixed`，它只关闭变水头；分期约束仍由独立开关控制。添加 `--no-reward-penalties` 可恢复纯发电奖励及按同一 gamma 加权的发电奖励选模，`--reward-penalties` 可显式开启两项服务惩罚。使用原全局边界和恒库容参考时添加 `--no-seasonal-constraints`，此时 actor 使用 11 维局部输入、critic 使用 18 维系统状态，服务惩罚仍由独立开关控制。`--seasonal-constraints` 可显式开启分期硬约束。默认模式的补充表缺失、与原始参数／配置不一致时直接报错，不自动退回旧模式。
 
-每个种子各训练 400 个年度 episode。仅运行一次 400 episodes 时使用 --seeds 1。每 10 个 episode 评估五个验证年，包含 episode=0 初始点；所有种子模型选择结束后才进行典型年最终测试。
+每个种子各训练 300 个年度 episode，对应 50 次 HAPPO 更新。仅运行一个种子时使用 `--seeds 1`。每轮更新后评估五个验证年，包含更新前的 episode=0 初始点；所有种子模型选择结束后才进行典型年最终测试。旧命令若显式写了 `--eval-interval 10`，会变成每十轮更新验证一次；本实验请改为 `--eval-interval 1`。新实验须使用新的日志文件名，已经启动的进程不会切换到新采集方式。
 
 启动时输出分期开关、观测维数、数据来源状态和参考控制器类型，并检查选定训练、验证、测试年的物理／截止约束是否可行（默认共 60 年；显式子集仅检查选中的年份）。随后逐年计算验证年的参考发电量并打印其均值；典型年参考只在全部种子模型选择结束后计算，`--skip-final-test` 同时跳过这些参考。
 
@@ -60,11 +67,21 @@ PYTHONDONTWRITEBYTECODE=1 /opt/anaconda3/envs/harl/bin/python examples/train_cas
 
 examples/train_cascade.py 为训练入口；examples/plot_cascade.py 为弹窗绘图入口。harl/envs/cascade_reservoir 负责真实数据读取、年度环境、硬约束与发电、冻结策略评估；harl/runners 组织年度采样和原有顺序 HAPPO 更新；harl/algorithms、common、models、utils 保留所需算法与公共组件。配置位于 harl/configs，回归检查位于 tests。
 
-合成数据生成入口、旧版文件读取格式、单个验证／测试年配置、模型／图片导出和可选 LP 输出入口已移除；逐回合日志支持按需导出 JSONL。真实 CSV 保持原样。统一运行时期表用于核对日历，逐库分期边界与截止日期由补充分期表给出。
+合成数据生成入口、旧版文件读取格式、单个验证／测试年配置、模型／图片导出和可选 LP 输出入口已移除；逐回合日志支持按需导出 JSONL。自然入流、物理参数及硬运行边界保持原样。统一运行时期表用于核对日历，逐库分期边界与截止日期由补充分期表给出。
 
 分期运行已接入数据读取、剩余时域可达性、物理动作执行、环境观测、评估参考和绘图。默认物理配置为 `seasonal_constraints: true`，环境读取四个补充分期 CSV，并在每一步同时执行当日日末边界和剩余时域约束。也可通过 `data.load_seasonal_operation()` 或 `load_seasonal_operation: true` 只读取数据，这两种方式不会单独启用动作约束。输入按日期和水库 ID 对齐，并检查缺失、重复、库容—水位关系、参考节点、闰年及跨表一致性；来源状态原样保留。当前关键参数仍标记为 `scenario_reference_not_official_operating_rule`，日参考为软情景目标；启用约束不代表已核实为官方运行规程。
 
 分期参考控制器每天尝试接近输入表的日末目标库容。它按上游至下游顺序，使用实际已选上游下泄计算期望流量 `Qin + (Vstart - Vtarget)/dt`，限制在环境给出的可行区间内，再反解二次映射并量化到与策略相同的归一化动作网格，最后调用同一物理转移。软目标在枯水期或动作量化后可能无法精确达到；控制器不裁剪库容、不补水、不放宽硬约束。它是可行的规则对照，不是最优年发电量或上界，HAPPO 是否超过它需要实际训练验证。关闭分期约束时保留原恒库容解析参考，不对它施加分期图例。
+
+日参考已保留 THR 的 2006、2011、2022 年和 XJB 的 2022 年编辑轨迹。
+这些年份通过可选的 `reservoir_reference_year_nodes.csv` 明确定义逐日边界节点；
+其他库／年继续使用循环参考节点。默认分期汇总表描述循环路径，覆盖年份的
+分期起止目标则取自年度节点。日参考必须与对应节点、水位—库容曲线及派生字段
+一致，否则仍然拒绝启动。软带的上下端点均限制在运行最低水位和参考汛期上限
+之间，防止编辑目标超出汛限时出现倒置区间；硬汛限与蓄水截止约束仍独立执行。
+年度覆盖文件参与数据哈希，并在启动元数据的 `reference_year_overrides` 中列出。
+格式、来源状态和本次 2 m³ 数值修正在
+[年度参考说明](data/cascade_reservoir_new/reservoir_reference_year_nodes.md) 中记录。
 
 分期评估记录对策略和参考统一报告 `violation_count`、逐库汛限超量、蓄水截止缺额、年末库容误差、软参考水位平均绝对偏差，以及各库各运行阶段的天数和发电量；软目标偏差不算违规。库容比较沿用物理模块的舍入容差，原始最大超量仍单独报告。参考逐年通过 `REFERENCE_VALIDATION`／`REFERENCE_TEST` 输出，策略记录保留于内存评估历史，诊断模式逐年输出。
 
@@ -98,7 +115,7 @@ PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tests /opt/anaconda3/envs/harl/bin/python -
 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=tests MPLCONFIGDIR=/private/tmp/happo-cascade-matplotlib /Library/Frameworks/Python.framework/Versions/3.9/bin/python3 -m unittest test_cascade_plot -v
 ```
 
-这些检查只执行少量小网络更新；不会运行完整 400 episodes，也不会打开真实窗口。保留原 HARL 来源与安装信息于 setup.py。
+这些检查只执行少量小网络更新；不会运行完整 300 episodes，也不会打开真实窗口。保留原 HARL 来源与安装信息于 setup.py。
 
 ## 诊断模式
 
@@ -128,7 +145,7 @@ bins, physical constraints, reward weights, gamma **0.99**, GAE lambda **0.95**,
 settings are unchanged. Inflow normalization continues to use the original 50-year training split.
 
 This mode evaluates the current policy **deterministically on the same training year**, before
-the first update (episode 0), at every `--eval-interval`, and after the last update even when it
+the first update (episode 0), at every `--eval-interval` HAPPO updates, and after the last update even when it
 does not fall on an interval. Evaluation uses a fresh environment, does not insert transitions
 into training buffers, and preserves the Torch RNG state. Validation years and typical-year
 tests cannot be chosen as the fixed training year. Held-out evaluations and reference simulations
@@ -139,14 +156,14 @@ Run this command from the repository root in the VS Code terminal:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 /opt/anaconda3/envs/harl/bin/python examples/train_cascade.py \
-  --fixed-training-year 2013 --episodes 60 --eval-interval 5 --seeds 1 \
+  --fixed-training-year 2013 --episodes 60 --rollout-episodes 1 --eval-interval 5 --seeds 1 \
   --gamma 0.99 --gae-lambda 0.95 --diagnostics --plot-details \
   --episode-log runs/fixed_2013_seed1_run1.jsonl \
   --plot-python /Library/Frameworks/Python.framework/Versions/3.9/bin/python3
 ```
 
-The primary figure has six **unsmoothed deterministic** curves: actual annual generation,
-Power Reward, Band penalty, Rise penalty, Fall penalty, and Total Reward. Dashed lines mark the
+The primary figure has five **unsmoothed deterministic** curves: actual annual generation,
+Power Reward, Guaranteed-output penalty, Ecological-flow penalty, and Total Reward. Dashed lines mark the
 untrained checkpoint. The sampled training curves remain separate and are labelled with the
 fixed year. `--diagnostics` still reports critic errors against realized discounted returns and
 GAE targets, along with policy update statistics; it does not run extra stochastic evaluations
@@ -154,6 +171,14 @@ on the held-out years in fixed-year mode.
 
 The JSONL file contains `record_type="training_episode"` for each sampled rollout and
 `record_type="fixed_year_evaluation"` for deterministic checkpoints, including episode 0.
+In multi-year batch mode it also contains `training_update` summaries and, in
+held-out mode, `validation_checkpoint` records with the full per-year results.
+Annual episode, HAPPO update, and cumulative training-step counters are separate.
+Update-level returns are means of the independently discounted annual returns;
+the six years are never discounted as one continuous episode. Diagnostic start
+values are likewise averaged over the six true annual starts. Learning curves
+use cumulative environment steps; across seeds, mean curves use the mean step
+position of matched annual checkpoints, without interpolating the returns.
 Checkpoint records contain generation, all reward components, penalty percentages, settings,
 and the detailed evaluation trajectory summary. With `--diagnostics`, checkpoints after an
 update also retain `last_training_update_diagnostics`, including critic MC/GAE errors from
@@ -170,19 +195,74 @@ retained; this option changes the training-year selection, not the inflow model.
 Regression coverage for this mode is in `tests/test_fixed_year_training.py` and
 `tests/test_cascade_plot.py`.
 
+## Policy optimization budget diagnostic
+
+The six-year batch baseline still uses five full-batch actor epochs. A larger
+batch does not increase the number of optimizer steps. An opt-in comparison
+allows more actor epochs with exact categorical KL early stopping:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /opt/anaconda3/envs/harl/bin/python examples/train_cascade.py \
+  --episodes 300 --rollout-episodes 6 --eval-interval 1 --seeds 1 2 3 \
+  --action-bins 50 --ppo-epochs 20 --target-kl 0.01 --diagnostics \
+  --diagnostic-episodes 0 24 60 120 180 240 300 --no-plot \
+  --episode-log runs/service_batch6_kl001_20epochs_300ep_trial1.jsonl
+```
+
+This is an experimental optimization setting, not an established convergence
+fix. The source requirements, penalty weights, gamma, GAE, critic epochs,
+physical action grid and HAPPO sequential likelihood factors are unchanged.
+`--ppo-epochs 5 --no-kl-limit` reproduces the preceding optimization budget.
+
+For each actor, KL(old || new) is measured over all controllable states in
+the collected batch, using the complete categorical distributions and original
+available-action masks. The old distribution is fixed for that actor's entire
+update. If mean KL exceeds the target after an epoch, subsequent actor epochs
+are skipped. The last step can exceed the target; this is early stopping,
+not a strict projection or a guarantee of monotonic return improvement.
+The critic completes its own configured updates. The approach of stopping
+further PPO optimization based on KL is described in
+[OpenAI's PPO documentation](https://spinningup.openai.com/en/latest/algorithms/ppo.html).
+
+Startup metadata records the requested budget and KL target. Update JSONL
+records include each actor's actual optimizer steps, completed epochs, final
+KL and early-stop indicator. Diagnostics also show maximum action probability,
+the gap between the two largest probabilities, normalized entropy, and the
+fraction of old-rollout states whose preferred action changed. Stochastic
+validation at the requested diagnostic milestones remains isolated from the
+training RNG; compare it with deterministic validation and service compliance.
+
+`examples/compare_cascade_policy_budget.py` provides a paired training-year
+check with a common seed, initial policy, annual episode budget and sampled
+evaluation seeds. It compares five unguarded epochs with twenty guarded
+epochs without tuning on test years. For a bounded smoke check:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /opt/anaconda3/envs/harl/bin/python examples/compare_cascade_policy_budget.py \
+  --year 2013 --updates 1 --rollout-episodes 1 --seeds 1 \
+  --evaluation-repeats 1 --output runs/policy_budget_smoke_trial1.jsonl
+```
+
+The default comparison uses six updates of six annual trajectories and three
+sampled evaluation repeats per arm; it is substantially more expensive. A
+single-year check establishes neither held-out improvement nor convergence.
+Full runs must assess several seeds, sampled and deterministic held-out
+returns, and physical shortfalls. Keep the test years reserved for final
+evaluation, and preserve the preceding run as the baseline.
+
 ## Reward scaling and episode logging
 
 Every sampled training episode prints an `EPISODE_METRICS` JSON record, independently of `--diagnostics` and `--plot-details`. Two new plot windows open automatically unless `--no-plot` is set:
 
-- **Reward components:** Power Reward, Band penalty, Rise penalty, Fall penalty, and Total Reward. Every component is weighted by the same configured `gamma**t`, with `t=0` on the first executed day of each episode. Penalties are positive applied costs: `Total = Power - Band - Rise - Fall`. Power Reward is a dimensionless generation return, not MW or actual annual energy. With `gamma=1`, all these sums become undiscounted.
+- **Reward components:** Power Reward, Guaranteed-output penalty, Ecological-flow penalty, and Total Reward. Every component is weighted by the same configured `gamma**t`, with `t=0` on the first executed day of each episode. Penalties are positive applied costs: `Total = Power - Guaranteed output - Ecological flow`. Power Reward is a dimensionless generation return, not MW or actual annual energy. With `gamma=1`, all these sums become undiscounted. The plots can still read separate historical three-penalty logs, but reject mixed old/new component schemas.
 - **Penalty percentages:** each cost and their sum divided by Power Reward, multiplied by 100. Thin raw curves use each episode's ratio. The 20-episode curves use `100 * sum(window cost) / sum(window Power Reward)` for each seed, followed by the seed mean and sample standard deviation. They do not average episode percentages. A zero denominator is undefined (`null` in logs, a gap in plots).
 
 Episode records include:
 
 - Actual generated MWh/TWh and generation by reservoir, with sampled year and simulated/calendar days. `annual_generation_TWh` is present only for completed episodes; failed records retain the actually executed prefix and set annual generation to `null`.
-- Discounted reward components and their exact percentages of discounted Power Reward, plus gamma, GAE lambda, reward weights, the normalization constant, and `reward_aggregation`. Physical soft-exceedance counts and metres remain unweighted.
+- Discounted reward components and their exact percentages of discounted Power Reward, plus gamma, GAE lambda, reward weights, the normalization constant, `reward_aggregation`, and `reward_definition= generation_minus_mean_service_shortfalls_v1`. Thresholds and paper provenance are included in `service_requirements`. Physical service counts and deficits remain undiscounted.
 - `hard_constraint_failed` and `hard_constraint_failure_rate` (a per-attempt indicator, 0 or 1), and `hard_constraint_failure_rate_so_far` (failed training attempts divided by attempted training episodes, separately for each seed). A physical infeasibility/assertion during a transition is logged and then re-raised: no failure penalty, relaxed constraint, or automatic continuation is introduced. A zero failure rate describes the environment-protected executed trajectories; it does not establish that the raw policies independently enforce the constraints. The current future-inflow feasibility layer is explicitly identified in the record.
-- `soft_exceedances` for Band, Rise and Fall: reservoir-day count/rate, days with any exceedance, summed excess metres and maximum excess, and corresponding per-reservoir arrays in `reservoir_ids` order. The reservoir-day denominator is `5 * simulated_days`, including leap days and excluding rejected transitions. Sum of excess metres is an accumulated deviation, not a water volume. Raw exceedances remain measured when `--no-reward-penalties` makes all applied costs zero. With seasonal constraints disabled, soft metrics are unavailable rather than a claim of zero exceedances.
+- `service_shortfalls` for `guaranteed_output` and `ecological_flow`: shortfall reservoir-day count/rate, compliance rate, days with any shortfall, mean/maximum relative shortfall, maximum physical shortfall (MW or m³/s), and per-reservoir arrays in `reservoir_ids` order. Integrated deficits are `shortfall_energy_MWh` and `deficit_volume_m3`, using the time step in hours and seconds respectively. Rates use active reservoir-days, including leap days and excluding rejected transitions; inactive requirements have null compliance rates. Cascade ecological deficit volume is a sum over outlet requirements, not unique missing basin water. Deficits are still measured with penalties disabled when the table is loaded, and do not depend on the seasonal-constraint switch.
 
 To retain logs, specify a **new** JSONL path; existing files are never overwritten. Parent directories are created, each episode is flushed immediately, and the log remains available if a later episode fails. This adds accounting only and does not change reward weights, action selection, inflow information, or HAPPO updates.
 

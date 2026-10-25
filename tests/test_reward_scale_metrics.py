@@ -39,24 +39,27 @@ class RewardScaleMetricsTests(unittest.TestCase):
             observation_metadata=lambda:dict(actor_observation_layout='local_neighbors_v1',
                                              actor_observation_size=16,critic_state_size=43))
         metrics = EpisodeRewardMetrics(1.)
-        for power,costs,excess in [(1.,(.1,.2,0.),([1,0,0,0,0],[0,3,0,0,0],[0]*5)),
-                                   (2.,(.2,0.,.1),([2,0,1,0,0],[0]*5,[0,0,0,4,0]))]:
-            components=dict(zip(('target_band','daily_rise','daily_fall'),costs))
+        for power,costs,excess in [(1.,(.1,.2),([1,0,0,0,0],[0,3,0,0,0])),
+                                   (2.,(.2,.1),([2,0,1,0,0],[0]*5))]:
+            components=dict(zip(('guaranteed_output','ecological_flow'),costs))
             metrics.update(dict(reward=power-sum(costs),generation_reward=power,
                 reward_penalty=sum(costs),reward_penalty_components=components,
-                soft_violations_m={k:np.array(v,dtype=float) for k,v in zip(components,excess)}))
+                service_shortfalls={k:np.array(v,dtype=float) for k,v in zip(components,excess)},
+                service_active_masks={k:np.ones(5,dtype=bool) for k in components},
+                service_shortfall_integrals={k:np.array(v,dtype=float)*(24. if k=='guaranteed_output' else 86400.)
+                                             for k,v in zip(components,excess)}))
         row=episode_record(env,metrics,np.full(5,60.),1,1,1.,.95,0)
         self.assertEqual(row['actual_generation_MWh'],300.)
         self.assertEqual(row['power_reward'],3.)
         self.assertAlmostEqual(row['total_reward'],2.4)
-        self.assertAlmostEqual(row['penalty_to_power_percent']['target_band'],10.)
+        self.assertAlmostEqual(row['penalty_to_power_percent']['guaranteed_output'],10.)
         self.assertAlmostEqual(row['penalty_to_power_percent']['total'],20.)
-        band=row['soft_exceedances']['target_band']
+        band=row['service_shortfalls']['guaranteed_output']
         self.assertEqual(band['reservoir_day_count'],3)
         self.assertEqual(band['reservoir_day_rate'],.3)
         self.assertEqual(band['days_any_reservoir'],2)
-        self.assertEqual(band['sum_m'],4.)
-        self.assertEqual(band['max_m'],2.)
+        self.assertEqual(band['shortfall_energy_MWh'],96.)
+        self.assertEqual(band['max_shortfall'],2.)
         self.assertEqual(band['by_reservoir_days'],[2,0,1,0,0])
         self.assertEqual(row['hard_constraint_failure_rate'],0.)
         self.assertEqual(row['actor_observation_layout'],'local_neighbors_v1')
@@ -111,7 +114,7 @@ class RewardScaleMetricsTests(unittest.TestCase):
         row=runner.episode_history[0]
         self.assertEqual(row['power_reward'],row['total_reward'])
         self.assertEqual(row['total_soft_penalty'],0.)
-        self.assertGreater(sum(v['reservoir_day_count'] for v in row['soft_exceedances'].values()),0)
+        self.assertGreater(sum(v['reservoir_day_count'] for v in row['service_shortfalls'].values()),0)
         self.assertTrue(all(v==0. for v in row['penalty_to_power_percent'].values()))
 
     def test_logging_preserves_buffers_rng_and_parameter_updates(self):

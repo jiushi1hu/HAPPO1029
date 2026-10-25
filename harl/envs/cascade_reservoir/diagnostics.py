@@ -96,6 +96,9 @@ def before_update(runner):
 @torch.no_grad()
 def after_update(runner, before):
     cb = runner.critic_buffer
+    starts = getattr(runner, 'batch_episode_starts', np.array([0],dtype=int))
+    mc_start = float(before['mc'][starts,0,0].mean())
+    prediction_start = float(before['prediction'][starts,0,0].mean())
     prediction = runner.critic.get_values(
         cb.share_obs[:-1].reshape(-1, cb.share_obs.shape[-1]))
     prediction = prediction.cpu().numpy().reshape(cb.rewards.shape)
@@ -104,8 +107,10 @@ def after_update(runner, before):
     require_finite('post-update values', prediction)
     result = dict(episode=runner.iteration, sampled_year=runner.sampled_years[-1],
         gamma=float(cb.gamma),
-        episode_reward=float(before['mc'][0,0,0]),
-        discounted_episode_reward=float(before['mc'][0,0,0]),
+        update=getattr(runner,'update_count',0), training_steps=runner.training_steps,
+        batch_episodes=len(starts), sampled_years=getattr(runner,'batch_years',[]),
+        episode_reward=mc_start,
+        discounted_episode_reward=mc_start,
         episode_energy_TWh=runner.last_rollout['episode_energy_TWh'],
         critic_update=parameter_update(runner.critic.critic, before['critic_parameters']),
         critic_mc_pre=fit_metrics(before['mc'], before['prediction']),
@@ -113,15 +118,15 @@ def after_update(runner, before):
         critic_gae_post=fit_metrics(cb.returns[:-1], prediction),
         actors=[])
     if runner.reward_settings['enabled']:
-        result.update(predicted_start_return_reward_units=float(before['prediction'][0,0,0]),
-            realized_sampled_return_reward_units=float(before['mc'][0,0,0]),
+        result.update(predicted_start_return_reward_units=prediction_start,
+            realized_sampled_return_reward_units=mc_start,
             episode_penalty=runner.last_reward_metrics['episode_penalty'],
             episode_generation_reward=runner.last_reward_metrics['episode_generation_reward'],
             episode_penalty_components={k:runner.last_reward_metrics['episode_penalty_'+k]
-                for k in ('target_band','daily_rise','daily_fall')})
+                for k in ('guaranteed_output','ecological_flow')})
     else:
-        result.update(predicted_start_return_TWh=float(before['prediction'][0,0,0]*runner.envs[0].physics.reference_energy/1e6),
-            realized_sampled_return_TWh=float(before['mc'][0,0,0]*runner.envs[0].physics.reference_energy/1e6))
+        result.update(predicted_start_return_TWh=prediction_start*runner.envs[0].physics.reference_energy/1e6,
+            realized_sampled_return_TWh=mc_start*runner.envs[0].physics.reference_energy/1e6)
     for i,(actor,buffer,old) in enumerate(zip(runner.actor, runner.actor_buffer,before['distributions'])):
         new = actor_distribution(actor,buffer)
         update = parameter_update(actor.actor, before['actor_parameters'][i])
@@ -137,12 +142,17 @@ def after_update(runner, before):
         second = (new.probs[active]*grid.square()).sum(-1, keepdim=True)
         variance = (second-mean.square()).clamp_min(0.)
         deterministic = new.mode()[active].float()/(new.probs.shape[-1]-1)
+        top_two = new.probs[active].topk(2, dim=-1).values
         require_finite('actor {} ratios'.format(i), ratio.cpu().numpy())
         require_finite('actor {} KL'.format(i), kl.cpu().numpy())
         sampled = action[active]/(new.probs.shape[-1]-1)
         result['actors'].append(dict(agent=i, active_samples=int(active.sum()),
             **update,
             entropy=float(new.entropy()[active].mean()),
+            normalized_entropy=float(new.entropy()[active].mean()/np.log(new.probs.shape[-1])),
+            mean_max_action_probability=float(top_two[:,0].mean()),
+            mean_top_two_probability_gap=float((top_two[:,0]-top_two[:,1]).mean()),
+            mode_change_fraction=float((old.mode()[active] != new.mode()[active]).float().mean()),
             sampled_action_mean=float(sampled.mean()),
             sampled_action_std=float(sampled.std(unbiased=False)),
             sampled_boundary_fraction=float(((sampled<=.01)|(sampled>=.99)).float().mean()),
@@ -161,8 +171,9 @@ def print_update_window(runner, window=10):
         values=[r[key][metric] for r in rows if r[key][metric] is not None]
         return float(np.mean(values)) if values else None
     active=[a for r in rows for a in r['actors'] if a['active_samples']]
-    summary=dict(episode=runner.iteration,window_episodes=len(rows),gamma=rows[-1]['gamma'],
-        sampled_years=[r['sampled_year'] for r in rows],
+    summary=dict(episode=runner.iteration,update=runner.update_count,training_steps=runner.training_steps,
+        window_updates=len(rows),window_episodes=sum(r.get('batch_episodes',1) for r in rows),gamma=rows[-1]['gamma'],
+        sampled_years=[year for r in rows for year in (r.get('sampled_years') or [r['sampled_year']])],
         mc_rmse_pre=avg('critic_mc_pre','rmse'),mc_rmse_post=avg('critic_mc_post','rmse'),
         mc_explained_variance_post=avg('critic_mc_post','explained_variance'),
         gae_explained_variance_post=avg('critic_gae_post','explained_variance'),

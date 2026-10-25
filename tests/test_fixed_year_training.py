@@ -73,7 +73,7 @@ class FixedYearTrainingTests(unittest.TestCase):
         self.assertEqual(a['record_type'], 'fixed_year_evaluation')
         self.assertEqual(a['evaluation']['phase'], 'training_evaluation')
         self.assertAlmostEqual(a['total_reward'], a['power_reward']-
-            sum(a[key+'_penalty'] for key in ('band', 'rise', 'fall')))
+            sum(a[key+'_penalty'] for key in ('guaranteed_output', 'ecological_flow')))
         self.assertEqual(runner.validation_history, [])
         self.assertEqual(runner.episode_attempts, 1)
         self.assertEqual(len(runner.episode_history), 1)

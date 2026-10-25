@@ -3,7 +3,7 @@ device:
   cuda: false
   torch_threads: 1
 train:
-  n_rollout_threads: 1  # One sampled year = exactly one training episode.
+  n_rollout_threads: 1  # Annual environments collected sequentially; batching is below.
   episode_length: 365  # Reallocated to 365/366 for each sampled calendar year.
   use_valuenorm: true
   use_linear_lr_decay: false
@@ -24,6 +24,7 @@ algo:
   share_param: false
   fixed_order: false
   ppo_epoch: 5
+  target_kl: null  # Opt-in trial: --ppo-epochs 20 --target-kl 0.01; baseline stays unchanged.
   critic_epoch: 5
   actor_num_mini_batch: 1  # Keep all days; same update count in leap/non-leap years.
   critic_num_mini_batch: 1
@@ -40,6 +41,7 @@ experiment:
   test_labels: [extremely_wet, wet, normal, dry, extremely_dry]
   episode_mode: random_training_year
   fixed_training_year: null  # --fixed-training-year YEAR enables an in-sample learning check.
-  episodes: 400  # Independent uniform year draws with replacement, per seed.
-  eval_interval: 10
+  episodes: 300  # Total annual episodes, including the final partial batch.
+  rollout_episodes: 6  # Freeze policy, collect six independent years, then update.
+  eval_interval: 1  # HAPPO update rounds, not annual episode count.
   seeds: [1, 2, 3, 4, 5]

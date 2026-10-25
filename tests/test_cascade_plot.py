@@ -385,6 +385,68 @@ class PlotTests(unittest.TestCase):
             show.assert_called_once_with(block=True);save.assert_not_called()
         plt.close('all')
 
+    def service_reward_payload(self):
+        payload=self.reward_scale_payload()
+        payload['reward_definition']='generation_minus_mean_service_shortfalls_v1'
+        for rows in payload['episode_histories']:
+            for row in rows:
+                row['guaranteed_output_penalty']=row.pop('band_penalty')
+                row['ecological_flow_penalty']=row.pop('rise_penalty')+row.pop('fall_penalty')
+                row['reward_definition']=payload['reward_definition']
+        return payload
+
+    def test_service_reward_curves_have_two_costs_and_preserve_percentage_windows(self):
+        figures=make_reward_scale_figures(self.service_reward_payload(),window=2)
+        components,ratios=figures
+        self.assertEqual([ax.get_title() for ax in components.axes[:4]],
+                         ['Power Reward','Guaranteed-output penalty','Ecological-flow penalty','Total Reward'])
+        self.assertFalse(components.axes[4].axison)
+        np.testing.assert_allclose(ratios.axes[2].lines[-1].get_ydata(),[15.,25.,100.*5.5/30])
+        self.assertFalse(ratios.axes[3].axison)
+        for fig in figures:fig.canvas.draw();plt.close(fig)
+
+    def test_mixed_old_and_service_reward_logs_are_rejected(self):
+        payload=self.service_reward_payload()
+        payload['episode_histories'][0][0]=self.reward_scale_payload()['episode_histories'][0][0]
+        with self.assertRaisesRegex(ValueError,'schemas'):
+            make_reward_scale_figures(payload)
+
+    def test_fixed_year_service_components_use_the_new_schema(self):
+        payload=self.fixed_year_payload()
+        payload['reward_definition']='generation_minus_mean_service_shortfalls_v1'
+        for rows in payload['fixed_year_histories']:
+            for row in rows:
+                row['guaranteed_output_penalty']=row.pop('band_penalty')
+                row['ecological_flow_penalty']=row.pop('rise_penalty')+row.pop('fall_penalty')
+        fig=make_fixed_year_figure(payload)
+        self.assertEqual(fig.axes[2].get_title(),'Guaranteed-output penalty')
+        self.assertEqual(fig.axes[3].get_title(),'Ecological-flow penalty')
+        self.assertEqual(fig.axes[4].get_title(),'Total Reward')
+        self.assertFalse(fig.axes[5].axison)
+        fig.canvas.draw();plt.close(fig)
+
+    def test_service_learning_curves_use_steps_without_interpolating_returns(self):
+        payload=self.service_reward_payload()
+        payload['learning_curve_x_axis']='training_steps'
+        for i,rows in enumerate(payload['episode_histories']):
+            for row in rows:
+                row['training_steps']=365*row['episode']+(i if row['episode']>1 else 0)
+        figures=make_reward_scale_figures(payload,window=1)
+        np.testing.assert_array_equal(figures[0].axes[0].lines[-1].get_xdata(),[365.,730.5,1095.5])
+        np.testing.assert_array_equal(figures[0].axes[0].lines[-1].get_ydata(),[15.,0.,45.])
+        self.assertIn('environment steps',figures[0].axes[0].get_xlabel())
+        for fig in figures:fig.canvas.draw();plt.close(fig)
+
+    def test_fixed_year_batch_checkpoints_use_actual_step_counts(self):
+        payload=self.fixed_year_payload()
+        payload['learning_curve_x_axis']='training_steps'
+        for rows in payload['fixed_year_histories']:
+            for row in rows:row['training_steps']=row['episode']*365
+        fig=make_fixed_year_figure(payload)
+        np.testing.assert_array_equal(fig.axes[0].lines[-1].get_xdata(),[0,1825,3650])
+        self.assertIn('environment steps',fig.axes[0].get_xlabel())
+        fig.canvas.draw();plt.close(fig)
+
 
 if __name__ == "__main__":
     unittest.main()

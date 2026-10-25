@@ -7,6 +7,23 @@ from harl.utils.models_tools import get_grad_norm
 from harl.algorithms.actors.on_policy_base import OnPolicyBase
 
 
+def validate_policy_optimization(epochs, target_kl):
+    """Validate the optimization budget independently of rollout collection."""
+    if (isinstance(epochs, (bool, np.bool_)) or
+            not isinstance(epochs, (int, np.integer)) or epochs < 1):
+        raise ValueError("ppo_epoch must be a positive integer")
+    if target_kl is not None:
+        if isinstance(target_kl, (bool, np.bool_)):
+            raise ValueError("target_kl must be finite and positive, or null")
+        try:
+            target_kl = float(target_kl)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("target_kl must be finite and positive, or null") from exc
+        if not np.isfinite(target_kl) or target_kl <= 0.:
+            raise ValueError("target_kl must be finite and positive, or null")
+    return int(epochs), target_kl
+
+
 class HAPPO(OnPolicyBase):
     def __init__(self, args, obs_space, act_space, device=torch.device("cpu")):
         """Initialize HAPPO algorithm.
@@ -16,14 +33,48 @@ class HAPPO(OnPolicyBase):
             act_space: (gym.spaces) action space.
             device: (torch.device) device to use for tensor operations.
         """
+        epochs, target_kl = validate_policy_optimization(args["ppo_epoch"], args.get("target_kl"))
+        if target_kl is not None and act_space.__class__.__name__ != "Discrete":
+            raise ValueError("Exact categorical target_kl requires a Discrete action space")
         super(HAPPO, self).__init__(args, obs_space, act_space, device)
 
         self.clip_param = args["clip_param"]
-        self.ppo_epoch = args["ppo_epoch"]
+        self.ppo_epoch, self.target_kl = epochs, target_kl
         self.actor_num_mini_batch = args["actor_num_mini_batch"]
         self.entropy_coef = args["entropy_coef"]
         self.use_max_grad_norm = args["use_max_grad_norm"]
         self.max_grad_norm = args["max_grad_norm"]
+
+    @torch.no_grad()
+    def rollout_distribution(self, actor_buffer):
+        """Evaluate all old-rollout states, keeping the original action masks."""
+        available = actor_buffer.available_actions
+        _, _, distribution = self.evaluate_actions(
+            actor_buffer.obs[:-1].reshape(-1, *actor_buffer.obs.shape[2:]),
+            actor_buffer.actions.reshape(-1, actor_buffer.actions.shape[-1]),
+            None if available is None else available[:-1].reshape(-1, available.shape[-1]),
+            return_entropy_per_sample=True,
+        )
+        return torch.distributions.Categorical(logits=distribution.logits.detach().clone())
+
+    @torch.no_grad()
+    def rollout_kl(self, actor_buffer, before):
+        """Exact KL(old || new), averaged over controllable old-rollout states.
+
+        This guard measures the full action distribution, not just the sampled
+        actions or the current minibatch. Forced decisions do not contribute.
+        It stops further epochs after crossing the threshold; it is not a
+        projection guaranteeing a strict KL bound on the last optimizer step.
+        """
+        active = torch.as_tensor(actor_buffer.active_masks[:-1].reshape(-1) > 0,
+                                 device=self.device)
+        if not active.any():
+            return 0.
+        divergence = torch.distributions.kl_divergence(before, self.rollout_distribution(actor_buffer))
+        value = divergence[active].mean().clamp_min(0.)
+        if not torch.isfinite(value):
+            raise FloatingPointError("Non-finite full-rollout actor KL")
+        return float(value)
 
     def update(self, sample):
         """Update actor network.
@@ -125,9 +176,12 @@ class HAPPO(OnPolicyBase):
         train_info["dist_entropy"] = 0
         train_info["actor_grad_norm"] = 0
         train_info["ratio"] = 0
+        budget_info = dict(optimizer_steps=0., ppo_epochs_completed=0., kl_early_stopped=0.)
+        if self.target_kl is not None:
+            budget_info['policy_kl'] = 0.
 
         if np.all(actor_buffer.active_masks[:-1] == 0.0):
-            return train_info
+            return dict(train_info, **budget_info)
 
         if state_type == "EP" and not self.args.get("normalize_shared_advantages", False):
             advantages_copy = advantages.copy()
@@ -139,6 +193,8 @@ class HAPPO(OnPolicyBase):
         # Keep this separate from advantages, so normalization cannot remove
         # the episode-start discount, and separate from HAPPO's likelihood factor.
         objective_weights = actor_buffer.discount_weights(self.args["gamma"])
+        before = self.rollout_distribution(actor_buffer) if self.target_kl is not None else None
+        num_updates = 0
         for _ in range(self.ppo_epoch):
             data_generator = actor_buffer.feed_forward_generator_actor(
                 advantages, self.actor_num_mini_batch,
@@ -146,6 +202,7 @@ class HAPPO(OnPolicyBase):
             )
 
             for sample in data_generator:
+                effective = sample[-1] * (sample[3] if self.use_policy_active_masks else 1.)
                 policy_loss, dist_entropy, actor_grad_norm, imp_weights = self.update(
                     sample
                 )
@@ -154,10 +211,17 @@ class HAPPO(OnPolicyBase):
                 train_info["dist_entropy"] += dist_entropy.item()
                 train_info["actor_grad_norm"] += actor_grad_norm
                 train_info["ratio"] += imp_weights.mean()
+                num_updates += 1
+                budget_info['optimizer_steps'] += float(np.any(effective > 0.))
 
-        num_updates = self.ppo_epoch * self.actor_num_mini_batch
+            budget_info['ppo_epochs_completed'] += 1.
+            if self.target_kl is not None:
+                budget_info['policy_kl'] = self.rollout_kl(actor_buffer, before)
+                if budget_info['policy_kl'] > self.target_kl:
+                    budget_info['kl_early_stopped'] = 1.
+                    break
 
         for k in train_info.keys():
-            train_info[k] /= num_updates
+            train_info[k] /= max(num_updates, 1)
 
-        return train_info
+        return dict(train_info, **budget_info)

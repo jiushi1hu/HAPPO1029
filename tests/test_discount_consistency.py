@@ -21,17 +21,18 @@ class DiscountConsistencyTests(unittest.TestCase):
         for gamma in (0., .5, .99, 1.):
             with self.subTest(gamma=gamma):
                 metrics = EpisodeRewardMetrics(gamma)
-                for power, costs in ((10., (1., 2., 0.)), (20., (2., 0., 3.))):
+                for power, costs in ((10., (1., 2.)), (20., (2., 3.))):
                     metrics.update(dict(reward=power-sum(costs), generation_reward=power,
                         reward_penalty=sum(costs), reward_penalty_components=dict(zip(PENALTY_TERMS, costs)),
                         reward_penalty_by_reservoir=np.full(5, sum(costs)/5),
-                        soft_violations_m={term: np.ones(5) for term in PENALTY_TERMS}))
+                        service_shortfalls={term: np.ones(5) for term in PENALTY_TERMS},
+                        service_active_masks={term: np.ones(5, dtype=bool) for term in PENALTY_TERMS}))
                 row = metrics.summary(detailed=True)
                 self.assertAlmostEqual(row['episode_generation_reward'], 10.+gamma*20.)
                 self.assertAlmostEqual(row['episode_penalty'], 3.+gamma*5.)
                 self.assertAlmostEqual(row['episode_reward'], 7.+gamma*15.)
                 self.assertAlmostEqual(sum(row['penalty_by_reservoir']), row['episode_penalty'])
-                self.assertEqual(row['soft_violation_days_by_reservoir']['daily_rise'], [2]*5)
+                self.assertEqual(row['service_shortfalls']['ecological_flow']['by_reservoir_days'], [2]*5)
                 self.assertEqual(metrics.undiscounted_generation_reward, 30.)
 
     def test_rollout_logging_and_lambda_one_gae_have_the_same_return(self):
@@ -135,8 +136,8 @@ class DiscountConsistencyTests(unittest.TestCase):
                 runner = CascadeReservoirRunner(data, physical, cfg, 4)
                 cost = .01 if enabled else 0.
                 row = dict(energy_MWh=1000000., energy_TWh=1., episode_generation_reward=.1,
-                    episode_reward=.1-cost, episode_penalty_target_band=cost,
-                    episode_penalty_daily_rise=0., episode_penalty_daily_fall=0.,
+                    episode_reward=.1-cost, episode_penalty_guaranteed_output=cost,
+                    episode_penalty_ecological_flow=0.,
                     feasible=True, violation_count=0)
                 with patch('harl.runners.cascade_reservoir_runner.evaluate_policy', return_value=row) as evaluate, \
                         redirect_stdout(io.StringIO()):

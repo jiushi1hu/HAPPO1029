@@ -5,13 +5,13 @@ import json
 from contextlib import redirect_stdout, redirect_stderr
 import unittest
 from unittest.mock import patch
+from types import SimpleNamespace
 import numpy as np
 import torch
 
 from examples.train_cascade import main
 from cascade_test_utils import load_configuration
 import test_seasonal_operation as seasonal_tests
-from harl.envs.cascade_reservoir.data_loader import IDS, OPERATION_PERIODS
 from harl.envs.cascade_reservoir.cascade_reservoir_env import CascadeReservoirEnv
 from harl.envs.cascade_reservoir.reservoir_physics import ReservoirPhysics, InfeasibleCascade
 from harl.envs.cascade_reservoir.reward import OperationReward, EpisodeRewardMetrics, reward_settings
@@ -25,40 +25,38 @@ DT = seasonal_tests.DT
 class RewardPenaltyTests(unittest.TestCase):
     def fixture(self):
         data,config,seasonal=seasonal_tests.SeasonalExecutionTests().fixture()
-        config['reward_penalties']=dict(enabled=True,target_band_weight=.1,daily_rise_weight=.1,daily_fall_weight=.1)
-        target=seasonal.reference['target_end_of_day_level_m']
-        seasonal.reference.update(soft_target_lower_level_m=np.maximum(0.,target-.2),
-                                 soft_target_upper_level_m=np.minimum(data.levels(data.vmax),target+.2))
-        seasonal.period_parameters={(name,period):dict(suggested_soft_daily_rise_limit_m=.2,
-            suggested_soft_daily_fall_limit_m=.3) for name in IDS for period in OPERATION_PERIODS}
+        config['reward_penalties']=dict(enabled=True,guaranteed_output_weight=1.,ecological_flow_weight=1.)
+        data.service_requirements=SimpleNamespace(guaranteed_output_mw=np.array([3.,2.,3.,2.,1.]),
+            ecological_flow_m3s=np.array([4.,3.,3.,2.,1.]), metadata=lambda:dict(value_status='test_fixture'))
         data.training_years=(1965,);data.validation_years=(1965,);data.test_years=();data.test_labels=()
         return data,config,seasonal
 
     def test_exact_penalty_arithmetic_normalization_and_negative_reward(self):
         data,config,seasonal=self.fixture()
-        config['reward_penalties'].update(target_band_weight=2.,daily_rise_weight=3.,daily_fall_weight=4.)
+        config['reward_penalties'].update(guaranteed_output_weight=2.,ecological_flow_weight=3.)
         reward=OperationReward(data,seasonal,reward_settings(config))
-        row=dict(storage_start=np.array([7.,.5,.8,.4,.5])*DT,
-                 levels_end=np.array([8.,.8,.2,.4,1.]),reward=.7)
+        row=dict(power=np.array([0.,2.,1.5,4.,.75]),release=np.array([0.,6.,1.5,2.,.25]),reward=.7)
         reward.apply(row,0)
-        for key,expected in dict(target_band=[1.8,0.,.6,.4,0.],
-                                 daily_rise=[.8,.1,0.,0.,.3],daily_fall=[0.,0.,.3,0.,0.]).items():
-            np.testing.assert_allclose(row['soft_violations_m'][key],expected,rtol=0,atol=1e-14)
-        self.assertAlmostEqual(row['reward_penalty_components']['target_band'],.472)
-        self.assertAlmostEqual(row['reward_penalty_components']['daily_rise'],.288)
-        self.assertAlmostEqual(row['reward_penalty_components']['daily_fall'],.24)
-        self.assertAlmostEqual(row['reward_penalty'],1.)
-        self.assertAlmostEqual(row['reward'],-.3)
+        for key,expected in dict(guaranteed_output=[1.,0.,.5,0.,.25],
+                                 ecological_flow=[1.,0.,.5,0.,.75]).items():
+            np.testing.assert_allclose(row['normalized_service_shortfalls'][key],expected,rtol=0,atol=1e-14)
+        self.assertAlmostEqual(row['reward_penalty_components']['guaranteed_output'],.7)
+        self.assertAlmostEqual(row['reward_penalty_components']['ecological_flow'],1.35)
+        self.assertAlmostEqual(row['reward_penalty'],2.05)
+        self.assertAlmostEqual(row['reward'],-1.35)
         self.assertEqual(row['generation_reward'],.7)
-        self.assertAlmostEqual(row['reward_penalty_by_reservoir'].sum(),1.)
+        self.assertAlmostEqual(row['reward_penalty_by_reservoir'].sum(),2.05)
         metrics=EpisodeRewardMetrics(1.);metrics.update(row)
         totals=metrics.summary(detailed=True)
         self.assertAlmostEqual(totals['episode_generation_reward']-totals['episode_penalty'],totals['episode_reward'])
-        self.assertEqual(totals['soft_violation_days_by_reservoir']['daily_fall'],[0,0,1,0,0])
+        self.assertEqual(totals['service_shortfalls']['ecological_flow']['by_reservoir_days'],[1,0,1,0,1])
+        self.assertEqual(totals['service_shortfalls']['guaranteed_output']['shortfall_energy_MWh'],114.)
+        self.assertEqual(totals['service_shortfalls']['ecological_flow']['deficit_volume_m3'],540000.)
 
-    def test_inside_soft_band_and_rate_limits_has_zero_penalty(self):
-        data,config,seasonal=self.fixture();target=seasonal.reference['target_end_of_day_level_m'][0]
-        row=dict(storage_start=target*DT,levels_end=target.copy(),reward=.7)
+    def test_requirements_met_or_exceeded_has_zero_penalty(self):
+        data,config,seasonal=self.fixture()
+        row=dict(power=data.service_requirements.guaranteed_output_mw.copy(),
+                 release=2*data.service_requirements.ecological_flow_m3s,reward=.7)
         OperationReward(data,seasonal,reward_settings(config)).apply(row,0)
         self.assertEqual(row['reward'],.7);self.assertEqual(row['reward_penalty'],0.)
 
@@ -66,7 +64,7 @@ class RewardPenaltyTests(unittest.TestCase):
         data,config,_=self.fixture()
         disabled=copy.deepcopy(config);disabled['reward_penalties']['enabled']=False
         zero=copy.deepcopy(config)
-        for key in ('target_band_weight','daily_rise_weight','daily_fall_weight'):zero['reward_penalties'][key]=0.
+        for key in ('guaranteed_output_weight','ecological_flow_weight'):zero['reward_penalties'][key]=0.
         a,b,c=[CascadeReservoirEnv(data,settings) for settings in (config,disabled,zero)]
         cost=0.
         for _ in range(5):
@@ -80,17 +78,34 @@ class RewardPenaltyTests(unittest.TestCase):
         self.assertGreater(cost,0.)
         np.testing.assert_allclose(a.storage,data.vmax,rtol=0,atol=1e-7)
 
-    def test_bad_settings_and_missing_seasonality_are_rejected(self):
-        _,config,_=self.fixture()
+    def test_bad_settings_rejected_and_services_do_not_require_seasonality(self):
+        data,config,_=self.fixture()
         for value in (-1.,np.nan,np.inf,True,None,'invalid',10**400):
-            bad=copy.deepcopy(config);bad['reward_penalties']['daily_rise_weight']=value
+            bad=copy.deepcopy(config);bad['reward_penalties']['ecological_flow_weight']=value
             with self.subTest(value=value),self.assertRaisesRegex(ValueError,'finite and nonnegative'):
                 reward_settings(bad)
         for raw in (None,[],True,dict(enabled='true'),dict(unknown=1)):
             bad=copy.deepcopy(config);bad['reward_penalties']=raw
             with self.subTest(raw=raw),self.assertRaises(ValueError):reward_settings(bad)
-        with self.assertRaisesRegex(ValueError,'require seasonal_constraints'):
-            reward_settings(dict(config,seasonal_constraints=False))
+        self.assertTrue(reward_settings(dict(config,seasonal_constraints=False))['enabled'])
+        del data.service_requirements
+        with self.assertRaisesRegex(ValueError,'require service requirement data'):
+            OperationReward(data,None,reward_settings(config))
+
+    def test_inactive_requirements_use_fixed_active_denominators_and_total_release(self):
+        data,config,_=self.fixture()
+        data.service_requirements.guaranteed_output_mw[:]=[0.,2.,0.,0.,0.]
+        data.service_requirements.ecological_flow_m3s[:]=[0.,4.,0.,0.,0.]
+        row=dict(power=np.array([0.,1.,0.,0.,0.]),release=np.array([0.,4.,0.,0.,0.]),
+                 turbine=np.zeros(5),reward=.2)
+        OperationReward(data,None,reward_settings(config)).apply(row)
+        self.assertEqual(row['reward_penalty_components']['guaranteed_output'],.5)
+        self.assertEqual(row['reward_penalty_components']['ecological_flow'],0.)
+        self.assertEqual(row['normalized_service_shortfalls']['guaranteed_output'][0],0.)
+        data.service_requirements.guaranteed_output_mw[:]=0.
+        data.service_requirements.ecological_flow_m3s[:]=0.
+        OperationReward(data,None,reward_settings(config)).apply(row)
+        self.assertEqual(row['reward_penalty'],0.)
 
     def test_hard_infeasibility_still_raises_without_punishing_and_continuing(self):
         data,config,_=self.fixture();data.external[:]=0.
@@ -144,6 +159,23 @@ class RewardPenaltyTests(unittest.TestCase):
         self.assertAlmostEqual(sum(summary['last_episode_penalty_components'].values()),totals['episode_penalty'])
         self.assertEqual(summary['last_episode_generation_reward'],totals['episode_generation_reward'])
 
+    def test_constant_storage_reference_uses_service_penalties_without_seasonality(self):
+        data,physical,_=self.fixture()
+        physical['seasonal_constraints']=False
+        physics=ReservoirPhysics(data,physical)
+        release,energy=physics.constant_storage(data.external,data.initial_storage(1965))
+        power=energy/24.
+        generation=energy.sum(axis=1)/physics.reference_energy
+        output=np.maximum(1.-power/data.service_requirements.guaranteed_output_mw,0.).mean(axis=1)
+        ecology=np.maximum(1.-release/data.service_requirements.ecological_flow_m3s,0.).mean(axis=1)
+        gamma=.5
+        expected=np.dot(gamma**np.arange(5),generation-output-ecology)
+        row=reference_summary(data,physics,[1965],gamma=gamma)[0]
+        self.assertAlmostEqual(row['episode_reward'],expected)
+        self.assertGreater(row['episode_penalty_guaranteed_output'],0.)
+        self.assertGreater(row['episode_penalty_ecological_flow'],0.)
+        self.assertEqual(row['service_shortfalls']['ecological_flow']['active_reservoir_days'],25)
+
     def test_stochastic_validation_reports_reward_and_preserves_random_state(self):
         data,physical,_=self.fixture();cfg,_=load_configuration()
         runner=CascadeReservoirRunner(data,physical,cfg,17)
@@ -177,7 +209,7 @@ class RewardPenaltyTests(unittest.TestCase):
         self.assertEqual(rows[0]['typical_label'],'wet')
 
     def test_cli_rejects_bad_penalties_before_loading_data(self):
-        cfg,physical=load_configuration();physical['reward_penalties']['target_band_weight']=-1.
+        cfg,physical=load_configuration();physical['reward_penalties']['guaranteed_output_weight']=-1.
         with patch('sys.argv',['train_cascade.py','--check-data-only']), \
              patch('examples.train_cascade.load_configuration',return_value=(cfg,physical)), \
              patch('examples.train_cascade.CascadeData') as load,redirect_stderr(io.StringIO()):
@@ -187,7 +219,8 @@ class RewardPenaltyTests(unittest.TestCase):
     def test_cli_effective_penalty_switches_and_startup_objective(self):
         data,physical,_=self.fixture();cfg,_=load_configuration()
         for flags,enabled,seasonal in (([],True,True),(['--no-reward-penalties'],False,True),
-                (['--reward-penalties'],True,True),(['--no-seasonal-constraints'],False,False),
+                (['--reward-penalties'],True,True),(['--no-seasonal-constraints'],True,False),
+                (['--no-seasonal-constraints','--reward-penalties'],True,False),
                 (['--no-seasonal-constraints','--no-reward-penalties'],False,False)):
             config=copy.deepcopy(physical)
             if flags==['--reward-penalties']:config['reward_penalties']['enabled']=False
@@ -202,11 +235,6 @@ class RewardPenaltyTests(unittest.TestCase):
             self.assertEqual(startup['seasonal_constraints'],seasonal)
             self.assertEqual(startup['evaluation_metric'],'gamma-weighted annual '+
                 ('penalized return' if enabled else 'generation reward'))
-        with patch('sys.argv',['train_cascade.py','--no-seasonal-constraints','--reward-penalties']), \
-             patch('examples.train_cascade.load_configuration',return_value=(cfg,physical)), \
-             patch('examples.train_cascade.CascadeData') as load,redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit) as error:main()
-        self.assertEqual(error.exception.code,2);load.assert_not_called()
 
 
 if __name__=='__main__':unittest.main()
