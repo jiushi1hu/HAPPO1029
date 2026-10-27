@@ -4,6 +4,16 @@ import numpy as np
 from harl.utils.envs_tools import get_shape_from_obs_space
 
 
+def validate_critic_minibatches(batch_size, count):
+    """Require complete, equal-sized critic minibatches before shuffling."""
+    if (isinstance(count, (bool, np.bool_)) or
+            not isinstance(count, (int, np.integer)) or count < 1):
+        raise ValueError('critic_num_mini_batch must be a positive integer')
+    if batch_size < count or batch_size % count:
+        raise ValueError('critic_num_mini_batch must divide the rollout size without dropping rows')
+    return int(count)
+
+
 class OnPolicyCriticBufferEP:
     """On-policy buffer for critic that uses Environment-Provided (EP) state."""
 
@@ -108,7 +118,9 @@ class OnPolicyCriticBufferEP:
                         gae = self.bad_masks[step + 1] * gae
                         self.returns[step] = gae + self.value_preds[step]
             else:  # do not use GAE
-                self.returns[-1] = next_value
+                # Return storage is in reward units, including its bootstrap.
+                self.returns[-1] = (next_value if value_normalizer is None else
+                                    value_normalizer.denormalize(next_value))
                 for step in reversed(range(self.rewards.shape[0])):
                     if value_normalizer is not None:  # use ValueNorm
                         self.returns[step] = (
@@ -162,7 +174,8 @@ class OnPolicyCriticBufferEP:
                         )
                         self.returns[step] = gae + self.value_preds[step]
             else:  # do not use GAE
-                self.returns[-1] = next_value
+                self.returns[-1] = (next_value if value_normalizer is None else
+                                    value_normalizer.denormalize(next_value))
                 for step in reversed(range(self.rewards.shape[0])):
                     self.returns[step] = (
                         self.returns[step + 1] * self.gamma * self.masks[step + 1]
@@ -180,9 +193,7 @@ class OnPolicyCriticBufferEP:
         # get episode_length, n_rollout_threads, mini_batch_size
         episode_length, n_rollout_threads = self.rewards.shape[0:2]
         batch_size = n_rollout_threads * episode_length
-        assert batch_size >= critic_num_mini_batch, (
-            f"The rollout size ({batch_size}) must be at least the critic minibatch count ({critic_num_mini_batch})."
-        )
+        critic_num_mini_batch = validate_critic_minibatches(batch_size, critic_num_mini_batch)
         mini_batch_size = batch_size // critic_num_mini_batch
 
         # shuffle indices

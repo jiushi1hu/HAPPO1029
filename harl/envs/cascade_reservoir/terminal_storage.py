@@ -92,18 +92,21 @@ class TerminalReleaseBounds:
             for i in range(5):
                 self.bounds[-5+i] = (0., 0.)
 
-    def _solve(self, objective):
+    def _solve(self, objective, bounds=None):
+        # Keep the full-horizon bounds independent of a particular prefix query.
+        # The same instance can then evaluate alternative current-day releases.
+        bounds = self.bounds if bounds is None else bounds
         options = {'primal_feasibility_tolerance': 1e-9,
                    'dual_feasibility_tolerance': 1e-9}
         result = linprog(objective, A_eq=self.matrix, b_eq=self.rhs,
-                         bounds=self.bounds, method='highs', options=options)
+                         bounds=bounds, method='highs', options=options)
         if not result.success and result.status == 2:
             result = linprog(objective, A_eq=self.matrix, b_eq=self.rhs,
-                bounds=self.bounds, method='highs', options={**options, 'presolve': False})
+                bounds=bounds, method='highs', options={**options, 'presolve': False})
         if not result.success and result.status == 2 and self.target is not None:
             # Recover only within the final-storage tolerance already enforced
             # by the environment. Never alter the state or discard water.
-            bounds = self.bounds.copy()
+            bounds = bounds.copy()
             for i in range(5):
                 bounds[-5+i] = (max((self.storage_lower[-1,i]-self.target[i])/self.dt, -self.tolerance[i]/self.dt),
                                min((self.storage_upper[-1,i]-self.target[i])/self.dt, self.tolerance[i]/self.dt))
@@ -123,6 +126,12 @@ class TerminalReleaseBounds:
             raise RuntimeError('Operating feasibility solver failed: ' + result.message)
 
     def interval(self, agent, releases):
+        """Return a release interval conditioned only on the supplied prefix.
+
+        Queries may arrive in any reservoir order, including repeated queries
+        for alternative prefixes. They never constrain later calls on this
+        instance or the unconditioned check_feasible().
+        """
         if isinstance(agent, bool) or not isinstance(agent, (int, np.integer)) or not 0 <= agent < 5:
             raise ValueError('Reservoir index must be an integer in [0, 4]')
         releases = np.asarray(releases, dtype=np.float64)
@@ -136,13 +145,14 @@ class TerminalReleaseBounds:
             inflow = external[agent] + (releases[agent-1] if agent else 0.)
             return [max(lower[agent], inflow+(self.storage[agent]-self.data.vmax[agent])/self.dt),
                     min(upper[agent], inflow+(self.storage[agent]-self.data.vmin[agent])/self.dt)]
+        bounds = self.bounds.copy()
         for i in range(agent):
-            self.bounds[i] = (releases[i], releases[i])
+            bounds[i] = (releases[i], releases[i])
         objective = np.zeros(2*self.n)
         objective[agent] = 1.
         limits = []
         for sign in (1., -1.):
-            result = self._solve(sign*objective)
+            result = self._solve(sign*objective, bounds=bounds)
             if not result.success:
                 if result.status == 2:
                     reason = ('Daily storage bounds are unreachable' if self.target is None else

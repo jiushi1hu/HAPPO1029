@@ -107,9 +107,11 @@ class OnPolicyActorBuffer:
         # get episode_length, n_rollout_threads, mini_batch_size
         episode_length, n_rollout_threads = self.actions.shape[0:2]
         batch_size = n_rollout_threads * episode_length
-        assert batch_size >= actor_num_mini_batch, (
-            f"The rollout size ({batch_size}) must be at least the actor minibatch count ({actor_num_mini_batch})."
-        )
+        if (isinstance(actor_num_mini_batch, (bool, np.bool_)) or
+                not isinstance(actor_num_mini_batch, (int, np.integer)) or actor_num_mini_batch < 1):
+            raise ValueError('Actor minibatch count must be a positive integer')
+        if batch_size < actor_num_mini_batch or batch_size % actor_num_mini_batch:
+            raise ValueError('Actor minibatch count must divide the positive rollout size without dropping rows')
         mini_batch_size = batch_size // actor_num_mini_batch
 
         # shuffle indices
@@ -125,7 +127,8 @@ class OnPolicyActorBuffer:
         # --> (episode_length * n_rollout_threads, *obs_shape)
         obs = self.obs[:-1].reshape(-1, *self.obs.shape[2:])
         actions = self.actions.reshape(-1, self.actions.shape[-1])
-        available_actions = self.available_actions[:-1].reshape(-1, self.available_actions.shape[-1])
+        available_actions = (None if self.available_actions is None else
+                             self.available_actions[:-1].reshape(-1, self.available_actions.shape[-1]))
         masks = self.masks[:-1].reshape(-1, 1)
         active_masks = self.active_masks[:-1].reshape(-1, 1)
         action_log_probs = self.action_log_probs.reshape(-1, self.action_log_probs.shape[-1])
@@ -145,7 +148,7 @@ class OnPolicyActorBuffer:
             # (episode_length * n_rollout_threads, *obs_shape) --> (mini_batch_size, *obs_shape)
             obs_batch = obs[indices]
             actions_batch = actions[indices]
-            available_actions_batch = available_actions[indices]
+            available_actions_batch = None if available_actions is None else available_actions[indices]
             masks_batch = masks[indices]
             active_masks_batch = active_masks[indices]
             old_action_log_probs_batch = action_log_probs[indices]

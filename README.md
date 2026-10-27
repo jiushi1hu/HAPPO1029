@@ -173,8 +173,8 @@ The primary figure has five **unsmoothed deterministic** curves: actual annual g
 Power Reward, Guaranteed-output penalty, Ecological-flow penalty, and Total Reward. Dashed lines mark the
 untrained checkpoint. The sampled training curves remain separate and are labelled with the
 fixed year. `--diagnostics` still reports critic errors against realized discounted returns and
-GAE targets, along with policy update statistics; it does not run extra stochastic evaluations
-on the held-out years in fixed-year mode.
+GAE targets, along with policy update statistics. At diagnostic milestones it also runs repeated
+sampled-policy evaluations on this same training year; held-out years remain unused.
 
 The JSONL file contains `record_type="training_episode"` for each sampled rollout and
 `record_type="fixed_year_evaluation"` for deterministic checkpoints, including episode 0.
@@ -298,3 +298,406 @@ GAE, critic targets, daily rewards, physical constraints, reward coefficients, a
 `--gae-lambda 1` 是可选对照设置。完整年度终止时，λ=1 使每步价值目标等于从该步到年末、按所选 gamma 计算的完整实际回报；gamma=1 时即为未折扣累计回报。该设置消除未来价值 bootstrap 的依赖，但采样方差可能增大。未指定时继续使用原配置 0.95。
 
 GAE λ 无论来自 YAML、命令行还是直接构造 runner，均须为 [0, 1] 内的有限数值。种子须为 [0, 4294967295] 内的整数，布尔值和浮点种子会被拒绝；种子列表仍须非空且不重复。命令行先覆盖 YAML，再校验最终生效值；非法参数在读取数据、可行性检查和参考计算前报错。
+
+## Policy improvement diagnosis (step 1)
+
+`--diagnostics` now separates three measurements without changing PPO epochs, clipping,
+learning rates, entropy, GAE, reward, physics, checkpoint selection, or training RNG:
+
+1. **Training surrogate endpoints.** Each actor's `clipped_surrogate_before`, `_after`,
+   and `_delta` evaluate the same complete rollout, stored old action likelihoods,
+   actual normalized training advantages, sequential HAPPO factor, controllability
+   masks, and per-episode `gamma**t` weights. The reduction is the full-row mean used
+   by optimization. Unclipped surrogate, weighted entropy, and entropy-regularized
+   objective endpoints are separate. Larger values mean a better sampled objective;
+   these are not actual episode returns. Different actors use different sequential
+   factors, so their endpoint values are not one common team-return estimate.
+   Existing `actorN_policy_loss` averages losses encountered during optimization;
+   it is not an endpoint measurement and need not equal either endpoint.
+2. **Sampled policy return.** Repeated fresh evaluations use checkpoint-independent
+   action seeds on the same evaluation years. Reports retain every year/repeat reward,
+   generation and penalty, together with mean, repeat SD and standard error.
+3. **Deterministic policy return.** The existing categorical-mode evaluation remains
+   the checkpoint-selection score. Reports show its difference from the sampled mean.
+
+`training_diagnostics` JSONL records contain the surrogate endpoints under
+`actors[i].surrogate`, alongside critic MC/GAE fit and policy-distribution diagnostics.
+`policy_evaluation_diagnostics` records contain `sampled_results_by_year`,
+`stochastic_repeat_se_reward`, `deterministic_minus_sampled_reward`, and
+`comparison_to_previous`. The latter pairs repeat means with the previous matching
+diagnostic checkpoint and reports sampled/deterministic return changes and paired
+sampling SD/SE. It rejects mismatched evaluation grids, gamma, training seeds or scope.
+The first checkpoint has no previous comparison. A single repeat has no estimated SE.
+These uncertainties are conditional on one trained seed and the selected years;
+they do not quantify variation across trained seeds or unseen hydrology.
+
+Both record types print to the console and are flushed to a new `--episode-log` when
+one is supplied. Without `--diagnostics`, these extra measurements are disabled.
+Repeated evaluations occur at the first evaluation checkpoint crossing each requested
+`--diagnostic-episodes` milestone and at the final checkpoint. A paired delta may span
+several updates; use adjacent update milestones when diagnosing a particular update.
+Fixed-year reports use `scope="fixed_training_year"` and remain in-sample.
+
+For a bounded one-update check with the existing 50-bin experiment grid:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /opt/anaconda3/envs/harl/bin/python examples/train_cascade.py \
+  --fixed-training-year 2013 --episodes 6 --rollout-episodes 6 --eval-interval 1 \
+  --seeds 1 --action-bins 50 --diagnostics --diagnostic-episodes 0 6 \
+  --diagnostic-stochastic-repeats 3 --no-plot \
+  --episode-log runs/step1_policy_diagnosis_2013_seed1_new.jsonl
+```
+
+This includes six sampled annual training trajectories and before/after modal plus
+three sampled evaluations. It verifies the measurement pipeline and provides local
+evidence; one update on one training year cannot establish convergence or generalization.
+Existing running processes retain their loaded code and need a new run to emit these fields.
+
+Focused checks: `PYTHONPATH=tests /opt/anaconda3/envs/harl/bin/python -B -m unittest
+test_surrogate_diagnostics test_policy_evaluation_diagnostics`. They cover independent
+surrogate arithmetic, discount resets, forced actions, exact preservation of Adam/
+gradients/RNG, paired sampling uncertainty, and end-to-end JSONL integration.
+
+## Matched KL comparison (step 2)
+
+`examples/compare_cascade_policy_budget.py --kl-only` isolates the existing KL
+early-stopping option. Both arms allow five actor epochs; the baseline has no KL
+limit and the guarded arm uses `--candidate-target-kl` (default 0.01). Specifying
+another epoch count with `--kl-only` is rejected. The older budget comparison
+continues to default to five versus twenty epochs when this flag is omitted.
+The normal training YAML remains five epochs with KL stopping disabled.
+
+The matched profile enables step-1 diagnostics and keeps the same initial seed,
+fixed training year, six annual trajectories per update, 50 action bins, critic
+budget, learning rates, clipping, entropy, gamma/lambda, service penalties, and
+physical model in both arms. It evaluates modes at each update and sampled
+policies at the initial and final checkpoints. Comparisons use the final current
+policies at the same episode budget, rather than selecting each arm's best
+checkpoint. Evaluation repeats use the same year/action-seed grid in both arms.
+Validation and test years are not used in this in-sample experiment.
+
+For a bounded three-update, three-training-seed pilot, use a new output path:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /opt/anaconda3/envs/harl/bin/python examples/compare_cascade_policy_budget.py \
+  --kl-only --year 2013 --updates 3 --rollout-episodes 6 --seeds 1 2 3 \
+  --evaluation-repeats 3 --candidate-target-kl 0.01 \
+  --output runs/step2_kl_only_2013_new.jsonl
+```
+
+The JSONL includes arm-tagged episode/update diagnostics and two aggregate
+`paired_check_result` rows per training seed. `paired_kl_comparison` reports
+guarded-minus-baseline sampled repeat differences, their conditional SD/SE,
+deterministic return differences, threshold-crossing counts, and epochs saved.
+`paired_kl_summary` describes variation of the paired estimates across training
+seeds separately from within-seed action-sampling uncertainty. Full common
+configuration, arm overrides, data/code hashes and per-arm elapsed times are
+recorded for reproducibility.
+
+A threshold crossing after the fifth epoch saves zero steps: the existing guard
+retains the crossing update and only skips subsequent epochs. Therefore
+`kl_early_stops` alone does not prove the treatment changed learning. Learning
+state fingerprints cover actor/critic weights, Adam states, ValueNorm, modes,
+Python/NumPy/Torch/year RNG states, and iteration counters. The driver requires
+matching initial fingerprints and reports final policy and learning-state
+equality. No omitted epochs plus identical final fingerprints is an observed
+nonbinding control result, not evidence that the guard improves performance.
+
+If an arm actually omits epochs, fewer minibatch permutations can change later
+training RNG consumption. Initial seeds and year schedules remain matched;
+subsequent sampled actions need not remain identical. Three updates and three
+seeds screen the setting locally; they do not establish long-run convergence or
+held-out superiority. This experiment does not add rollback or change clipping,
+learning rates, rewards, or the feasibility solver.
+
+## Candidate-step KL rollback (step 3)
+
+`--target-kl LIMIT --kl-rollback` enables an opt-in rollback-and-stop policy for
+actor optimization. YAML exposes the same switch as `algo.kl_rollback: false`.
+A positive finite KL budget is required. Omitting rollback retains the earlier
+after-epoch early stopping, including its accepted threshold-crossing step.
+`--no-kl-rollback` explicitly restores that behavior; disabling both protections
+uses `--no-kl-limit --no-kl-rollback`.
+
+For every minibatch with positive objective weight, rollback mode snapshots the
+actor state, complete Adam state and gradients before calling the optimizer.
+It then measures exact categorical KL(old || candidate) on the full original
+rollout's controllable states. The old distribution is fixed for the actor's
+entire update, including across minibatches and epochs. A candidate above the
+budget is restored to its immediate pre-step state, and the remainder of that
+actor's optimization is stopped. Earlier accepted steps remain. There is no
+automatic retry or learning-rate adjustment.
+
+Nonfinite candidate metrics, gradients, parameters, Adam tensors, or KL, and
+exceptions during candidate optimization/checking, restore the snapshot before
+the error is raised. Fully forced or zero-objective minibatches do not attempt
+optimizer steps or take transaction snapshots. Existing epoch shuffling is
+preserved, including zero-objective batches, so a nonbinding rollback setting
+preserves legacy parameters, optimizer state and RNG consumption. Rejection does
+not rewind minibatch-shuffle RNG; skipping the remaining epochs can naturally
+change later sampling streams.
+
+The check runs after each optimizer step, even with multiple minibatches.
+HAPPO's sequential factors are calculated afterward from the retained actor
+weights. An actor that rejects its first candidate contributes ratio one; a
+partially updated actor contributes only its accepted policy changes. Critic
+training still follows the actor updates normally.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /opt/anaconda3/envs/harl/bin/python -B examples/train_cascade.py \
+  --fixed-training-year 2013 --episodes 6 --rollout-episodes 6 --seeds 1 \
+  --ppo-epochs 5 --target-kl 0.01 --kl-rollback --diagnostics --no-plot \
+  --episode-log runs/kl_rollback_2013_new.jsonl
+```
+
+Startup metadata, episode/update records and comparison configuration identify
+the rollback mode. Per-actor optimization records distinguish:
+
+| Field | Meaning |
+|---|---|
+| `optimizer_steps` | Retained optimizer steps |
+| `optimizer_attempts` | Effective candidate steps actually attempted |
+| `optimizer_rejected_steps` | Attempted steps that were restored |
+| `policy_kl` | KL of the final retained actor against the fixed reference |
+| `rejected_policy_kl` | KL of the rejected candidate; zero if none |
+| `ppo_epochs_attempted` | Epochs whose minibatch loop was entered |
+| `ppo_epochs_completed` | Epochs fully processed without rejection |
+
+An epoch can contain accepted minibatches without being completed. Use optimizer
+counts to assess partial epochs. Rejected candidate losses are excluded from
+training averages. If no minibatch is retained, optimizer-path loss, entropy and
+gradient averages are zero by convention; this does not mean the policy itself
+has zero entropy. Distribution diagnostics report the actual retained policy.
+
+The comparison driver supports `--kl-only --candidate-kl-rollback` to compare
+five unguarded epochs against five epochs with rollback. This changes both
+`target_kl` and `kl_rollback`, and is labeled `comparison_type="kl_rollback"`;
+plain `--kl-only` still reproduces the step-2 early-stopping comparison. Attempts,
+rejections and accepted steps are retained separately in its output. Its legacy
+`actor_epochs_saved` field counts uncompleted epochs; for partially accepted
+multi-minibatch epochs, rely on the optimizer counters instead.
+
+This mechanism bounds the measured mean KL on the collected controllable states.
+It does not bound every state, the joint five-actor policy, or actual return, and
+does not establish monotonic improvement or a better modal controller. The
+step-2 result still applies: a 0.01 limit may remain nonbinding at five epochs.
+The normal training defaults, reward and physical model remain unchanged.
+
+## Cumulative joint command-policy KL budget (step 4)
+
+`--joint-target-kl LIMIT` adds an optional shared budget across the sequential
+actor updates. It requires `--kl-rollback` and a positive `--target-kl` for the
+existing local guard. YAML defaults to `algo.joint_target_kl: null`. Disable the
+shared budget with `--no-joint-kl-limit`; disabling every KL protection also
+requires `--no-kl-limit --no-kl-rollback`.
+
+The local and joint budgets measure different quantities. Local `policy_kl`
+averages over each actor's controllable states, which can differ by reservoir.
+Those local means cannot simply be added to obtain a joint-policy KL. The new
+budget freezes **all** actor distributions before the sequential update and
+uses **all the same rollout rows**, including forced decisions, for every actor:
+
+```
+joint_KL = mean_over_common_rows(sum_i KL(old_command_i || current_command_i))
+         = sum_i mean_over_common_rows(KL(old_command_i || current_command_i))
+```
+
+This factorization applies to independent categorical command policies at the
+recorded joint observations. The common mean is uniform, without controllability
+masks or episode discount weights. Available-action masks remain those stored
+in the rollout. Each actor's mean is clamped to zero only to suppress negative
+floating-point roundoff. The budget validates matching rollout grids and episode
+boundaries and rejects shared actor parameters. Cascade collection supplies the
+aligned observations from the same trajectories.
+
+After every effective optimizer candidate, both guards are checked. The joint
+candidate is the sum of earlier actors' retained contributions and the current
+actor's full KL against its original reference. Successive candidates **replace**
+the current actor's contribution; their KLs are not accumulated. A candidate
+crossing either limit restores actor weights, Adam state and gradients, stops
+that actor, and consumes no additional shared budget. Earlier accepted steps
+remain. Later actors can still attempt a smaller step within the remaining
+allowance. HAPPO factors use the retained weights, and critic training proceeds.
+
+The current actor may reduce its own KL in a later accepted candidate, freeing
+some allowance. Earlier actors are not revisited within the round. A new budget
+and new frozen references are created for each collected batch. Existing random
+actor order remains in effect; early actors can consume most of the budget.
+This is a cumulative cap, with no equal allocation, automatic retries or learning
+rate reduction.
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /opt/anaconda3/envs/harl/bin/python -B examples/train_cascade.py \
+  --fixed-training-year 2013 --episodes 6 --rollout-episodes 6 --seeds 1 \
+  --ppo-epochs 5 --target-kl 0.01 --kl-rollback --joint-target-kl 0.01 \
+  --diagnostics --no-plot --episode-log runs/joint_kl_2013_new.jsonl
+```
+
+The limits above illustrate the interface; they are not tuned recommendations.
+With the joint setting disabled, no extra distribution evaluations, optimizer
+transactions, or random draws are added. The existing comparison driver keeps
+the joint setting disabled explicitly so its step-2/3 experiments retain their
+original meaning.
+
+Per-actor optimization records add `joint_actor_kl` (unmasked retained actor
+contribution), `joint_kl_before`, `joint_actor_budget`, `joint_policy_kl`,
+`joint_kl_remaining`, `rejected_joint_policy_kl`, and `joint_kl_early_stopped`.
+The cumulative per-actor fields describe the instant that actor finishes, so
+read them in the recorded update order. `kl_early_stopped` indicates rejection
+by either guard; `joint_kl_early_stopped` identifies a joint-budget crossing.
+The local `policy_kl` and `rejected_policy_kl` retain their original definitions.
+
+When enabled, every update emits a `training_update` record, even for one annual
+trajectory. Its `joint_kl` object records the round's final retained KL, limit,
+remaining allowance, actor contributions, update order, and common row count.
+The same object is included in optional `training_diagnostics` reports.
+
+This bounds the empirical **mean raw command-policy** KL on collected states.
+It does not bound the largest per-state KL or the policy's behavior on unvisited
+states. The physical shield maps commands to feasible releases, so command KL
+is not a direct measurement of executed-release KL. It includes raw commands on
+forced rows even when those commands do not affect releases. This can make the
+budget conservative. It still does not establish monotonic return improvement;
+sampled and deterministic returns must be evaluated separately.
+
+## Learning-signal diagnosis and controlled experiments (step 5)
+
+`--diagnostics` now includes a `learning_signal` object in every
+`training_diagnostics` record and `last_learning_signal` in the console update
+summary. It measures the collected training trajectories only. It does not
+change targets, normalization, optimizer acceptance or checkpoint selection.
+The existing lambda `0.95`, batch size `6`, and critic/actor epoch budgets remain
+the defaults.
+
+The report freezes the old critic predictions in reward units and the targets
+before critic training. It compares:
+
+```
+raw_GAE_advantage = frozen_GAE_target - frozen_old_value
+realized_MC_advantage = realized_discounted_reward_to_go - frozen_old_value
+target_gap = frozen_GAE_target - realized_discounted_reward_to_go
+```
+
+Monte Carlo means the return realized by the collected actions. It is a noisy
+sample comparator, not the true value function or true advantage. Sign
+disagreement with this comparator does not by itself establish that GAE is
+incorrect. The report includes target-gap RMSE/bias, raw advantage distributions
+and sign disagreement, and each actor's actual normalized training-advantage
+statistics on positive-objective rows. Controllability masks and episode-start
+discount weights are respected; fully forced actors have empty objective
+statistics rather than invented zero-variance measurements. Shared versus
+actor-specific advantage normalization follows the training implementation.
+
+Existing critic-versus-MC fit is supplemented with per-trajectory fit before and
+after training, start returns/values, and trajectory lengths. Fit after training
+uses the updated ValueNorm interpretation; frozen old values retain the original
+interpretation. These are in-sample fit measurements, not held-out critic
+accuracy. `use_gae` and `target_estimator` identify whether GAE or ordinary return
+targets are active; the historical `gae_target_vs_mc` field describes the stored
+targets in either case.
+
+Batch reporting distinguishes daily rows, complete annual trajectories and
+distinct sampled years. It reports year frequencies and inverse year-frequency
+concentration (`1 / sum(frequency**2)`) as a descriptive diversity measure.
+Neither this measure nor the daily-row count is an independent-sample count.
+Daily and trajectory standard deviations describe spread; no per-day standard
+error is computed. Sampling uncertainty continues to come from repeated policy
+evaluations, with variation across training seeds reported separately.
+
+For complete, truly terminal annual episodes, `gae_lambda=1` makes the return
+targets agree with realized Monte Carlo reward-to-go up to floating-point error.
+It removes future-value bootstrap dependence from those targets. The advantage
+still subtracts the old critic baseline, and the longer-horizon targets can have
+more sampling variability. This is an experimental alternative, not an automatic
+default change. The diagnostics reject incomplete/truncated trajectories or
+inconsistent actor/critic episode boundaries.
+
+The new `examples/compare_cascade_learning_signal.py` changes one setting per
+run. For a lambda comparison:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /opt/anaconda3/envs/harl/bin/python -B examples/compare_cascade_learning_signal.py \
+  --intervention gae_lambda --candidate-gae-lambda 1 \
+  --episodes 12 --rollout-episodes 6 --training-years 2012 2013 \
+  --seeds 1 2 3 --evaluation-repeats 3 --output runs/lambda_comparison_new.jsonl
+```
+
+For a larger annual batch with the same lambda and total episode budget:
+
+```bash
+PYTHONDONTWRITEBYTECODE=1 /opt/anaconda3/envs/harl/bin/python -B examples/compare_cascade_learning_signal.py \
+  --intervention rollout_episodes --candidate-rollout-episodes 12 \
+  --episodes 12 --rollout-episodes 6 --training-years 2012 2013 \
+  --seeds 1 2 3 --evaluation-repeats 3 --output runs/batch_comparison_new.jsonl
+```
+
+Both arms start from identical learning state and use the same explicit sampled
+year schedule. They retain the same networks, discount, clipping, learning rates,
+critic epochs, rewards, physical rules and configured KL protections. Shared
+`--target-kl`, `--kl-rollback`, and `--joint-target-kl` overrides are available;
+they apply to both arms. Output includes configurations, source/data hashes,
+year schedules, actual training days, update and retained optimizer-step counts,
+all training diagnostics and endpoint policy reports. Existing output files are
+never overwritten.
+
+The lambda comparison keeps annual episode and maximum update budgets equal.
+The batch comparison keeps annual episodes equal and explicitly permits fewer
+updates and fewer maximum optimizer opportunities in the larger-batch arm.
+Actual retained steps are logged separately because KL rejection can change
+them. Partial final batches are retained. This compares two training protocols;
+it cannot isolate batch variance from the change in update frequency. A common
+year schedule does not imply identical collected actions after policies diverge.
+
+The comparison runner evaluates current policies only at initial/final endpoints
+on the explicitly selected **training** years. It does not select checkpoints or
+evaluate validation/test years. Evaluation restores actor modes and random state
+and verifies the complete learning-state fingerprint. Final sampled differences
+use matched per-year action seeds and paired repeat differences. A single repeat
+or training seed has no estimated standard error at its respective level. The
+driver labels all results as in-sample; these runs do not establish generalization
+or monotonic improvement.
+
+## Correctness corrections: pass 1
+
+This pass repairs the audited arithmetic, reporting and query-state defects.
+Training defaults remain unchanged; the default terminal annual GAE equations,
+unclipped critic/ValueNorm update sequence, rewards and physical assumptions are
+preserved. Checkpoint persistence and complete run/final-test logging are a
+separate follow-up.
+
+- Non-GAE return endpoints are denormalized before bootstrapping when ValueNorm
+  is supplied. Return arrays remain in reward units in both time-limit modes.
+- `use_clipped_value_loss: true` with `train.use_valuenorm: true` now fails early
+  with a clear error. Updating normalization and rebasing old predictions alone
+  can shift the current physical value and saturate the clipped-loss branch.
+  Full support needs an output-preserving normalization design; it is not
+  implemented here. Unclipped loss with ValueNorm remains the default, and
+  clipped loss without ValueNorm remains supported. The CLI, direct runner and
+  critic loss/update/train APIs reject the incompatible combination before
+  their data/model/normalizer/optimizer work, respectively.
+- Actor and critic generators require positive integer minibatch counts that
+  divide the rollout size. Invalid requests fail before shuffling, rather than
+  silently dropping rows. The cascade runner still adjusts valid integer
+  requests to calendar-compatible divisors, and rejects malformed types before
+  coercion. Actor batches also support `available_actions=None` for unrestricted
+  categorical actions.
+- The optimizer-path `ratio` statistic now averages only positive-objective rows
+  in retained minibatches, weighted by their row counts. `ratio_samples` reports
+  the number of contributions, including repeated uses across epochs. It is not
+  an independent sample count. If there are no retained positive-objective rows,
+  both fields are zero by convention and the ratio is undefined. This statistic
+  describes the sampled-action ratios computed during optimization; endpoint
+  distribution diagnostics remain separate. Gradients and optimizer steps are
+  unchanged by this reporting correction.
+- Distribution diagnostics retain stored action-availability masks, so their
+  probabilities, entropy, modes and KL use the same support as training.
+- Each LP release-interval query uses fresh prefix-conditioned bounds. Earlier,
+  repeated, out-of-order or failed queries cannot constrain subsequent queries
+  or the unconditioned feasibility check. The normal upstream-to-downstream
+  sequence, fast path and physical solver tolerances are preserved.
+- Validation selection now captures the selected episode's training days and
+  update count. Final tests report that selected budget in `training_steps` and
+  `selected_update`, with the full run's cost separately in `run_training_steps`.
+  The run result also exposes `best_training_steps` and `best_update`. An
+  untrained selected checkpoint correctly retains zero steps. Historical logs
+  are not rewritten.

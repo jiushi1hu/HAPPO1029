@@ -69,9 +69,12 @@ def monte_carlo_returns(rewards, masks, gamma):
 
 @torch.no_grad()
 def actor_distribution(actor, buffer):
+    """Use the same stored action support as collection and optimization."""
+    available = buffer.available_actions
     _, _, dist = actor.evaluate_actions(
         buffer.obs[:-1].reshape(-1, buffer.obs.shape[-1]),
-        buffer.actions.reshape(-1, 1))
+        buffer.actions.reshape(-1, 1),
+        None if available is None else available[:-1].reshape(-1, available.shape[-1]))
     return type(dist)(logits=dist.logits.clone())
 
 
@@ -87,7 +90,7 @@ def before_update(runner):
     if runner.value_normalizer is not None:
         prediction = runner.value_normalizer.denormalize(prediction)
     mc = monte_carlo_returns(cb.rewards, cb.masks, cb.gamma)
-    return dict(mc=mc, prediction=prediction,
+    return dict(mc=mc, prediction=prediction, gae_targets=cb.returns[:-1].copy(),
                 actor_parameters=[parameter_snapshot(a.actor) for a in runner.actor],
                 critic_parameters=parameter_snapshot(runner.critic.critic),
                 distributions=[actor_distribution(a,b) for a,b in zip(runner.actor, runner.actor_buffer)])
@@ -117,6 +120,8 @@ def after_update(runner, before):
         critic_mc_post=fit_metrics(before['mc'], prediction),
         critic_gae_post=fit_metrics(cb.returns[:-1], prediction),
         actors=[])
+    from harl.envs.cascade_reservoir.learning_signal import learning_signal_report
+    result['learning_signal'] = learning_signal_report(runner, before, prediction)
     if runner.reward_settings['enabled']:
         result.update(predicted_start_return_reward_units=prediction_start,
             realized_sampled_return_reward_units=mc_start,
@@ -198,6 +203,8 @@ def print_update_window(runner, window=10):
     summary['last_discounted_episode_reward']=rows[-1]['discounted_episode_reward']
     summary['last_episode_energy_TWh']=rows[-1]['episode_energy_TWh']
     summary['last_critic_update']=rows[-1]['critic_update']
+    if 'learning_signal' in rows[-1]:
+        summary['last_learning_signal'] = rows[-1]['learning_signal']
     summary['last_training_metrics']={k:v for k,v in training[-1].items()
                                      if k.startswith('actor') or k.startswith('critic_')}
     summary['happo_factor_min']=min(r['actor{}_factor_min'.format(i)] for r in training for i in range(5))
@@ -205,32 +212,144 @@ def print_update_window(runner, window=10):
     print('DIAG_UPDATE '+json.dumps(summary),flush=True)
 
 
-def validation_report(runner, deterministic_rows):
-    """Compare deterministic actions with sampled policy, preserving RNG state."""
-    repeats=int(runner.algo_args['experiment'].get('diagnostic_stochastic_repeats',3))
-    samples=[]
-    reward_samples=[]
-    for repeat in range(repeats):
-        values=[]; rewards=[]
-        for year in runner.data.validation_years:
-            with torch.random.fork_rng(devices=[]):
-                torch.manual_seed(1000000+runner.seed*100000+repeat*10000+year)
-                row=evaluate_policy(runner.actor,runner.data,runner.physical_config,year,
-                    runner.seed,runner.iteration,runner.training_steps,deterministic=False,
-                    gamma=runner.algo_args['algo']['gamma'])
-            values.append(row['energy_TWh'])
-            rewards.append(row['episode_reward'])
-        samples.append(float(np.mean(values)))
-        if rewards:reward_samples.append(float(np.mean(rewards)))
-    report=dict(episode=runner.iteration, gamma=runner.algo_args['algo']['gamma'],
-        deterministic_mean_TWh=float(np.mean([r['energy_TWh'] for r in deterministic_rows])),
-        stochastic_mean_TWh=float(np.mean(samples)),
-        stochastic_repeat_means_TWh=samples,
-        stochastic_repeat_sd_TWh=float(np.std(samples,ddof=1)) if repeats>1 else 0.,
-        years=deterministic_rows)
-    report.update(deterministic_mean_reward=float(np.mean([r['episode_reward'] for r in deterministic_rows])),
-        stochastic_mean_reward=float(np.mean(reward_samples)),
+def _repeat_statistics(values):
+    """Action-sampling statistics, conditional on one fixed evaluation-year set."""
+    values = np.asarray(values, dtype=np.float64)
+    if values.ndim != 1 or not len(values) or not np.isfinite(values).all():
+        raise ValueError('Policy diagnostics require finite nonempty repeat values')
+    sd = float(values.std(ddof=1)) if len(values) > 1 else None
+    return dict(mean=float(values.mean()), sd=sd,
+                se=None if sd is None else sd/np.sqrt(len(values)))
+
+
+def _policy_evaluation_report(runner, deterministic_rows, previous_report, scope):
+    """Evaluate a common action-sampling grid without changing training state.
+
+    Repeat seeds intentionally omit the checkpoint number. Differences between
+    matched checkpoints therefore use common random numbers, rather than two
+    unrelated evaluation samples. Their uncertainty does not measure variation
+    across trained seeds or generalization to unobserved hydrologic years.
+    """
+    if scope not in ('validation', 'fixed_training_year', 'training_years'):
+        raise ValueError('Policy diagnostic scope must be validation, fixed_training_year or training_years')
+    if not deterministic_rows:
+        raise ValueError('Policy diagnostics require deterministic evaluation rows')
+    if all('year' in row for row in deterministic_rows):
+        years = [int(row['year']) for row in deterministic_rows]
+    else:
+        if scope == 'training_years':
+            raise ValueError('Training-year diagnostic rows must identify their evaluation years')
+        # Compatibility with older direct diagnostic callers/test fixtures.
+        years = (list(runner.data.validation_years) if scope == 'validation' else
+                 [runner.fixed_training_year])
+        if len(years) != len(deterministic_rows) or any(year is None for year in years):
+            raise ValueError('Policy diagnostic rows must identify their evaluation years')
+    if len(set(years)) != len(years):
+        raise ValueError('Policy diagnostic years must be unique')
+    if scope == 'training_years' and not set(years).issubset(runner.data.training_years):
+        raise ValueError('Training-year diagnostics cannot evaluate validation or test years')
+    repeats = runner.algo_args['experiment'].get('diagnostic_stochastic_repeats', 3)
+    if isinstance(repeats, bool) or not isinstance(repeats, (int, np.integer)) or repeats < 1:
+        raise ValueError('Policy diagnostics require a positive integer repeat count')
+    repeats = int(repeats)
+    gamma = float(runner.algo_args['algo']['gamma'])
+    reward_samples, energy_samples, seeds = [], [], []
+    by_year = [dict(year=year, repeats=[]) for year in years]
+    modes = [(actor.actor, actor.actor.training) for actor in runner.actor]
+    try:
+        for repeat in range(repeats):
+            reward_values, energy_values, repeat_seeds = [], [], []
+            for j, year in enumerate(years):
+                evaluation_seed = 1000000+runner.seed*100000+repeat*10000+year
+                with torch.random.fork_rng(devices=[]):
+                    torch.manual_seed(evaluation_seed)
+                    row = evaluate_policy(runner.actor, runner.data, runner.physical_config,
+                        year, runner.seed, runner.iteration, runner.training_steps,
+                        deterministic=False, gamma=gamma)
+                reward, energy = float(row['episode_reward']), float(row['energy_TWh'])
+                require_finite('sampled policy reward/energy', np.array([reward, energy]))
+                penalty = row.get('episode_penalty')
+                if penalty is not None:
+                    penalty = float(penalty)
+                    require_finite('sampled policy penalty', np.asarray(penalty))
+                by_year[j]['repeats'].append(dict(repeat=repeat,
+                    evaluation_seed=int(evaluation_seed), episode_reward=reward,
+                    energy_TWh=energy, episode_penalty=penalty))
+                reward_values.append(reward); energy_values.append(energy)
+                repeat_seeds.append(int(evaluation_seed))
+            reward_samples.append(float(np.mean(reward_values)))
+            energy_samples.append(float(np.mean(energy_values)))
+            seeds.append(repeat_seeds)
+    finally:
+        for module, training in modes:
+            module.train(training)
+    for row, deterministic in zip(by_year, deterministic_rows):
+        row['reward_statistics'] = _repeat_statistics([r['episode_reward'] for r in row['repeats']])
+        row['energy_TWh_statistics'] = _repeat_statistics([r['energy_TWh'] for r in row['repeats']])
+        row['deterministic_reward'] = float(deterministic['episode_reward'])
+        row['deterministic_energy_TWh'] = float(deterministic['energy_TWh'])
+        row['deterministic_minus_sampled_reward'] = (
+            row['deterministic_reward']-row['reward_statistics']['mean'])
+    reward_stats, energy_stats = _repeat_statistics(reward_samples), _repeat_statistics(energy_samples)
+    deterministic_reward = float(np.mean([r['episode_reward'] for r in deterministic_rows]))
+    deterministic_energy = float(np.mean([r['energy_TWh'] for r in deterministic_rows]))
+    require_finite('deterministic policy reward/energy', np.array([deterministic_reward, deterministic_energy]))
+    report = dict(record_type='policy_evaluation_diagnostics', seed=int(runner.seed),
+        episode=runner.iteration, update=getattr(runner, 'update_count', 0),
+        training_steps=runner.training_steps, gamma=gamma, scope=scope,
+        evaluation_years=years, sampled_repeats=repeats, evaluation_seeds=seeds,
+        evaluation_seed_rule='1000000 + training_seed*100000 + repeat*10000 + year; repeat starts at zero',
+        uncertainty_scope='action sampling conditional on these evaluation years and this trained seed; '
+                          'not uncertainty across training seeds or unseen years',
+        evaluation_scope=('in-sample fixed training year; no generalization claim' if scope == 'fixed_training_year'
+                          else 'in-sample training years; no generalization claim' if scope == 'training_years'
+                          else 'held-out validation years'),
+        deterministic_mean_TWh=deterministic_energy, stochastic_mean_TWh=energy_stats['mean'],
+        stochastic_repeat_means_TWh=energy_samples,
+        stochastic_repeat_sd_TWh=energy_stats['sd'] if energy_stats['sd'] is not None else 0.,
+        stochastic_repeat_se_TWh=energy_stats['se'], years=deterministic_rows,
+        deterministic_mean_reward=deterministic_reward, stochastic_mean_reward=reward_stats['mean'],
         stochastic_repeat_means_reward=reward_samples,
-        stochastic_repeat_sd_reward=float(np.std(reward_samples,ddof=1)) if repeats>1 else 0.)
-    print('DIAG_VALIDATION '+json.dumps(report),flush=True)
+        stochastic_repeat_sd_reward=reward_stats['sd'] if reward_stats['sd'] is not None else 0.,
+        stochastic_repeat_se_reward=reward_stats['se'], sampled_results_by_year=by_year,
+        deterministic_minus_sampled_reward=deterministic_reward-reward_stats['mean'],
+        deterministic_minus_sampled_TWh=deterministic_energy-energy_stats['mean'])
+    comparison = dict(available=False, reason='no_previous_report')
+    if previous_report is not None:
+        matched = all(previous_report.get(key) == report[key] for key in (
+            'seed', 'gamma', 'scope', 'evaluation_years', 'sampled_repeats', 'evaluation_seeds'))
+        if not matched:
+            comparison = dict(available=False, reason='previous_evaluation_grid_or_scope_does_not_match')
+        else:
+            reward_delta = np.asarray(reward_samples)-previous_report['stochastic_repeat_means_reward']
+            energy_delta = np.asarray(energy_samples)-previous_report['stochastic_repeat_means_TWh']
+            reward_delta_stats = _repeat_statistics(reward_delta)
+            energy_delta_stats = _repeat_statistics(energy_delta)
+            comparison = dict(available=True, previous_episode=previous_report['episode'],
+                previous_update=previous_report.get('update'),
+                deterministic_reward_delta=deterministic_reward-previous_report['deterministic_mean_reward'],
+                deterministic_energy_TWh_delta=deterministic_energy-previous_report['deterministic_mean_TWh'],
+                stochastic_repeat_reward_deltas=reward_delta.tolist(),
+                stochastic_reward_delta_mean=reward_delta_stats['mean'],
+                stochastic_reward_delta_sd=reward_delta_stats['sd'],
+                stochastic_reward_delta_se=reward_delta_stats['se'],
+                stochastic_repeat_energy_TWh_deltas=energy_delta.tolist(),
+                stochastic_energy_TWh_delta_mean=energy_delta_stats['mean'],
+                stochastic_energy_TWh_delta_sd=energy_delta_stats['sd'],
+                stochastic_energy_TWh_delta_se=energy_delta_stats['se'])
+    report['comparison_to_previous'] = comparison
+    return report
+
+
+def policy_evaluation_report(runner, deterministic_rows, previous_report=None, scope='validation'):
+    """Print sampled/modal policy evidence on an unchanged evaluation grid."""
+    report = _policy_evaluation_report(runner, deterministic_rows, previous_report, scope)
+    print('DIAG_POLICY '+json.dumps(report, allow_nan=False), flush=True)
+    return report
+
+
+def validation_report(runner, deterministic_rows, previous_report=None):
+    """Keep the legacy validation report while adding paired policy diagnostics."""
+    report = _policy_evaluation_report(runner, deterministic_rows, previous_report, 'validation')
+    print('DIAG_VALIDATION '+json.dumps(report, allow_nan=False), flush=True)
     return report

@@ -11,6 +11,14 @@ from harl.utils.envs_tools import check
 from harl.models.value_function_models.v_net import VNet
 
 
+def validate_value_normalization(use_clipped_value_loss, use_valuenorm):
+    """Reject clipping across moving value scales until it is implemented safely."""
+    if use_clipped_value_loss and use_valuenorm:
+        raise ValueError(
+            'Clipped value loss with ValueNorm is unsupported: use unclipped value loss '
+            'or disable ValueNorm; clipping requires a consistent value scale')
+
+
 class VCritic:
     """V Critic.
     Critic that learns a V-function.
@@ -63,6 +71,9 @@ class VCritic:
         """
         return self.critic(cent_obs)
 
+    def _validate_value_normalizer(self, value_normalizer):
+        validate_value_normalization(self.use_clipped_value_loss, value_normalizer is not None)
+
     def cal_value_loss(
         self, values, value_preds_batch, return_batch, value_normalizer=None
     ):
@@ -75,6 +86,7 @@ class VCritic:
         Returns:
             value_loss: (torch.Tensor) value function loss.
         """
+        self._validate_value_normalizer(value_normalizer)
         value_pred_clipped = value_preds_batch + (values - value_preds_batch).clamp(
             -self.clip_param, self.clip_param
         )
@@ -113,6 +125,7 @@ class VCritic:
             value_loss: (torch.Tensor) value function loss.
             critic_grad_norm: (torch.Tensor) gradient norm from critic update.
         """
+        self._validate_value_normalizer(value_normalizer)
         (
             share_obs_batch,
             value_preds_batch,
@@ -152,7 +165,7 @@ class VCritic:
         Returns:
             train_info: (dict) contains information regarding training update (e.g. loss, grad norms, etc).
         """
-
+        self._validate_value_normalizer(value_normalizer)
         train_info = {}
 
         train_info["value_loss"] = 0

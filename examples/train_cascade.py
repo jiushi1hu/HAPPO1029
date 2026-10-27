@@ -13,7 +13,9 @@ sys.path.insert(0, str(ROOT))
 
 import numpy as np
 import yaml
-from harl.algorithms.actors.happo import validate_policy_optimization
+from harl.algorithms.actors.happo import (
+    validate_policy_optimization, validate_kl_rollback, validate_joint_target_kl)
+from harl.algorithms.critics.v_critic import validate_value_normalization
 from harl.envs.cascade_reservoir.data_loader import CascadeData, HEAD_MODELS, IDS, resolve_year_split
 from harl.envs.cascade_reservoir.cascade_reservoir_env import (
     ACTOR_OBSERVATION_LAYOUT, actor_observation_features)
@@ -63,8 +65,19 @@ def main():
     parser.add_argument('--action-bins', type=int, help='Number of discrete choices per reservoir (default: 200)')
     parser.add_argument('--ppo-epochs', type=int, help='Maximum policy optimization epochs per collected batch')
     kl = parser.add_mutually_exclusive_group()
-    kl.add_argument('--target-kl', type=float, help='Stop further actor epochs after mean exact rollout KL exceeds this value')
+    kl.add_argument('--target-kl', type=float, help='Mean exact rollout KL budget; crossing steps are retained unless --kl-rollback is enabled')
     kl.add_argument('--no-kl-limit', action='store_true', help='Disable actor KL early stopping for baseline comparisons')
+    rollback = parser.add_mutually_exclusive_group()
+    rollback.add_argument('--kl-rollback', dest='kl_rollback', action='store_true',
+                          help='Reject a crossing optimizer step, restore actor/Adam state and stop this actor; requires --target-kl')
+    rollback.add_argument('--no-kl-rollback', dest='kl_rollback', action='store_false',
+                          help='Retain the legacy after-epoch KL early-stopping behavior')
+    parser.set_defaults(kl_rollback=None)
+    joint_kl = parser.add_mutually_exclusive_group()
+    joint_kl.add_argument('--joint-target-kl', type=float,
+                          help='Mean common-rollout joint command KL budget across all actors; requires --target-kl and --kl-rollback')
+    joint_kl.add_argument('--no-joint-kl-limit', action='store_true',
+                          help='Disable the cumulative joint command KL budget')
     parser.add_argument("--seeds", nargs="+", type=int)
     parser.add_argument("--gamma", type=float,
                         help="Shared discount factor for training, evaluation and rewards in [0, 1]; overrides YAML")
@@ -90,9 +103,12 @@ def main():
     parser.add_argument('--plot-details', action='store_true', help='Also open reward, training generation, and optimization windows')
     parser.add_argument('--episode-log', type=Path,
                         help='Write episode metrics and fixed-year checkpoints as JSONL to a new file (never overwrite)')
-    parser.add_argument("--diagnostics", action="store_true", help="Print training and validation diagnostics without saving files")
-    parser.add_argument("--diagnostic-episodes", nargs="+", type=int, default=[0,20,100,150,400])
-    parser.add_argument("--diagnostic-stochastic-repeats", type=int, default=3)
+    parser.add_argument("--diagnostics", action="store_true",
+                        help="Measure critic/advantage/year-diversity diagnostics, fixed-batch surrogates and sampled/modal returns; include reports in an optional episode log")
+    parser.add_argument("--diagnostic-episodes", nargs="+", type=int, default=[0,20,100,150,400],
+                        help="Annual episode milestones for repeated policy evaluation; final checkpoint is always included")
+    parser.add_argument("--diagnostic-stochastic-repeats", type=int, default=3,
+                        help="Sampled evaluations per year at diagnostic milestones (also in fixed-year mode)")
     parser.add_argument("--skip-final-test", action="store_true", help="Skip typical-year tests during diagnostic tuning")
     args = parser.parse_args()
     if args.episode_log is not None and args.episode_log.exists():
@@ -104,9 +120,20 @@ def main():
         config['algo']['target_kl'] = args.target_kl
     elif args.no_kl_limit:
         config['algo']['target_kl'] = None
+    if args.kl_rollback is not None:
+        config['algo']['kl_rollback'] = args.kl_rollback
+    if args.joint_target_kl is not None:
+        config['algo']['joint_target_kl'] = args.joint_target_kl
+    elif args.no_joint_kl_limit:
+        config['algo']['joint_target_kl'] = None
     try:
+        validate_value_normalization(config['algo']['use_clipped_value_loss'], config['train']['use_valuenorm'])
         config['algo']['ppo_epoch'], config['algo']['target_kl'] = validate_policy_optimization(
             config['algo']['ppo_epoch'], config['algo'].get('target_kl'))
+        config['algo']['kl_rollback'] = validate_kl_rollback(
+            config['algo'].get('kl_rollback', False), config['algo']['target_kl'])
+        config['algo']['joint_target_kl'] = validate_joint_target_kl(
+            config['algo'].get('joint_target_kl'), config['algo']['kl_rollback'])
         config["algo"]["gamma"] = validate_discount_factor(
             config["algo"]["gamma"] if args.gamma is None else args.gamma)
         config["algo"]["gae_lambda"] = validate_gae_lambda(
@@ -196,6 +223,12 @@ def main():
         eval_interval_updates=exp['eval_interval'],
         ppo_epochs_max=config['algo']['ppo_epoch'],
         actor_target_kl=config['algo']['target_kl'],
+        actor_kl_rollback=config['algo']['kl_rollback'],
+        joint_target_kl=config['algo']['joint_target_kl'],
+        joint_kl_definition='sum of actor mean exact KL(old || new) on all common old-rollout rows; raw commands, no controllability masks or discounting',
+        actor_kl_stopping=('disabled' if config['algo']['target_kl'] is None else
+                          'reject step, restore actor/Adam/gradients, stop actor' if
+                          config['algo']['kl_rollback'] else 'retain crossing step, stop later epochs'),
         actor_kl_definition='mean exact KL(old || new) over controllable old-rollout states',
         collection_mode='sequential_independent_annual_episodes_under_frozen_policy',
         reference_energy_MWh=physics.reference_energy,
@@ -231,6 +264,10 @@ def main():
         result_storage="memory and console; optional episode JSONL",
         episode_log=None if args.episode_log is None else str(args.episode_log.resolve()),
         reward_curve_units='gamma-weighted episode sums; penalties are positive costs',
+        diagnostics=args.diagnostics,
+        diagnostic_eval_episodes=args.diagnostic_episodes,
+        diagnostic_stochastic_repeats=args.diagnostic_stochastic_repeats,
+        surrogate_diagnostic_definition='fixed rollout, normalized training advantages, sequential factor, gamma**t and controllability; larger is better',
         penalty_ratio_definition='100 * episode applied penalty / episode Power Reward; null if Power Reward is zero',
         hard_failure_rate_definition='failed episode attempts / attempted episodes, per seed; failures still raise',
         **comparison), indent=2), flush=True)
@@ -287,6 +324,8 @@ def main():
         payload = dict(gamma=config["algo"]["gamma"], gae_lambda=config["algo"]["gae_lambda"],
                        rollout_episodes_per_update=exp['rollout_episodes'],
                        ppo_epochs_max=config['algo']['ppo_epoch'], actor_target_kl=config['algo']['target_kl'],
+                       actor_kl_rollback=config['algo']['kl_rollback'],
+                       joint_target_kl=config['algo']['joint_target_kl'],
                        learning_curve_x_axis='training_steps',
                        reward_definition=REWARD_DEFINITION,
                        reward_aggregation=REWARD_AGGREGATION,
