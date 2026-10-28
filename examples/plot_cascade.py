@@ -268,7 +268,7 @@ def make_fixed_year_figure(payload):
 
 
 def make_training_figures(payload, window=20):
-    """Extra windows from existing in-memory training metrics; no model changes."""
+    """Training curves and optimizer diagnostics from recorded rollout metrics."""
     import matplotlib.pyplot as plt
     window_unit = 'update' if payload.get('rollout_episodes_per_update',1)>1 else 'episode'
     histories = payload['training_histories']
@@ -299,7 +299,7 @@ def make_training_figures(payload, window=20):
         return (cumulative[:,stop]-cumulative[:,start])/(stop-start)
 
     def draw(ax, series, label, show_raw=False):
-        if show_raw:
+        if show_raw and window > 1:
             ax.plot(grid,series.mean(axis=0),color='#087f8c',alpha=.2,lw=.7,
                     label='Raw '+window_unit+' mean across seeds')
         rolled = smooth(series)
@@ -310,7 +310,7 @@ def make_training_figures(payload, window=20):
         if len(histories)>1:
             sd = rolled.std(axis=0,ddof=1)
             ax.fill_between(grid,mean-sd,mean+sd,color='#087f8c',alpha=.15,
-                            label='Smoothed seed +/-1 SD')
+                            label='Smoothed seed +/-1 SD' if window > 1 else 'Seed +/-1 SD')
         ax.set_xlabel(learning_xlabel(payload,'HAPPO updates (fixed year {})'.format(payload['fixed_training_year'])
                       if payload.get('fixed_training_year') is not None else
                       'HAPPO updates'))
@@ -327,17 +327,19 @@ def make_training_figures(payload, window=20):
         returns = energy*1e6/reference
     reward_fig, ax = plt.subplots(figsize=(10,6),constrained_layout=True)
     reward_fig.canvas.manager.set_window_title('HAPPO training reward')
-    draw(ax,returns,'{}-{} trailing mean'.format(window,window_unit),show_raw=True)
+    curve_label = ('{}-{} trailing mean'.format(window,window_unit) if window > 1 else
+                   'Recorded '+window_unit+' mean')
+    draw(ax,returns,curve_label,show_raw=True)
     objective = 'penalized return' if payload.get('reward_penalties',{}).get('enabled',False) else 'return'
     year_label = ('fixed training year {}'.format(payload['fixed_training_year'])
                   if payload.get('fixed_training_year') is not None else 'sampled training years')
-    ax.set(title='Stochastic training '+objective+' | '+year_label,
+    ax.set(title='Stochastic training '+objective+' | '+year_label+' (in-sample)',
            ylabel=reward_units(payload))
 
     energy_fig, ax = plt.subplots(figsize=(10,6),constrained_layout=True)
     energy_fig.canvas.manager.set_window_title('HAPPO training generation')
-    draw(ax,energy,'{}-{} trailing mean'.format(window,window_unit),show_raw=True)
-    ax.set(title='Stochastic training generation | '+year_label,
+    draw(ax,energy,curve_label,show_raw=True)
+    ax.set(title='Stochastic training generation | '+year_label+' (in-sample)',
            ylabel='Annual cascade generation (TWh)')
 
     optimization_fig, axes = plt.subplots(2,2,figsize=(12,8),constrained_layout=True)
@@ -354,7 +356,8 @@ def make_training_figures(payload, window=20):
         ax.set(title=title,xlabel=learning_xlabel(payload,'HAPPO updates'),ylabel=ylabel)
         ax.grid(alpha=.2)
         ax.legend(fontsize=8)
-    optimization_fig.suptitle('{}-{} trailing means, averaged across seeds'.format(window,window_unit))
+    optimization_fig.suptitle(('{}-{} trailing means, averaged across seeds'.format(window,window_unit)
+                              if window > 1 else 'Recorded '+window_unit+' metrics, averaged across seeds'))
     return [reward_fig,energy_fig,optimization_fig]
 
 
@@ -462,8 +465,12 @@ def main():
         print("Interactive plotting backend available: " + backend, flush=True)
         return
     payload = json.load(sys.stdin)
+    training_only = (payload.get('fixed_training_year') is None and
+                     not payload.get('validation_years'))
     if payload.get('fixed_training_year') is not None:
         make_fixed_year_figure(payload)
+    elif training_only:
+        make_training_figures(payload, window=1)
     else:
         make_figure(payload)
         if (payload.get('reward_penalties',{}).get('enabled',False) or
@@ -471,7 +478,7 @@ def main():
             make_validation_reward_figure(payload)
     if 'episode_histories' in payload:
         make_reward_scale_figures(payload)
-    if args.plot_details:
+    if args.plot_details and not training_only:
         make_training_figures(payload)
     import matplotlib.pyplot as plt
     plt.show(block=True)

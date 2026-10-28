@@ -10,8 +10,10 @@ train:
 model:
   # Actor inputs: 16 local/neighbor features (11 without seasonal rules).
   # The centralized critic separately receives 43/18 system-state values.
-  hidden_sizes: [128, 128]
-  activation_func: tanh
+  # Flattened encoder [64, 128, 256] + one 256-unit hidden head.
+  # Actors and the critic build separate MLPs with this same layout.
+  hidden_sizes: [64, 128, 256, 256]
+  activation_func: relu
   use_feature_normalization: false
   initialization_method: orthogonal_
   gain: 0.01
@@ -47,8 +49,9 @@ algo:
   normalize_shared_advantages: true
   mask_inactive_factors: true
 experiment:
-  training_years: null  # Default: all years outside holdouts; --training-years selects an explicit subset.
-  validation_years: [2020, 2021, 2022, 2023, 2024]
+  collection_mode: five_year_parallel  # CLI default; --collection-mode annual restores the earlier pipeline.
+  training_years: null  # Default: all 55 years outside test holdouts; explicit validation years are also excluded.
+  validation_years: []  # No validation/checkpoint selection by default; test the final trained policy.
   test_years: [1998, 1999, 1970, 1997, 2006]
   test_labels: [extremely_wet, wet, normal, dry, extremely_dry]
   episode_mode: random_training_year

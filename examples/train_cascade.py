@@ -48,16 +48,24 @@ def reported_references(data, physics, years, action_bins, phase, gamma):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--data-dir", type=Path, default=ROOT / "data/cascade_reservoir_new")
-    parser.add_argument("--episodes", type=int, help='Total annual episodes per seed')
+    parser.add_argument("--episodes", type=int, help='Total completed training episodes per seed')
+    parser.add_argument('--collection-mode', choices=('annual', 'five_year_parallel'),
+                        help='Default from YAML: five_year_parallel; annual preserves the earlier pipeline')
+    parser.add_argument('--parallel-envs', type=int, help='Parallel worker environments (default: 6)')
+    parser.add_argument('--episode-days', type=int, help='Fixed parallel episode horizon (default: 1825)')
     parser.add_argument('--rollout-episodes', type=int,
                         help='Annual trajectories per HAPPO update (default: 6; 1 restores the baseline)')
-    parser.add_argument("--eval-interval", type=int, help='Evaluate every N HAPPO updates (default: 1)')
+    parser.add_argument("--eval-interval", type=int,
+                        help='Report every N updates; evaluate only configured validation/fixed-year diagnostics')
     parser.add_argument('--training-years', nargs='+', type=int, metavar='YEAR',
                         help='Explicit training years; unassigned years are unused')
-    parser.add_argument('--validation-years', nargs='+', type=int, metavar='YEAR',
-                        help='Held-out years whose mean reward selects the checkpoint')
+    validation = parser.add_mutually_exclusive_group()
+    validation.add_argument('--validation-years', nargs='+', type=int, metavar='YEAR',
+                            help='Opt-in held-out years whose mean reward selects the checkpoint')
+    validation.add_argument('--no-validation', action='store_true',
+                            help='Train without validation and test the final policy (default)')
     parser.add_argument('--test-years', nargs='+', type=int, metavar='YEAR',
-                        help='Held-out years evaluated only after validation selection')
+                        help='Held-out years evaluated only after training finishes')
     parser.add_argument('--fixed-training-year', type=int, metavar='YEAR',
                         help='Train on one training-split year and evaluate it deterministically; '
                              'skip held-out validation, final tests and reference runs')
@@ -114,6 +122,22 @@ def main():
     if args.episode_log is not None and args.episode_log.exists():
         parser.error('episode-log must name a new file; existing paths are not overwritten')
     config, physical = load_configuration()
+    mode = args.collection_mode or config['experiment'].get('collection_mode', 'annual')
+    if args.fixed_training_year is not None and args.collection_mode is None:
+        mode = 'annual'
+    config['experiment']['collection_mode'] = mode
+    if mode == 'five_year_parallel':
+        with (ROOT/'harl/configs/algos_cfgs/happo_cascade_parallel.yaml').open() as stream:
+            overrides = yaml.safe_load(stream)
+        for section, settings in overrides.items():
+            config[section].update(settings)
+        if args.parallel_envs is not None:
+            config['train']['n_rollout_threads'] = args.parallel_envs
+            config['experiment']['rollout_episodes'] = args.parallel_envs
+        if args.episode_days is not None:
+            config['train']['episode_length'] = args.episode_days
+    elif args.parallel_envs is not None or args.episode_days is not None:
+        parser.error('--parallel-envs and --episode-days require five_year_parallel collection')
     if args.ppo_epochs is not None:
         config['algo']['ppo_epoch'] = args.ppo_epochs
     if args.target_kl is not None:
@@ -174,6 +198,8 @@ def main():
     for key in ('training_years', 'validation_years', 'test_years'):
         if getattr(args, key) is not None:
             exp[key] = getattr(args, key)
+    if args.no_validation:
+        exp['validation_years'] = []
     if args.test_years is not None:
         # A custom test year must not inherit an unrelated wet/dry label.
         exp.pop('test_labels', None)
@@ -201,6 +227,10 @@ def main():
     except ValueError as exc:
         parser.error(str(exc))
     exp['fixed_training_year'] = fixed_year
+    if mode == 'five_year_parallel':
+        from examples.train_cascade_parallel import run_parallel_experiment
+        run_parallel_experiment(data, physical, config, args)
+        return
     exp['episode_mode'] = 'fixed_training_year' if fixed_year is not None else 'random_training_year'
     physics = ReservoirPhysics(data, physical)
     seasonal_enabled = physical.get('seasonal_constraints', False)
@@ -213,8 +243,14 @@ def main():
         episode_mode=exp['episode_mode'], fixed_training_year=fixed_year,
         active_training_years=[fixed_year] if fixed_year is not None else list(data.training_years),
         checkpoint_evaluation=('deterministic evaluation on the fixed training year (in-sample)' if
-                               fixed_year is not None else 'held-out validation on {} years'.format(len(data.validation_years))),
-        held_out_evaluation_enabled=fixed_year is None,
+                               fixed_year is not None else
+                               'held-out validation on {} years'.format(len(data.validation_years)) if
+                               data.validation_years else 'disabled; test the final training policy'),
+        policy_selection=('fixed_training_year' if fixed_year is not None else
+                          'validation' if data.validation_years else 'final_training_update'),
+        validation_enabled=bool(data.validation_years) and fixed_year is None,
+        held_out_evaluation_enabled=(fixed_year is None and
+            bool(data.validation_years or (data.test_years and not args.skip_final_test))),
         validation_years=list(data.validation_years),
         test_years=dict(zip(data.test_labels, data.test_years)),
         episodes_per_seed=exp["episodes"], episode_days="365/366", release_mapping="quadratic",
@@ -291,21 +327,24 @@ def main():
             args.episode_log.parent.mkdir(parents=True, exist_ok=True)
             episode_log = stack.enter_context(args.episode_log.open('x', encoding='utf-8'))
         references = []
-        if fixed_year is None:
+        if fixed_year is None and data.validation_years:
             references = reported_references(data, physics, data.validation_years,
                                              config['model']['action_bins'], 'validation', config['algo']['gamma'])
             print('Validation reference mean = {:.3f} TWh/year ({})'.format(
                 np.mean([r['energy_TWh'] for r in references]), comparison['reference_label']), flush=True)
-        else:
+        elif fixed_year is not None:
             print('Fixed-year learning check: training and deterministic evaluation use {}. '
                   'Held-out validation, final tests and reference runs are skipped.'.format(fixed_year), flush=True)
+        else:
+            print('Validation disabled: training curves use collected trajectories; '
+                  'final tests use the policy after the last update.', flush=True)
         runners = []
         for seed in exp["seeds"]:
             runner = CascadeReservoirRunner(data, physical, config, seed,
                 **({'episode_log': episode_log} if episode_log is not None else {}))
             runner.run(exp["episodes"], exp["eval_interval"])
             runners.append(runner)
-        # Test years are used only after all validation-based selections finish.
+        # Test years are used only after every seed has finished training.
         skip_tests = args.skip_final_test or fixed_year is not None
         tests = [] if skip_tests else [row for runner in runners for row in runner.final_test()]
         for year, label in ([] if skip_tests else zip(data.test_years, data.test_labels)):
@@ -330,6 +369,8 @@ def main():
                        reward_definition=REWARD_DEFINITION,
                        reward_aggregation=REWARD_AGGREGATION,
                        fixed_training_year=fixed_year,
+                       policy_selection=('fixed_training_year' if fixed_year is not None else
+                                         'validation' if data.validation_years else 'final_training_update'),
                        fixed_year_histories=([r.fixed_year_history for r in runners] if fixed_year is not None else []),
                        validation_years=list(data.validation_years), test_years=list(data.test_years),
                        test_labels=list(data.test_labels), seeds=exp["seeds"],
@@ -340,7 +381,7 @@ def main():
                        head_data_status=physics.head_data_status,
                        terminal_storage_mode=physical.get('terminal_storage_mode', 'free'),
                        reward_penalties=penalty_settings, **comparison)
-        if args.plot_details:
+        if args.plot_details or (fixed_year is None and not data.validation_years and not args.no_plot):
             payload.update(training_histories=[r.training_history for r in runners],
                            reference_energy_MWh=physics.reference_energy)
         if not args.no_plot:

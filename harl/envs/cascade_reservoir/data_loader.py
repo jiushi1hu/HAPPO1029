@@ -22,7 +22,7 @@ OPERATION_PERIODS = ("drawdown", "flood_season", "impoundment", "dry_season")
 FLOW_COLUMNS = ("WDD_external_inflow_m3s",) + tuple(
     name + "_interval_inflow_m3s" for name in IDS[1:]
 )
-DEFAULT_VALIDATION_YEARS = (2020, 2021, 2022, 2023, 2024)
+DEFAULT_VALIDATION_YEARS = ()
 DEFAULT_TEST_YEARS = (1998, 1999, 1970, 1997, 2006)
 DEFAULT_TEST_LABELS = ("extremely_wet", "wet", "normal", "dry", "extremely_dry")
 
@@ -30,15 +30,17 @@ DEFAULT_TEST_LABELS = ("extremely_wet", "wet", "normal", "dry", "extremely_dry")
 def resolve_year_split(experiment):
     """Validate disjoint year lists before reading data or fitting a scaler.
 
-    Omitted training years retain the historical complement-of-holdouts default.
+    Validation is optional and disabled by default. Omitted training years use
+    every year outside the explicitly configured validation and test holdouts.
     Explicit training years leave every other unassigned year unused.
     """
     available = set(range(1965, 2025))
 
-    def years(key, default):
+    def years(key, default, allow_empty=False):
         values = experiment.get(key, default)
-        if not isinstance(values, (list, tuple)) or not values:
-            raise ValueError(key + ' must be a nonempty list of integer years')
+        if not isinstance(values, (list, tuple)) or (not values and not allow_empty):
+            qualifier = '' if allow_empty else 'nonempty '
+            raise ValueError(key + ' must be a ' + qualifier + 'list of integer years')
         if any(isinstance(y, (bool, np.bool_)) or not isinstance(y, (int, np.integer)) for y in values):
             raise ValueError(key + ' must contain integer years')
         values = tuple(int(y) for y in values)
@@ -48,7 +50,7 @@ def resolve_year_split(experiment):
             raise ValueError(key + ' must lie within 1965--2024')
         return values
 
-    validation = years('validation_years', DEFAULT_VALIDATION_YEARS)
+    validation = years('validation_years', DEFAULT_VALIDATION_YEARS, allow_empty=True)
     tests = years('test_years', DEFAULT_TEST_YEARS)
     if set(validation) & set(tests):
         raise ValueError('Validation and test years must be disjoint')

@@ -99,10 +99,17 @@ class SeasonalMetrics:
 
 @torch.no_grad()
 def evaluate_policy(actors, data, physical_config, year, seed, iteration, training_steps,
-                    deterministic=True, diagnostics=False, *, gamma):
+                    deterministic=True, diagnostics=False, *, gamma,
+                    source_years=None, episode_days=None):
     gamma = validate_discount_factor(gamma)
     bins = actors[0].args.get('action_bins', 200)
-    env = CascadeReservoirEnv(data, physical_config, start_year=year, end_year=year, action_bins=bins)
+    if source_years is None and episode_days is None:
+        env = CascadeReservoirEnv(data, physical_config, start_year=year, end_year=year, action_bins=bins)
+    else:
+        from harl.envs.cascade_reservoir.episodes import episode_environment
+        if source_years is None or episode_days is None:
+            raise ValueError('Multi-year evaluation requires source_years and episode_days together')
+        env = episode_environment(data, physical_config, source_years, episode_days, bins)
     initial = env.storage.copy()
     seasonal_metrics = SeasonalMetrics(env) if env.seasonal is not None else None
     reward_metrics = EpisodeRewardMetrics(gamma)
@@ -149,6 +156,12 @@ def evaluate_policy(actors, data, physical_config, year, seed, iteration, traini
         row.update(seasonal_metrics.finish())
     row.update(reward_metrics.summary(detailed=True), **reward_metadata(data), reward_penalties=env.reward_settings,
                reward_aggregation=REWARD_AGGREGATION)
+    if source_years is not None:
+        row.update(source_years=list(dict.fromkeys(d.year for d in env.data.dates[env.start:env.stop])),
+                   episode_horizon_days=env.stop-env.start,
+                   start_date=env.data.dates[env.start].isoformat(),
+                   end_date=env.data.dates[env.stop-1].isoformat(),
+                   source_sequence='ordered source years; storage carries across every boundary; leap days retained')
     if diagnostics:
         row.update(energy_by_reservoir_TWh=(energy_by_reservoir/1e6).tolist(),
             spill_by_reservoir_billion_m3=(spill_by_reservoir/1e9).tolist(),

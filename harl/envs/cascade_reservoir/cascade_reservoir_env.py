@@ -33,7 +33,8 @@ class CascadeReservoirEnv:
         return dict(actor_observation_layout=self.observation_layout,
                     actor_observation_size=self.observation_size, critic_state_size=self.state_size)
 
-    def __init__(self, data, config, end_year=None, start_year=None, action_bins=200):
+    def __init__(self, data, config, end_year=None, start_year=None, action_bins=200,
+                 episode_days=None):
         self.data = data
         self.physics = ReservoirPhysics(data, config)
         self.seasonal_constraints = config.get('seasonal_constraints', False)
@@ -48,14 +49,19 @@ class CascadeReservoirEnv:
             raise ValueError('Terminal storage mode must be free or initial')
         start_year = data.start_year if start_year is None else int(start_year)
         end_year = start_year if end_year is None else int(end_year)
-        if self.terminal_storage_mode == 'initial' and start_year != end_year:
+        if episode_days is None and self.terminal_storage_mode == 'initial' and start_year != end_year:
             raise ValueError('Return-to-initial storage requires a single-year episode')
         self.start, self.stop = data.indices(start_year, end_year)
+        if episode_days is not None:
+            from harl.envs.cascade_reservoir.episodes import positive_integer
+            self.stop = self.start+positive_integer(episode_days, 'episode_days')
+            if self.stop > len(data.dates):
+                raise ValueError('Episode extends beyond the available daily data')
         if self.seasonal is not None:
             self._prepare_seasonal_calendar()
         # A finite-horizon policy needs time-to-go, not just day of year.
         # Keep the scale fixed across training, validation and test horizons.
-        self.time_scale_days = 366  # Fixed annual scale, including leap days.
+        self.time_scale_days = 366 if episode_days is None else episode_days
         self.observation_features = actor_observation_features(self.seasonal_constraints)
         self.observation_size = len(self.observation_features)
         self.state_size = 43 if self.seasonal_constraints else 18
@@ -73,7 +79,7 @@ class CascadeReservoirEnv:
         self.storage_lower, self.storage_upper = self.seasonal.storage_bounds(self.start, self.stop)
         self._phase_codes = np.empty((self.stop-self.start, 5), dtype=np.int8)
         self._deadline_indices = [[] for _ in range(5)]
-        for year in range(self.data.dates[self.start].year, self.data.dates[self.stop-1].year+1):
+        for year in dict.fromkeys(d.year for d in self.data.dates[self.start:self.stop]):
             a, b = self.data.indices(year, year)
             days = np.arange(b-a)
             for j in range(5):
@@ -81,8 +87,10 @@ class CascadeReservoirEnv:
                 refill = int(np.flatnonzero(self.seasonal.refill_deadline[a:b,j])[0])
                 draw, end = int(flood_days[0]), int(flood_days[-1])
                 codes = np.select([days <= draw, days <= end, days <= refill], [0, 1, 2], default=3)
-                self._phase_codes[a-self.start:b-self.start,j] = codes
-                self._deadline_indices[j].extend((a+draw, a+refill))
+                lo, hi = max(a, self.start), min(b, self.stop)
+                self._phase_codes[lo-self.start:hi-self.start,j] = codes[lo-a:hi-a]
+                self._deadline_indices[j].extend(event for event in (a+draw, a+refill)
+                                                if self.start <= event < self.stop)
         if self.terminal_storage_mode == 'initial':
             for events in self._deadline_indices:
                 events.append(self.stop-1)

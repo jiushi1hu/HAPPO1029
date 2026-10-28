@@ -39,26 +39,29 @@ def learning_signal_report(runner, before, post_prediction):
     """
     cb = runner.critic_buffer
     shape = cb.rewards.shape
-    if len(shape) != 3 or shape[0] < 1 or shape[1:] != (1, 1):
-        raise ValueError('Learning-signal diagnostics require complete cascade trajectories with one rollout thread')
+    if len(shape) != 3 or shape[0] < 1 or shape[1] < 1 or shape[2] != 1:
+        raise ValueError('Learning-signal diagnostics require complete cascade trajectories')
     signals = (before['mc'], before['prediction'], before['gae_targets'], post_prediction)
     for value in signals:
         if np.shape(value) != shape:
             raise ValueError('Learning-signal targets and predictions must match the rollout shape')
         if not np.isfinite(value).all():
             raise FloatingPointError('Non-finite learning-signal targets or predictions')
-    if (cb.masks.shape != (shape[0]+1, 1, 1) or
+    if (cb.masks.shape != (shape[0]+1, shape[1], 1) or
             not np.isin(cb.masks, (0., 1.)).all() or not np.all(cb.masks[-1] == 0.) or
             not np.all(cb.bad_masks == 1.)):
         raise ValueError('Learning-signal diagnostics require true terminal, untruncated annual trajectories')
-    starts = np.r_[0, np.flatnonzero(cb.masks[1:-1, 0, 0] == 0.)+1].astype(int)
+    if shape[1] > 1 and not np.all(cb.masks[1:-1] == 1.):
+        raise ValueError('Parallel diagnostics require one complete episode per lane without autoresets')
+    starts = (np.zeros(shape[1], dtype=int) if shape[1] > 1 else
+              np.r_[0, np.flatnonzero(cb.masks[1:-1, 0, 0] == 0.)+1].astype(int))
     recorded_starts = getattr(runner, 'batch_episode_starts', starts)
     if not np.array_equal(starts, recorded_starts):
         raise ValueError('Learning-signal episode boundaries disagree with the rollout metadata')
     years = getattr(runner, 'batch_years', []) or runner.sampled_years[-1:]
     if len(years) != len(starts):
         raise ValueError('Learning-signal diagnostics require one sampled year per trajectory')
-    ends = np.r_[starts[1:], shape[0]]
+    ends = np.full(shape[1], shape[0], dtype=int) if shape[1] > 1 else np.r_[starts[1:], shape[0]]
     lengths = (ends-starts).tolist()
     recorded_lengths = getattr(runner, 'batch_episode_lengths', [])
     if recorded_lengths and list(recorded_lengths) != lengths:
@@ -106,10 +109,11 @@ def learning_signal_report(runner, before, post_prediction):
                 weights[objective].astype(np.float64)*training_advantage[objective])/weight_sum)
                 if weight_sum > 0. else None)))
     per_episode = []
-    for year, start, end in zip(years, starts, ends):
-        rows = slice(start, end)
-        per_episode.append(dict(year=int(year), rows=int(end-start), episode_reward=float(mc[start, 0, 0]),
-            gae_start_target=float(targets[start, 0, 0]), pre_value_start=float(old_prediction[start, 0, 0]),
+    for index, (year, start, end) in enumerate(zip(years, starts, ends)):
+        lane = index if shape[1] > 1 else 0
+        rows = (slice(start, end), slice(lane, lane+1), slice(None))
+        per_episode.append(dict(year=int(year), rows=int(end-start), episode_reward=float(mc[start, lane, 0]),
+            gae_start_target=float(targets[start, lane, 0]), pre_value_start=float(old_prediction[start, lane, 0]),
             critic_mc_pre=_fit(mc[rows], old_prediction[rows]),
             critic_mc_post=_fit(mc[rows], post_prediction[rows]),
             gae_target_vs_mc=_fit(mc[rows], targets[rows]),
@@ -121,10 +125,13 @@ def learning_signal_report(runner, before, post_prediction):
         use_gae=use_gae, target_estimator='gae' if use_gae else 'discounted_return',
         interpretation='realized Monte Carlo targets and rowwise spread on the collected training trajectories; '
                        'not true advantages, independent daily samples, or held-out critic accuracy',
-        batch=dict(annual_trajectories=len(years), daily_rows=int(shape[0]), unique_year_count=len(unique),
+        batch=dict(annual_trajectories=(None if getattr(runner, 'collection_mode', 'annual') ==
+                   'five_year_parallel' else len(years)), episode_trajectories=len(years),
+            parallel_environments=int(shape[1]), daily_rows=int(shape[0]*shape[1]), unique_year_count=len(unique),
             year_counts={str(year):int(count) for year, count in zip(unique, counts)},
             year_diversity_effective_count=float(1./np.square(frequencies).sum()),
             diversity_definition='inverse concentration of sampled-year frequencies; not statistical sample size',
-            episode_lengths=lengths, trajectory_return_statistics=signal_statistics(mc[starts, 0, 0])),
+            episode_lengths=lengths, trajectory_return_statistics=signal_statistics(
+                [mc[start, index if shape[1] > 1 else 0, 0] for index, start in enumerate(starts)])),
         gae_target_vs_mc=_fit(mc, targets),
         advantages=_advantage_comparison(raw_advantage, mc_advantage), actors=actors, per_episode=per_episode)

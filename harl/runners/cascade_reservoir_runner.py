@@ -96,6 +96,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
     Each actor sees its own beginning-of-day local/neighbor observation. The
     critic sees the centralized state; physics resolves releases upstream to downstream.
     """
+    collection_mode = 'annual'
 
     def __init__(self, data, physical_config, algo_args, seed, episode_log=None):
         seed = validate_seed(seed)
@@ -110,6 +111,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         self.data, self.physical_config = data, physical_config
         self.fixed_training_year = validate_fixed_training_year(
             algo_args['experiment'].get('fixed_training_year'), data)
+        self.validation_enabled = bool(getattr(data, 'validation_years', ()))
         self.requested_args = copy.deepcopy(algo_args)
         self.rollout_episodes = validate_rollout_episodes(
             algo_args['experiment'].get('rollout_episodes', 1))
@@ -368,7 +370,9 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         """Keep in-sample diagnostic checkpoints separate from held-out validation."""
         if self.fixed_training_year is not None:
             return self.evaluate_training_year()
-        return self.validate()
+        if self.validation_enabled:
+            return self.validate()
+        return None
 
     def _record_policy_diagnostics(self, rows, previous_checkpoint, scope):
         """Compare sampled and modal policies only at requested milestones.
@@ -455,6 +459,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         return score
 
     def validate(self):
+        if not self.validation_enabled:
+            raise ValueError('No validation years configured')
         rows = [evaluate_policy(self.actor, self.data, self.physical_config, year,
                                 self.seed, self.iteration, self.training_steps,
                                 gamma=self.algo_args['algo']['gamma'],
@@ -495,7 +501,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         if episodes < 1 or eval_interval < 1:
             raise ValueError("Positive training episodes/evaluation interval required")
         self._final_training_episode = episodes
-        self.evaluate_checkpoint()  # Honest untrained point on the learning curve.
+        self.evaluate_checkpoint()  # Optional evaluation; training curves start after collection.
         updates = (episodes+self.rollout_episodes-1)//self.rollout_episodes
         for k, start in enumerate(range(0, episodes, self.rollout_episodes),1):
             count = min(self.rollout_episodes, episodes-start)
@@ -529,7 +535,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
             if not all(np.isfinite(v) for v in row.values()):
                 raise FloatingPointError("Non-finite training diagnostics")
             self.training_history.append(row)
-            if self.rollout_episodes > 1 or self.joint_kl_info is not None:
+            if self.rollout_episodes > 1 or self.joint_kl_info is not None or not self.validation_enabled:
                 log_episode(dict(record_type='training_update',seed=self.seed,update=self.update_count,
                     episode=self.iteration,training_steps=self.training_steps,
                     years=self.batch_years,episode_lengths=self.batch_episode_lengths,
@@ -545,8 +551,12 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                         'joint_actor_kl','joint_kl_remaining','rejected_joint_policy_kl',
                         'joint_kl_early_stopped','joint_kl_before','joint_actor_budget') if k in info}
                         for info in actor_info],
-                    annual_reward_mean=self.last_reward_metrics['episode_reward'],
-                    annual_generation_TWh_mean=self.last_rollout['episode_energy_TWh']),self.episode_log)
+                    **(dict(episode_reward_mean=self.last_reward_metrics['episode_reward'],
+                            episode_generation_TWh_mean=self.last_rollout['episode_energy_TWh'],
+                            episode_horizon_days=self.length, parallel_envs=self.n_envs)
+                       if self.collection_mode == 'five_year_parallel' else
+                       dict(annual_reward_mean=self.last_reward_metrics['episode_reward'],
+                            annual_generation_TWh_mean=self.last_rollout['episode_energy_TWh']))),self.episode_log)
             if self.diagnostics_enabled:
                 from harl.envs.cascade_reservoir.diagnostics import after_update, print_update_window
                 report = after_update(self, diagnostic_before)
@@ -570,31 +580,48 @@ class CascadeReservoirRunner(OnPolicyHARunner):
             if k % eval_interval == 0 or k == updates:
                 self.evaluate_checkpoint()
         if self.fixed_training_year is not None:
-            result = dict(seed=self.seed, fixed_training_year=self.fixed_training_year,
+            result = dict(seed=self.seed, policy_selection='fixed_training_year',
+                          fixed_training_year=self.fixed_training_year,
                           updates_completed=self.update_count,
                           best_episode=self.best_iteration, best_training_year_TWh=self.best_energy/1e6,
                           best_training_steps=self.best_training_steps, best_update=self.best_update,
                           best_training_year_reward=self.best_score)
             return result
-        result = dict(seed=self.seed, best_episode=self.best_iteration, best_iteration=self.best_iteration,
+        if not self.validation_enabled:
+            return dict(seed=self.seed, updates_completed=self.update_count,
+                        **self.test_policy_metadata())
+        result = dict(seed=self.seed, policy_selection='validation',
+                      best_episode=self.best_iteration, best_iteration=self.best_iteration,
                       best_training_steps=self.best_training_steps, best_update=self.best_update,
                       updates_completed=self.update_count,
                       best_validation_TWh=self.best_energy / 1e6, best_validation_reward=self.best_score)
         return result
 
-    def final_test(self):
-        """Evaluate selected actors once on each user-defined typical year."""
+    def test_policy_metadata(self):
+        """Identify the final trained policy or an explicitly validation-selected one."""
         if self.fixed_training_year is not None:
             raise RuntimeError('Fixed-training-year diagnostics do not run held-out tests')
+        if not self.validation_enabled:
+            if self.update_count < 1:
+                raise RuntimeError('No trained final policy is available')
+            return dict(policy_selection='final_training_update', selected_episode=self.iteration,
+                        selected_training_steps=self.training_steps, selected_update=self.update_count)
         if self.best_actor_states is None:
-            raise RuntimeError("No validation-selected policy is available")
+            raise RuntimeError('No validation-selected policy is available')
         if self.best_training_steps is None or self.best_update is None:
             raise RuntimeError('Validation-selected checkpoint training metadata is missing')
-        for actor, weights in zip(self.actor, self.best_actor_states):
-            actor.actor.load_state_dict(weights)
+        return dict(policy_selection='validation', selected_episode=self.best_iteration,
+                    selected_training_steps=self.best_training_steps, selected_update=self.best_update)
+
+    def final_test(self):
+        """Test the final actors, or the best actors when validation was requested."""
+        selection = self.test_policy_metadata()
+        if self.validation_enabled:
+            for actor, weights in zip(self.actor, self.best_actor_states):
+                actor.actor.load_state_dict(weights)
         return [dict(evaluate_policy(self.actor, self.data, self.physical_config, year,
-                                    self.seed, self.best_iteration, self.best_training_steps,
+                                    self.seed, selection['selected_episode'], selection['selected_training_steps'],
                                     gamma=self.algo_args['algo']['gamma']),
-                     typical_label=label, selected_update=self.best_update,
+                     typical_label=label, **selection,
                      run_training_steps=self.training_steps)
                 for year, label in zip(self.data.test_years, self.data.test_labels)]

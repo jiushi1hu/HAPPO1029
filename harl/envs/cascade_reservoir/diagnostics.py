@@ -3,6 +3,7 @@ import json
 import numpy as np
 import torch
 from harl.envs.cascade_reservoir.evaluation import evaluate_policy
+from harl.envs.cascade_reservoir.reward import validate_discount_factor
 
 
 def require_finite(name, value):
@@ -100,8 +101,9 @@ def before_update(runner):
 def after_update(runner, before):
     cb = runner.critic_buffer
     starts = getattr(runner, 'batch_episode_starts', np.array([0],dtype=int))
-    mc_start = float(before['mc'][starts,0,0].mean())
-    prediction_start = float(before['prediction'][starts,0,0].mean())
+    mc_start = float((before['mc'][0,:,0] if cb.rewards.shape[1] > 1 else before['mc'][starts,0,0]).mean())
+    prediction_start = float((before['prediction'][0,:,0] if cb.rewards.shape[1] > 1 else
+                              before['prediction'][starts,0,0]).mean())
     prediction = runner.critic.get_values(
         cb.share_obs[:-1].reshape(-1, cb.share_obs.shape[-1]))
     prediction = prediction.cpu().numpy().reshape(cb.rewards.shape)
@@ -222,7 +224,8 @@ def _repeat_statistics(values):
                 se=None if sd is None else sd/np.sqrt(len(values)))
 
 
-def _policy_evaluation_report(runner, deterministic_rows, previous_report, scope):
+def _policy_evaluation_report(runner, deterministic_rows, previous_report, scope,
+                              evaluation_gamma=None):
     """Evaluate a common action-sampling grid without changing training state.
 
     Repeat seeds intentionally omit the checkpoint number. Differences between
@@ -252,7 +255,10 @@ def _policy_evaluation_report(runner, deterministic_rows, previous_report, scope
     if isinstance(repeats, bool) or not isinstance(repeats, (int, np.integer)) or repeats < 1:
         raise ValueError('Policy diagnostics require a positive integer repeat count')
     repeats = int(repeats)
-    gamma = float(runner.algo_args['algo']['gamma'])
+    training_gamma = float(runner.algo_args['algo']['gamma'])
+    gamma = training_gamma if evaluation_gamma is None else validate_discount_factor(evaluation_gamma)
+    if evaluation_gamma is not None and any(row.get('gamma') != gamma for row in deterministic_rows):
+        raise ValueError('Deterministic rows must use the explicitly requested evaluation gamma')
     reward_samples, energy_samples, seeds = [], [], []
     by_year = [dict(year=year, repeats=[]) for year in years]
     modes = [(actor.actor, actor.actor.training) for actor in runner.actor]
@@ -275,6 +281,10 @@ def _policy_evaluation_report(runner, deterministic_rows, previous_report, scope
                 by_year[j]['repeats'].append(dict(repeat=repeat,
                     evaluation_seed=int(evaluation_seed), episode_reward=reward,
                     energy_TWh=energy, episode_penalty=penalty))
+                if evaluation_gamma is not None:
+                    by_year[j]['repeats'][-1].update(
+                        episode_generation_reward=row['episode_generation_reward'],
+                        service_shortfalls=row['service_shortfalls'])
                 reward_values.append(reward); energy_values.append(energy)
                 repeat_seeds.append(int(evaluation_seed))
             reward_samples.append(float(np.mean(reward_values)))
@@ -314,6 +324,8 @@ def _policy_evaluation_report(runner, deterministic_rows, previous_report, scope
         stochastic_repeat_se_reward=reward_stats['se'], sampled_results_by_year=by_year,
         deterministic_minus_sampled_reward=deterministic_reward-reward_stats['mean'],
         deterministic_minus_sampled_TWh=deterministic_energy-energy_stats['mean'])
+    if evaluation_gamma is not None:
+        report['training_gamma'] = training_gamma
     comparison = dict(available=False, reason='no_previous_report')
     if previous_report is not None:
         matched = all(previous_report.get(key) == report[key] for key in (
@@ -341,9 +353,11 @@ def _policy_evaluation_report(runner, deterministic_rows, previous_report, scope
     return report
 
 
-def policy_evaluation_report(runner, deterministic_rows, previous_report=None, scope='validation'):
+def policy_evaluation_report(runner, deterministic_rows, previous_report=None, scope='validation',
+                             *, evaluation_gamma=None):
     """Print sampled/modal policy evidence on an unchanged evaluation grid."""
-    report = _policy_evaluation_report(runner, deterministic_rows, previous_report, scope)
+    report = _policy_evaluation_report(runner, deterministic_rows, previous_report, scope,
+                                       evaluation_gamma=evaluation_gamma)
     print('DIAG_POLICY '+json.dumps(report, allow_nan=False), flush=True)
     return report
 
