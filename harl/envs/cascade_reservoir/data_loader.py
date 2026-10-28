@@ -22,25 +22,24 @@ OPERATION_PERIODS = ("drawdown", "flood_season", "impoundment", "dry_season")
 FLOW_COLUMNS = ("WDD_external_inflow_m3s",) + tuple(
     name + "_interval_inflow_m3s" for name in IDS[1:]
 )
-DEFAULT_VALIDATION_YEARS = ()
-DEFAULT_TEST_YEARS = (1998, 1999, 1970, 1997, 2006)
-DEFAULT_TEST_LABELS = ("extremely_wet", "wet", "normal", "dry", "extremely_dry")
+DEFAULT_EVALUATION_YEARS = (1998, 1999, 1970, 1997, 2006)
+DEFAULT_EVALUATION_LABELS = ("extremely_wet", "wet", "normal", "dry", "extremely_dry")
 
 
 def resolve_year_split(experiment):
-    """Validate disjoint year lists before reading data or fitting a scaler.
+    """Partition all 60 source years into 55 training and five evaluation years.
 
-    Validation is optional and disabled by default. Omitted training years use
-    every year outside the explicitly configured validation and test holdouts.
-    Explicit training years leave every other unassigned year unused.
+    The training years are the complete complement of the evaluation years.
+    Optional explicit training years must describe that same full complement;
+    partial training subsets cannot silently change the production experiment.
+    Evaluation order is retained for the representative five-year sequence.
     """
     available = set(range(1965, 2025))
 
-    def years(key, default, allow_empty=False):
+    def years(key, default):
         values = experiment.get(key, default)
-        if not isinstance(values, (list, tuple)) or (not values and not allow_empty):
-            qualifier = '' if allow_empty else 'nonempty '
-            raise ValueError(key + ' must be a ' + qualifier + 'list of integer years')
+        if not isinstance(values, (list, tuple)) or not values:
+            raise ValueError(key + ' must be a nonempty list of integer years')
         if any(isinstance(y, (bool, np.bool_)) or not isinstance(y, (int, np.integer)) for y in values):
             raise ValueError(key + ' must contain integer years')
         values = tuple(int(y) for y in values)
@@ -50,26 +49,21 @@ def resolve_year_split(experiment):
             raise ValueError(key + ' must lie within 1965--2024')
         return values
 
-    validation = years('validation_years', DEFAULT_VALIDATION_YEARS, allow_empty=True)
-    tests = years('test_years', DEFAULT_TEST_YEARS)
-    if set(validation) & set(tests):
-        raise ValueError('Validation and test years must be disjoint')
-    reserved = set(validation) | set(tests)
-    training = (tuple(sorted(available - reserved)) if experiment.get('training_years') is None
-                else tuple(sorted(years('training_years', ()))))
-    if not training:
-        raise ValueError('training_years must be nonempty')
-    if set(training) & reserved:
-        raise ValueError('Training years must be disjoint from validation and test years')
-    labels = experiment.get('test_labels')
+    evaluation = years('evaluation_years', DEFAULT_EVALUATION_YEARS)
+    if len(evaluation) != 5:
+        raise ValueError('evaluation_years must contain exactly five years')
+    training = tuple(sorted(available - set(evaluation)))
+    if experiment.get('training_years') is not None and set(years('training_years', ())) != set(training):
+        raise ValueError('training_years must contain all 55 years outside evaluation_years')
+    labels = experiment.get('evaluation_labels')
     if labels is None:
-        labels = DEFAULT_TEST_LABELS if tests == DEFAULT_TEST_YEARS else tuple('test_'+str(y) for y in tests)
-    if (not isinstance(labels, (list, tuple)) or len(labels) != len(tests) or
+        labels = (DEFAULT_EVALUATION_LABELS if evaluation == DEFAULT_EVALUATION_YEARS else
+                  tuple('evaluation_'+str(y) for y in evaluation))
+    if (not isinstance(labels, (list, tuple)) or len(labels) != len(evaluation) or
             any(not isinstance(label, str) or not label.strip() for label in labels) or
             len(set(labels)) != len(labels)):
-        raise ValueError('Require one unique nonempty test label per test year')
-    return dict(training_years=training, validation_years=validation,
-                test_years=tests, test_labels=tuple(labels))
+        raise ValueError('Require one unique nonempty evaluation label per evaluation year')
+    return dict(training_years=training, evaluation_years=evaluation, evaluation_labels=tuple(labels))
 
 
 def read_csv(path):
@@ -107,8 +101,6 @@ class CascadeData:
         self.start_year, self.end_year = 1965, 2024
         self.years = np.array([d.year for d in self.dates])
         all_years = set(range(self.start_year, self.end_year + 1))
-        selected = set(self.training_years + self.validation_years + self.test_years)
-        self.unused_years = tuple(sorted(all_years - selected))
         self.train_mask = np.isin(self.years, self.training_years)
         train_flow = self.external[self.train_mask]
         self.flow_mean = train_flow.mean(axis=0)
@@ -132,7 +124,7 @@ class CascadeData:
             date = datetime.strptime(row["date"], "%Y-%m-%d").date()
             key = (date.year, row["reservoir_id"])
             if date.month != 1 or date.day != 1 or key in keys or row["reservoir_id"] not in IDS:
-                raise ValueError("Invalid or duplicate annual initial-storage record")
+                raise ValueError("Invalid or duplicate calendar-year-start storage record")
             keys.add(key)
             self.initial_storage_by_year.setdefault(date.year, {})[row["reservoir_id"]] = float(row["initial_storage_m3"])
         if set(self.initial_storage_by_year) != all_years or any(set(v) != set(IDS) for v in self.initial_storage_by_year.values()):
@@ -348,7 +340,7 @@ class SeasonalOperationData:
     The supplied key table defines a flood ceiling from the drawdown deadline
     THROUGH the flood-limit end date, inclusive. The refill level is a lower
     bound ON its deadline, not a requirement to track a prescribed daily path
-    or to hold that level forever. Annual closure remains a solver argument.
+    or to hold that level forever. Episode-end closure remains a solver argument.
     Reference nodes describe start-of-day storage and interpolate in storage,
     with actual calendar-day lengths (including leap days). Reference bands,
     rate suggestions and reward weights are never promoted to hard bounds.
@@ -554,7 +546,7 @@ class SeasonalOperationData:
                 [r["storage"] for r in nodes] + [nodes[0]["storage"]])
 
     def _load_year_nodes(self):
-        """Optional, explicitly sourced annual paths, independently checked against daily data.
+        """Optional calendar-year reference paths, independently checked against daily data.
 
         A path includes both January 1 boundaries. Interpolation remains in
         storage, and these soft targets never replace the hard key-date rules.
@@ -594,7 +586,7 @@ class SeasonalOperationData:
                 raise ValueError("Invalid year-specific reference sequence/dates: " + str((id, year)))
             initial = self.data.initial_storage(year)[IDS.index(id)]
             if abs(nodes[0]["storage"]-initial) > 1. or abs(nodes[-1]["storage"]-initial) > 1.:
-                raise ValueError("Year-specific reference must match initial storage and annual closure: " +
+                raise ValueError("Year-specific reference endpoints must match source initial storage: " +
                                  str((id, year)))
             self.reference_year_nodes[(id, year)] = tuple(nodes)
 

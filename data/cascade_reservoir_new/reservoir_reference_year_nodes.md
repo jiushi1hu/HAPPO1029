@@ -24,6 +24,12 @@ storage values. The daily reference CSV is checked against these independent
 nodes; editing only one table is rejected. The override file is optional for
 datasets containing only recurring references, and is hashed when loaded.
 
+These nodes describe each calendar year's operating reference within a
+multi-year episode. They do not reset the simulated reservoir state on
+January 1. The standard episode contains 1,825 consecutive daily transitions;
+storage carries across the yearly reference boundaries, and return to the
+episode's initial storage is imposed only at the final episode transition.
+
 The original edited daily CSV was backed up before reconciliation to
 `runs/input_backups/seasonal_reference_20261025/`, with original SHA-256
 `40655c6cd38856e857489f3a822cdbf72763549c47f4a39a38a7bb1b04057eba`.
@@ -42,8 +48,7 @@ or raise that ceiling. `reference_target_feasible_zero_lag` is recomputed as
 <= max_total_release`, with the loader's existing flow tolerance. This flag
 checks release balance only. It does **not** certify hard seasonal compliance.
 
-Hard flood ceilings, refill deadlines, physical parameters and terminal
-storage rules are unchanged. A reference controller still projects a desired
-target onto its physically feasible action interval. In particular, retaining
-a target above a seasonal ceiling or below a refill deadline does not allow
-the executed policy or reference trajectory to violate that hard bound.
+Hard flood ceilings and refill deadlines apply to every included calendar
+year. Reference paths remain descriptive inputs and do not permit the
+executed policy to violate a seasonal ceiling, refill deadline or the final
+episode storage target.

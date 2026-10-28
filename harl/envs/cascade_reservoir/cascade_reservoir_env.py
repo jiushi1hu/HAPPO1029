@@ -5,6 +5,8 @@ from gym.spaces import Box, Discrete
 from harl.envs.cascade_reservoir.reservoir_physics import ReservoirPhysics, InfeasibleCascade
 from harl.envs.cascade_reservoir.terminal_storage import TerminalReleaseBounds
 from harl.envs.cascade_reservoir.reward import OperationReward, reward_settings
+from harl.envs.cascade_reservoir.episodes import (
+    DEFAULT_EPISODE_DAYS, DEFAULT_ACTION_BINS, positive_integer)
 
 SEASONAL_PHASES = ("drawdown", "flood_control", "impoundment", "post_refill")
 ACTOR_OBSERVATION_LAYOUT = "local_neighbors_v1"
@@ -15,10 +17,10 @@ LOCAL_NEIGHBOR_FEATURES = (
     "downstream_headroom_fraction",
 )
 LOCAL_RULE_FEATURES = (
-    "storage_lower_fraction", "storage_upper_fraction", "deadline_days_remaining",
+    "storage_lower_fraction", "storage_upper_fraction", "deadline_time_remaining_fraction",
     "deadline_storage_lower_fraction", "deadline_storage_upper_fraction",
 )
-TIME_FEATURES = ("season_sin", "season_cos", "episode_days_remaining")
+TIME_FEATURES = ("season_sin", "season_cos", "episode_time_remaining_fraction")
 
 
 def actor_observation_features(seasonal_constraints):
@@ -33,8 +35,8 @@ class CascadeReservoirEnv:
         return dict(actor_observation_layout=self.observation_layout,
                     actor_observation_size=self.observation_size, critic_state_size=self.state_size)
 
-    def __init__(self, data, config, end_year=None, start_year=None, action_bins=200,
-                 episode_days=None):
+    def __init__(self, data, config, start_year=None, action_bins=DEFAULT_ACTION_BINS,
+                 episode_days=DEFAULT_EPISODE_DAYS):
         self.data = data
         self.physics = ReservoirPhysics(data, config)
         self.seasonal_constraints = config.get('seasonal_constraints', False)
@@ -47,21 +49,17 @@ class CascadeReservoirEnv:
         self.terminal_storage_mode = config.get('terminal_storage_mode', 'free')
         if self.terminal_storage_mode not in ('free', 'initial'):
             raise ValueError('Terminal storage mode must be free or initial')
-        start_year = data.start_year if start_year is None else int(start_year)
-        end_year = start_year if end_year is None else int(end_year)
-        if episode_days is None and self.terminal_storage_mode == 'initial' and start_year != end_year:
-            raise ValueError('Return-to-initial storage requires a single-year episode')
-        self.start, self.stop = data.indices(start_year, end_year)
-        if episode_days is not None:
-            from harl.envs.cascade_reservoir.episodes import positive_integer
-            self.stop = self.start+positive_integer(episode_days, 'episode_days')
-            if self.stop > len(data.dates):
-                raise ValueError('Episode extends beyond the available daily data')
+        start_year = data.dates[0].year if start_year is None else int(start_year)
+        self.episode_days = positive_integer(episode_days, 'episode_days')
+        self.start, _ = data.indices(start_year, start_year)
+        self.stop = self.start+self.episode_days
+        if self.stop > len(data.dates):
+            raise ValueError('Episode extends beyond the available daily data')
         if self.seasonal is not None:
             self._prepare_seasonal_calendar()
         # A finite-horizon policy needs time-to-go, not just day of year.
-        # Keep the scale fixed across training, validation and test horizons.
-        self.time_scale_days = 366 if episode_days is None else episode_days
+        # Training and evaluation use the same configured multi-year horizon.
+        self.time_scale_days = self.episode_days
         self.observation_features = actor_observation_features(self.seasonal_constraints)
         self.observation_size = len(self.observation_features)
         self.state_size = 43 if self.seasonal_constraints else 18

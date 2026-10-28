@@ -177,18 +177,3 @@ class ReservoirPhysics:
         if storage_lower is not None:
             result.update(storage_lower_m3=storage_min.copy(), storage_upper_m3=storage_max.copy())
         return result
-
-    def constant_storage(self, external, storage=None):
-        """Reference at the explicitly supplied, unchanged annual storage."""
-        external = np.asarray(external, dtype=np.float64)
-        if (external.ndim < 1 or external.shape[-1] != 5 or
-                not np.isfinite(external).all() or (external < 0).any()):
-            raise ValueError("Reference inflows must be finite nonnegative five-vectors")
-        release = np.cumsum(external, axis=-1)
-        if (release > self.data.release_cap + 1e-8).any():
-            raise InfeasibleCascade("Constant-storage reference exceeds outlet capacities")
-        generated = self.generation(release, storage, storage)
-        # Preserve the fixed-head reference's original multiplication order.
-        if self.head_model == "fixed":
-            return release, 24. * self.coefficient * generated["turbine"]
-        return release, generated["energy"]

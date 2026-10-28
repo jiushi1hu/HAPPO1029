@@ -47,8 +47,7 @@ The shared daily reward is cascade energy divided by maximum daily cascade
 energy, minus two weighted averages of relative shortfalls. Each shortfall is
 `max(requirement - actual, 0) / requirement`, averaged over that term's fixed
 positive-requirement set. Both weights default to 1.0; they are explicit
-tradeoffs, not calibrated costs. The old target-band and daily level rise/fall
-penalties have been removed. This follows the paper's relative-deficit penalty
+tradeoffs, not calibrated costs. This follows the paper's relative-deficit penalty
 form while retaining the repository's common team objective, rather than
 reproducing the paper's entire local/global reward mixture.
 
@@ -56,10 +55,18 @@ For the current five positive requirements, generation is in [0,1], each mean
 relative shortfall is in [0,1], and the unit-weight daily reward is in [-2,1].
 Negative rewards are retained. A relative tolerance of 1e-10 excludes floating
 point roundoff from both costs and shortfall counts. All reward components use
-the same training discount, currently gamma=0.99; physical compliance rates,
+the same configured episode discount (YAML default gamma=0.99; gamma=1 gives
+the undiscounted five-year episode objective); physical compliance rates,
 shortfall energy, and deficit volumes are never discounted. A cascade sum of
 ecological deficits is a sum over outlet service requirements, not unique
 missing water volume in the basin.
+
+Episode totals cover all 1,825 daily decisions across the five-year horizon.
+With five active reservoirs, one complete episode contains 9,125 eligible
+reservoir-days for each requirement. Calendar-year boundaries do not reset
+rewards, shortfall counts, integrated deficits or storage. The 60 source
+years are partitioned into 55 training years and five held-out evaluation
+years; the same requirement table is used in both phases.
 
 Hydraulics, hard seasonal bounds, actor and critic observations, and HAPPO
 updates are unchanged. These requirements are soft penalties, so compliance is

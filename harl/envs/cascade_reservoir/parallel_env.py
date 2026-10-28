@@ -50,7 +50,7 @@ def _worker(connection):
                             source_years=list(dict.fromkeys(d.year for d in env.data.dates[env.start:env.stop])),
                             start_date=env.data.dates[env.start].isoformat(),
                             end_date=env.data.dates[env.stop-1].isoformat(),
-                            annual_generation_TWh=None, episode_generation_TWh=float(energy.sum()/1e6),
+                            episode_generation_TWh=float(energy.sum()/1e6),
                             worker_pid=os.getpid())
                         result.update(episode_record=record, reward_metrics=metrics.summary())
                 else:

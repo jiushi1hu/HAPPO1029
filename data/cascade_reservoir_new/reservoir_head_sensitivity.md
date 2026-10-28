@@ -31,7 +31,7 @@ Efficiency remains the existing constant 0.90. It is a model assumption, not a n
 | `reservoir_id` | Existing hydraulic order: WDD, BHT, XLD, XJB, THR. |
 | `data_status` | `assumed_sensitivity_only`; no row is measured or calibrated. |
 | `operating_level_min_m` | Lower elevation from the existing environment configuration, checked against the storage-elevation curve. |
-| `operating_level_max_m` | Upper elevation from that configuration, checked against the curve and all 60 annual initial-storage records. The full curve may extend above this operating limit. |
+| `operating_level_max_m` | Upper elevation from that configuration, checked against the curve and all 60 calendar-year-start storage records. The full curve may extend above this operating limit. |
 | `assumed_reference_forebay_level_m` | Arithmetic midpoint of the two operating elevations; an explicitly assumed anchor. |
 | `reference_net_head_m` | Existing `reservoir_parameters.csv:typical_net_head_m`, paired with the assumed anchor only for this scenario. |
 | `assumed_effective_tailwater_plus_loss_m` | Derived `Z_ref - H_ref`; not a separately identified physical tailwater or loss. |
@@ -46,7 +46,7 @@ Efficiency remains the existing constant 0.90. It is a model assumption, not a n
 - Hydraulic losses as a justified constant or a relationship with turbine/powerhouse flow. Unit-level data must identify unit counts and aggregation assumptions.
 - The actual operating conditions associated with each supplied typical net head, including reference forebay elevation.
 - Confirmation of the vertical datum and any gauge-zero offsets. The derived combined offsets inherit the source forebay coordinate system; their physical datum has not been independently verified.
-- Observed forebay/tailwater, turbine flow, spill, and generation records for calibration and validation.
+- Observed forebay/tailwater, turbine flow, spill, and generation records for calibration and independent physical verification.
 - Efficiency and head-dependent turbine-capacity curves if a subsequent model is to represent those effects. They are not required for this initial constant-efficiency scenario.
 
 These missing quantities cannot be recovered uniquely from daily inflows, storage-elevation curves, or installed capacity. No discharge-dependent tailwater/loss curve has been fabricated. A measured or calibrated relationship should replace this sensitivity anchor before making claims of plant-specific accuracy or paper reproduction.
@@ -55,9 +55,9 @@ These missing quantities cannot be recovered uniquely from daily inflows, storag
 
 The loader now consumes and validates this CSV when `head_model: storage_sensitivity` is selected (the environment configuration default). Missing or inconsistent scenario inputs raise errors; there is no automatic fallback. Fixed-head comparisons remain available with `--head-model fixed`, which does not require the supplement. Both startup output and evaluation rows identify the selected head model and the assumption status.
 
-Each transition computes storage and forebay elevations before calculating `H_day = H_ref + (Z_start + Z_end)/2 - Z_ref`. The turbine-flow cap is recomputed as `min(nominal_turbine_cap, installed_capacity / (rho*g*eta*H_day/1e6))`; remaining release is spill. Energy is daily mean power times 24 hours. The installed-power limit is therefore enforced at the modeled daily mean head; this does not establish compliance with an unmodeled instantaneous within-day power limit. Policy evaluation and the constant-storage reference use the same generation routine and selected head model. The reference uses each year's supplied initial storage throughout that year, rather than an assumed midpoint storage.
+Each transition computes storage and forebay elevations before calculating `H_day = H_ref + (Z_start + Z_end)/2 - Z_ref`. The turbine-flow cap is recomputed as `min(nominal_turbine_cap, installed_capacity / (rho*g*eta*H_day/1e6))`; remaining release is spill. Energy is daily mean power times 24 hours. The installed-power limit is therefore enforced at the modeled daily mean head; this does not establish compliance with an unmodeled instantaneous within-day power limit. Training and evaluation use the same generation routine and selected head model throughout the complete 1,825-day episode. Initial storage is loaded at the episode start; storage and head carry across subsequent calendar-year boundaries.
 
-Daily net head and effective turbine-flow capacity are available in environment transitions; diagnostic evaluation additionally reports each reservoir's annual minimum, mean, and maximum modeled daily head. Efficiency remains fixed at 0.90. This adds storage-to-head feedback, not a calibrated efficiency curve or a discharge-dependent tailwater/loss relationship.
+Daily net head and effective turbine-flow capacity are available in environment transitions; evaluation additionally reports each reservoir's episode minimum, mean, and maximum modeled daily head. Efficiency remains fixed at 0.90. This adds storage-to-head feedback, not a calibrated efficiency curve or a discharge-dependent tailwater/loss relationship.
 
 For future flow-dependent losses or efficiency, turbine flow and power may require a coupled solve. The current sensitivity scenario's constant combined offset does not require one. A historical head series alone would not provide storage-dependent feedback.
 

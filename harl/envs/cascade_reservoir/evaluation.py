@@ -1,45 +1,17 @@
-"""Frozen annual evaluation; all metrics stay in memory."""
+"""Frozen complete-episode evaluation for the five-reservoir cascade."""
 import numpy as np
 import torch
-from harl.envs.cascade_reservoir.cascade_reservoir_env import CascadeReservoirEnv, SEASONAL_PHASES
+from harl.envs.cascade_reservoir.cascade_reservoir_env import SEASONAL_PHASES
 from harl.envs.cascade_reservoir.data_loader import IDS
+from harl.envs.cascade_reservoir.episodes import (
+    DEFAULT_ACTION_BINS, DEFAULT_EPISODE_DAYS, episode_environment)
 from harl.envs.cascade_reservoir.reservoir_physics import InfeasibleCascade
-from harl.envs.cascade_reservoir.terminal_storage import TerminalReleaseBounds
 from harl.envs.cascade_reservoir.reward import (
-    EpisodeRewardMetrics, OperationReward, validate_discount_factor, reward_settings,
-    REWARD_AGGREGATION, reward_metadata)
-
-
-def reference_metadata(physical_config):
-    if physical_config.get('seasonal_constraints', False):
-        return dict(reference_type='seasonal_target_tracking', reference_label='Seasonal rule reference',
-            reference_description='Tracks supplied soft daily end-storage targets on the policy action grid; '
-                'uses the same hard seasonal bounds, future-inflow feasibility and terminal storage mode. '
-                'A feasible rule controller, not an optimal-generation bound.')
-    return dict(reference_type='constant_storage', reference_label='Constant-storage reference',
-        reference_description='Maintains initial storage all year with cumulative natural inflow releases; '
-            'seasonal operating constraints are disabled.')
-
-
-def validate_operating_feasibility(data, physical_config, years=None):
-    """Preflight physical feasibility only; no policy, reward fit or energy optimization."""
-    years = range(data.start_year, data.end_year+1) if years is None else years
-    checked = []
-    for year in years:
-        try:
-            env = CascadeReservoirEnv(data, physical_config, start_year=year, end_year=year)
-            bounds = {} if env.seasonal is None else dict(
-                storage_lower=env.storage_lower, storage_upper=env.storage_upper)
-            TerminalReleaseBounds(data, env.physics.dt, env.storage,
-                data.external[env.start:env.stop], env.terminal_storage_target, **bounds).check_feasible()
-        except RuntimeError as exc:
-            raise type(exc)('Operating feasibility check failed for year {}: {}'.format(year, exc)) from exc
-        checked.append(int(year))
-    return checked
+    EpisodeRewardMetrics, validate_discount_factor, REWARD_AGGREGATION, reward_metadata)
 
 
 class SeasonalMetrics:
-    """Identical compliance accounting for policy and reference trajectories."""
+    """Compliance accounting across every source year in a complete episode."""
 
     def __init__(self, env):
         self.env = env
@@ -98,18 +70,29 @@ class SeasonalMetrics:
 
 
 @torch.no_grad()
-def evaluate_policy(actors, data, physical_config, year, seed, iteration, training_steps,
-                    deterministic=True, diagnostics=False, *, gamma,
-                    source_years=None, episode_days=None):
+def evaluate_policy(actors, data, physical_config, seed, episode, training_steps, *,
+                    gamma, source_years, episode_days=DEFAULT_EPISODE_DAYS,
+                    deterministic=True, diagnostics=False):
+    """Evaluate one complete multi-year sequence without collecting training samples.
+
+    Evaluation years are used only after training. A training-only diagnostic
+    may explicitly supply training years; mixed split sequences are rejected.
+    Source dates and seasonal rules are preserved at representative-year joins.
+    """
     gamma = validate_discount_factor(gamma)
-    bins = actors[0].args.get('action_bins', 200)
-    if source_years is None and episode_days is None:
-        env = CascadeReservoirEnv(data, physical_config, start_year=year, end_year=year, action_bins=bins)
+    if len(actors) != len(IDS):
+        raise ValueError('Evaluation requires one actor per reservoir')
+    bins = actors[0].args.get('action_bins', DEFAULT_ACTION_BINS)
+    if any(actor.args.get('action_bins', DEFAULT_ACTION_BINS) != bins for actor in actors):
+        raise ValueError('Evaluation actors must use one common discrete action grid')
+    env = episode_environment(data, physical_config, source_years, episode_days, bins)
+    used_years = list(dict.fromkeys(day.year for day in env.data.dates[env.start:env.stop]))
+    if set(used_years).issubset(data.evaluation_years):
+        phase = 'evaluation'
+    elif set(used_years).issubset(data.training_years):
+        phase = 'training_evaluation'
     else:
-        from harl.envs.cascade_reservoir.episodes import episode_environment
-        if source_years is None or episode_days is None:
-            raise ValueError('Multi-year evaluation requires source_years and episode_days together')
-        env = episode_environment(data, physical_config, source_years, episode_days, bins)
+        raise ValueError('An evaluation episode cannot mix training and evaluation years')
     initial = env.storage.copy()
     seasonal_metrics = SeasonalMetrics(env) if env.seasonal is not None else None
     reward_metrics = EpisodeRewardMetrics(gamma)
@@ -119,112 +102,58 @@ def evaluate_policy(actors, data, physical_config, year, seed, iteration, traini
     head_sum, head_min, head_max = np.zeros(5), np.full(5, np.inf), np.full(5, -np.inf)
     for actor in actors:
         actor.prep_rollout()
-    for _ in range(env.stop - env.start):
+    for _ in range(env.stop-env.start):
         obs = env.actor_observations()
-        actions = []
-        for i, actor in enumerate(actors):
-            action = actor.act(obs[i:i+1], deterministic=deterministic)
-            actions.append(float(action.item()))
+        actions = [float(actor.act(obs[i:i+1], deterministic=deterministic).item())
+                   for i, actor in enumerate(actors)]
         env.step(np.asarray(actions))
-        r = env.last_transition
-        reward_metrics.update(r)
-        energy += float(r["energy"].sum())
-        spill += float(r["spill"].sum() * env.physics.dt)
-        residual = max(residual, float(np.abs(r["residual"]).max()))
+        row = env.last_transition
+        reward_metrics.update(row)
+        energy += float(row['energy'].sum())
+        spill += float(row['spill'].sum()*env.physics.dt)
+        residual = max(residual, float(np.abs(row['residual']).max()))
         if seasonal_metrics is not None:
             seasonal_metrics.update()
         if diagnostics:
-            energy_by_reservoir += r["energy"]
-            spill_by_reservoir += r["spill"]*env.physics.dt
-            action_sum += r["normalized_actions"]*r["controls"]
-            mapped_sum += r["normalized_actions"]**2*r["controls"]
-            active_count += r["controls"]
-            head_sum += r["net_head_m"]
-            head_min = np.minimum(head_min, r["net_head_m"])
-            head_max = np.maximum(head_max, r["net_head_m"])
-    row = dict(seed=seed, episode=iteration, training_steps=training_steps, year=year,
-               phase="validation" if year in data.validation_years else
-                     "test" if year in data.test_years else "training_evaluation",
-               energy_MWh=energy, energy_TWh=energy / 1e6,
-               spill_volume_m3=spill, max_balance_residual_m3=residual,
-               head_model=env.physics.head_model, head_data_status=env.physics.head_data_status,
-               feasible=True, violation_count=0, **env.observation_metadata())
+            energy_by_reservoir += row['energy']
+            spill_by_reservoir += row['spill']*env.physics.dt
+            action_sum += row['normalized_actions']*row['controls']
+            mapped_sum += row['normalized_actions']**2*row['controls']
+            active_count += row['controls']
+            head_sum += row['net_head_m']
+            head_min = np.minimum(head_min, row['net_head_m'])
+            head_max = np.maximum(head_max, row['net_head_m'])
+    closure = (np.zeros(5) if env.terminal_storage_target is None else
+               np.abs(env.storage-env.terminal_storage_target))
+    tolerance = np.maximum(1., 1e-10*np.abs(env.storage))
+    if (closure > tolerance).any():
+        raise InfeasibleCascade('Evaluation terminal storage target was not reached')
+    result = dict(seed=int(seed), episode=int(episode), training_steps=int(training_steps),
+        phase=phase, source_years=used_years, window_start_year=used_years[0],
+        episode_horizon_days=env.stop-env.start,
+        start_date=env.data.dates[env.start].isoformat(),
+        end_date=env.data.dates[env.stop-1].isoformat(),
+        source_sequence='ordered source years; storage carries across every boundary; leap days retained',
+        energy_MWh=energy, energy_TWh=energy/1e6, spill_volume_m3=spill,
+        max_balance_residual_m3=residual, head_model=env.physics.head_model,
+        head_data_status=env.physics.head_data_status, terminal_storage_mode=env.terminal_storage_mode,
+        terminal_storage_error_m3_by_reservoir=closure.tolist(),
+        feasible=True, violation_count=0, **env.observation_metadata())
     for i, name in enumerate(IDS):
-        row[name + "_start_m3"] = float(initial[i])
-        row[name + "_end_m3"] = float(env.storage[i])
+        result[name+'_start_m3'] = float(initial[i])
+        result[name+'_end_m3'] = float(env.storage[i])
     if seasonal_metrics is not None:
-        row.update(seasonal_metrics.finish())
-    row.update(reward_metrics.summary(detailed=True), **reward_metadata(data), reward_penalties=env.reward_settings,
-               reward_aggregation=REWARD_AGGREGATION)
-    if source_years is not None:
-        row.update(source_years=list(dict.fromkeys(d.year for d in env.data.dates[env.start:env.stop])),
-                   episode_horizon_days=env.stop-env.start,
-                   start_date=env.data.dates[env.start].isoformat(),
-                   end_date=env.data.dates[env.stop-1].isoformat(),
-                   source_sequence='ordered source years; storage carries across every boundary; leap days retained')
+        result.update(seasonal_metrics.finish())
+    result.update(reward_metrics.summary(detailed=True), **reward_metadata(data),
+        reward_penalties=env.reward_settings, reward_aggregation=REWARD_AGGREGATION)
     if diagnostics:
-        row.update(energy_by_reservoir_TWh=(energy_by_reservoir/1e6).tolist(),
+        result.update(energy_by_reservoir_TWh=(energy_by_reservoir/1e6).tolist(),
             spill_by_reservoir_billion_m3=(spill_by_reservoir/1e9).tolist(),
             end_storage_fraction=((env.storage-data.vmin)/(data.vmax-data.vmin)).tolist(),
             total_storage_depletion_billion_m3=float((initial-env.storage).sum()/1e9),
-            mean_u=(action_sum/np.maximum(active_count,1)).tolist(),
-            mean_mapping_fraction=(mapped_sum/np.maximum(active_count,1)).tolist(),
+            mean_u=(action_sum/np.maximum(active_count, 1)).tolist(),
+            mean_mapping_fraction=(mapped_sum/np.maximum(active_count, 1)).tolist(),
             active_days=active_count.astype(int).tolist(),
             mean_net_head_m=(head_sum/(env.stop-env.start)).tolist(),
             min_net_head_m=head_min.tolist(), max_net_head_m=head_max.tolist())
-    return row
-
-
-def reference_summary(data, physics, years, action_bins=200, *, gamma):
-    """Reference matched to the selected operating mode and physical model.
-
-    Seasonal targets are soft: low-flow years can deviate from the prescribed
-    curve while obeying the same hard constraints as the learned controller.
-    The legacy analytic reference is retained only when seasonality is off.
-    """
-    gamma = validate_discount_factor(gamma)
-    rows = []
-    for year in years:
-        if physics.config.get('seasonal_constraints', False):
-            env = CascadeReservoirEnv(data, physics.config, start_year=year, end_year=year,
-                                      action_bins=action_bins)
-            initial = env.storage.copy()
-            metrics = SeasonalMetrics(env)
-            reward_metrics = EpisodeRewardMetrics(gamma)
-            energy = np.zeros(5); spill = np.zeros(5); head = np.zeros(5)
-            residual = 0.
-            while env.index < env.stop:
-                env.step_towards_storage(env.seasonal.reference['target_end_of_day_storage_m3'][env.index])
-                r = env.last_transition
-                reward_metrics.update(r)
-                energy += r['energy']; spill += r['spill']*physics.dt; head += r['net_head_m']
-                residual = max(residual, float(np.abs(r['residual']).max()))
-                metrics.update()
-            row = dict(year=year, energy_MWh=float(energy.sum()), energy_TWh=float(energy.sum()/1e6),
-                energy_by_reservoir_TWh=(energy/1e6).tolist(), spill_volume_m3=float(spill.sum()),
-                spill_by_reservoir_billion_m3=(spill/1e9).tolist(), max_balance_residual_m3=residual,
-                mean_net_head_m=(head/(env.stop-env.start)).tolist(), head_model=physics.head_model,
-                head_data_status=physics.head_data_status, **reference_metadata(physics.config))
-            row.update(metrics.finish())
-            row.update(reward_metrics.summary(detailed=True), **reward_metadata(data), reward_penalties=env.reward_settings,
-                       reward_aggregation=REWARD_AGGREGATION)
-            for i, name in enumerate(IDS):
-                row[name+'_start_m3'] = float(initial[i])
-                row[name+'_end_m3'] = float(env.storage[i])
-            rows.append(row)
-            continue
-        start, stop = data.indices(year, year)
-        release, energy = physics.constant_storage(data.external[start:stop], data.initial_storage(year))
-        reward_metrics = EpisodeRewardMetrics(gamma)
-        settings = reward_settings(physics.config)
-        operation_reward = OperationReward(data, settings, timestep_seconds=physics.dt)
-        for daily_release, daily_energy in zip(release, energy):
-            transition = dict(reward=float(daily_energy.sum()/physics.reference_energy),
-                              power=daily_energy/24., release=daily_release)
-            operation_reward.apply(transition)
-            reward_metrics.update(transition)
-        rows.append(dict(year=year, energy_MWh=float(energy.sum()), energy_TWh=float(energy.sum() / 1e6),
-                         head_model=physics.head_model, head_data_status=physics.head_data_status,
-                         reward_penalties=settings, reward_aggregation=REWARD_AGGREGATION,
-                         **reward_metadata(data), **reward_metrics.summary(detailed=True)))
-    return rows
+    return result

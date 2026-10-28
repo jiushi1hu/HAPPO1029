@@ -1,9 +1,9 @@
-# Complete configuration for annual cascade HAPPO; no generic game defaults.
+# Complete five-year cascade HAPPO configuration; no generic game defaults.
 device:
   torch_threads: 1
 train:
-  n_rollout_threads: 1  # Annual environments collected sequentially; batching is below.
-  episode_length: 365  # Reallocated to 365/366 for each sampled calendar year.
+  n_rollout_threads: 6  # One complete episode per independent worker and update.
+  episode_length: 1825  # Five-year daily horizon; leap days are retained.
   use_valuenorm: true
   use_linear_lr_decay: false
   use_proper_time_limits: true
@@ -22,9 +22,9 @@ model:
   opti_eps: 0.00001
   weight_decay: 0
   action_distribution: categorical
-  action_bins: 200
+  action_bins: 100
 algo:
-  gamma: 0.99  # GAE, gamma**t actor/entropy weights, accounting and selection; 1 = annual total.
+  gamma: 0.99  # GAE, gamma**t actor/entropy weights and episode accounting; 1 = undiscounted total.
   gae_lambda: 0.95
   share_param: false
   fixed_order: false
@@ -33,7 +33,7 @@ algo:
   kl_rollback: false  # With target_kl, reject and restore crossing optimizer steps when explicitly enabled.
   joint_target_kl: null  # Opt-in common-rollout five-actor command KL budget; requires kl_rollback.
   critic_epoch: 5
-  actor_num_mini_batch: 1  # Keep all days; same update count in leap/non-leap years.
+  actor_num_mini_batch: 1  # Keep every row of the 1825 x 6 rollout.
   critic_num_mini_batch: 1
   clip_param: 0.2
   use_clipped_value_loss: false
@@ -49,14 +49,10 @@ algo:
   normalize_shared_advantages: true
   mask_inactive_factors: true
 experiment:
-  collection_mode: five_year_parallel  # CLI default; --collection-mode annual restores the earlier pipeline.
-  training_years: null  # Default: all 55 years outside test holdouts; explicit validation years are also excluded.
-  validation_years: []  # No validation/checkpoint selection by default; test the final trained policy.
-  test_years: [1998, 1999, 1970, 1997, 2006]
-  test_labels: [extremely_wet, wet, normal, dry, extremely_dry]
-  episode_mode: random_training_year
-  fixed_training_year: null  # --fixed-training-year YEAR enables an in-sample learning check.
-  episodes: 300  # Total annual episodes, including the final partial batch.
-  rollout_episodes: 6  # Freeze policy, collect six independent years, then update.
-  eval_interval: 1  # HAPPO update rounds, not annual episode count.
+  collection_mode: five_year_parallel
+  evaluation_years: [1998, 1999, 1970, 1997, 2006]  # The other 55 source years are used for training.
+  evaluation_labels: [extremely_wet, wet, normal, dry, extremely_dry]
+  episode_mode: random_training_window
+  episodes: 300  # Completed five-year episodes per seed; divisible by six workers (50 updates).
+  log_interval: 1  # Diagnostic reporting cadence in HAPPO update rounds.
   seeds: [1, 2, 3, 4, 5]

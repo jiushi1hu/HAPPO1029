@@ -1,6 +1,9 @@
-"""Explicit fixed-day episodes without annual resets or split leakage."""
+"""Fixed five-year episodes with explicit calendar views and split isolation."""
 import copy
 import numpy as np
+
+DEFAULT_EPISODE_DAYS = 1825
+DEFAULT_ACTION_BINS = 100
 
 
 def positive_integer(value, name):
@@ -9,7 +12,7 @@ def positive_integer(value, name):
     return int(value)
 
 
-def training_windows(data, days):
+def training_windows(data, days=DEFAULT_EPISODE_DAYS):
     """Jan-1 starts whose entire consecutive daily window belongs to training."""
     days = positive_integer(days, 'episode_days')
     allowed = set(data.training_years)
@@ -30,12 +33,12 @@ def training_windows(data, days):
 class EpisodeData:
     """Read-only daily view; static physics and initial-storage inputs are shared.
 
-    Ordered years can be nonconsecutive for the representative held-out test
+    Ordered years can be nonconsecutive for the representative evaluation
     sequence. Their source dates and operating rules are retained explicitly.
     No hydrology is interpolated and no leap days are deleted.
     """
 
-    def __init__(self, source, years, days):
+    def __init__(self, source, years, days=DEFAULT_EPISODE_DAYS):
         days = positive_integer(days, 'episode_days')
         if not years or len(set(years)) != len(years):
             raise ValueError('Episode source years must be nonempty and unique')
@@ -83,8 +86,9 @@ class EpisodeData:
         return self.seasonal_operation
 
 
-def episode_environment(data, physical, years, days, action_bins):
+def episode_environment(data, physical, years, days=DEFAULT_EPISODE_DAYS,
+                        action_bins=DEFAULT_ACTION_BINS):
     from harl.envs.cascade_reservoir.cascade_reservoir_env import CascadeReservoirEnv
     view = EpisodeData(data, years, days)
-    return CascadeReservoirEnv(view, physical, start_year=years[0], end_year=years[0],
+    return CascadeReservoirEnv(view, physical, start_year=years[0],
                                action_bins=action_bins, episode_days=days)
