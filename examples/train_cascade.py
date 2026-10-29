@@ -14,7 +14,7 @@ from harl.envs.cascade_reservoir.data_loader import CascadeData, HEAD_MODELS, re
 from harl.envs.cascade_reservoir.episodes import positive_integer
 from harl.envs.cascade_reservoir.reward import reward_settings, validate_discount_factor
 from harl.runners.cascade_reservoir_runner import validate_gae_lambda, validate_seed
-from examples.train_cascade_parallel import run_parallel_experiment
+from examples.train_cascade_parallel import run_parallel_experiment, step_metrics_paths
 
 
 def load_configuration():
@@ -49,18 +49,22 @@ def main():
     joint.add_argument('--joint-target-kl',type=float,help='Cumulative joint KL budget; requires actor rollback')
     joint.add_argument('--no-joint-kl-limit',action='store_true')
     parser.add_argument('--head-model',choices=HEAD_MODELS)
-    seasonal = parser.add_mutually_exclusive_group()
-    seasonal.add_argument('--seasonal-constraints',dest='seasonal_constraints',action='store_true')
-    seasonal.add_argument('--no-seasonal-constraints',dest='seasonal_constraints',action='store_false')
-    parser.set_defaults(seasonal_constraints=None)
+    limits = parser.add_mutually_exclusive_group()
+    limits.add_argument('--daily-level-limits',dest='daily_level_limits',action='store_true',
+                        help='Use the action-date CSV bounds on each next state (default)')
+    limits.add_argument('--no-daily-level-limits',dest='daily_level_limits',action='store_false',
+                        help='Use global operating bounds only')
+    parser.set_defaults(daily_level_limits=None)
     penalties = parser.add_mutually_exclusive_group()
     penalties.add_argument('--reward-penalties',dest='reward_penalties',action='store_true')
     penalties.add_argument('--no-reward-penalties',dest='reward_penalties',action='store_false')
     parser.set_defaults(reward_penalties=None)
-    parser.add_argument('--check-data-only',action='store_true',help='Check full episode feasibility without training')
+    parser.add_argument('--check-data-only',action='store_true',
+                        help='Check data, episode calendars and observations without training')
     parser.add_argument('--diagnostics',action='store_true',help='Record learning signals on collected training episodes')
     parser.add_argument('--skip-final-evaluation',action='store_true',help='Reserve evaluation years during tuning')
-    parser.add_argument('--episode-log',type=Path,help='New JSONL output path; existing files are never overwritten')
+    parser.add_argument('--episode-log',type=Path,
+                        help='New summary JSONL path; also creates compact <stem>_seedN_steps.csv files')
     parser.add_argument('--plot-python',default=sys.executable,help='Python interpreter with interactive Matplotlib')
     parser.add_argument('--no-plot',action='store_true',help='Run without opening plot windows')
     args = parser.parse_args()
@@ -95,8 +99,8 @@ def main():
         algo['joint_target_kl'] = None
     if args.head_model is not None:
         physical['head_model'] = args.head_model
-    if args.seasonal_constraints is not None:
-        physical['seasonal_constraints'] = args.seasonal_constraints
+    if args.daily_level_limits is not None:
+        physical['use_daily_level_limits'] = args.daily_level_limits
     physical['reward_penalties'] = dict(physical.get('reward_penalties',{}))
     if args.reward_penalties is not None:
         physical['reward_penalties']['enabled'] = args.reward_penalties
@@ -126,13 +130,16 @@ def main():
         for name in ('actor_num_mini_batch','critic_num_mini_batch'):
             if train['episode_length']*train['n_rollout_threads'] % algo[name]:
                 raise ValueError(name+' must divide all collected daily transitions')
-        if not isinstance(physical.get('seasonal_constraints'),bool):
-            raise ValueError('seasonal_constraints must be a boolean')
+        if not isinstance(physical.get('use_daily_level_limits'),bool):
+            raise ValueError('use_daily_level_limits must be a boolean')
         reward_settings(physical)
         split = resolve_year_split(exp)
         exp.update({name:list(values) for name,values in split.items()})
     except ValueError as exc:
         parser.error(str(exc))
+    for path in step_metrics_paths(args.episode_log,exp['seeds']).values():
+        if path.exists():
+            parser.error('Daily metrics file already exists: '+str(path))
     exp['diagnostics'] = args.diagnostics
     data = CascadeData(args.data_dir,physical,exp)
     run_parallel_experiment(data,physical,config,args)

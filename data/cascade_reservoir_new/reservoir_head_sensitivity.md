@@ -22,7 +22,7 @@ For each reservoir, with all elevations and heads in metres:
 
 The CSV endpoints are `H_scenario(Z_min)` and `H_scenario(Z_max)`. They are scenario values, not verified operating-head limits. Validity is restricted to the configured operating elevation interval. The implementation uses the existing storage-elevation curve to convert beginning/end storage into forebay elevations, then takes their arithmetic mean. This is a daily time-step approximation, not an additional measured input or a resolved within-day water-level trajectory.
 
-Efficiency remains the existing constant 0.90. It is a model assumption, not a newly calibrated value. Installed capacities, nominal turbine-flow limits, total-release limits, hydrology, initial storages, reward normalization, and terminal targets are not altered by this data supplement.
+Efficiency remains the existing constant 0.90. It is a model assumption, not a newly calibrated value. Installed capacities, nominal turbine-flow limits, total-release limits, hydrology, initial storages and reward normalization are independent of this data supplement. Permitted next-state water levels are supplied separately in `five_reservoir_happo_input_bounds_1965_2024.csv`; no final-storage target is imposed.
 
 ## CSV fields
 

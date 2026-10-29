@@ -14,7 +14,7 @@ from harl.envs.cascade_reservoir.episodes import episode_environment, positive_i
 from harl.envs.cascade_reservoir.parallel_env import ParallelCascadeEnvs
 from harl.envs.cascade_reservoir.evaluation import evaluate_policy
 from harl.envs.cascade_reservoir.reward import EpisodeRewardMetrics, reward_settings, validate_discount_factor
-from harl.envs.cascade_reservoir.training_metrics import log_episode
+from harl.envs.cascade_reservoir.training_metrics import log_episode, log_step, step_record
 from harl.runners.on_policy_ha_runner import OnPolicyHARunner
 from harl.utils.trans_tools import _t2n
 
@@ -43,7 +43,7 @@ def validate_seed(value):
 class CascadeReservoirRunner(OnPolicyHARunner):
     """Independent reservoir actors, centralized critic, and uninterrupted episodes."""
 
-    def __init__(self, data, physical_config, algo_args, seed, episode_log=None):
+    def __init__(self, data, physical_config, algo_args, seed, episode_log=None, step_log=None):
         seed = validate_seed(seed)
         self.data, self.physical_config = data, physical_config
         self.requested_args = copy.deepcopy(algo_args)
@@ -97,6 +97,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         self.last_reward_metrics = EpisodeRewardMetrics(args['algo']['gamma']).summary()
         self.training_history, self.episode_history, self.diagnostics_history = [], [], []
         self.episode_log = episode_log
+        self.step_log = step_log
         self.diagnostics_enabled = bool(args['experiment'].get('diagnostics', False))
         self.joint_kl_info = None
         self.parallel_envs = None
@@ -120,6 +121,18 @@ class CascadeReservoirRunner(OnPolicyHARunner):
             self.parallel_envs.close()
             self.parallel_envs = None
 
+    def _log_collected_steps(self, lane_results, episode_ids, day_index):
+        """The parent owns the log file; workers never append concurrently."""
+        if self.step_log is None:
+            return
+        for offset, (lane, result) in enumerate(lane_results):
+            if 'transition' not in result:
+                continue
+            record = step_record(result['transition'], seed=self.seed, episode=episode_ids[lane],
+                episode_step=day_index+1, phase='training',
+                training_steps=self.collected_training_steps+day_index*self.n_envs+offset+1)
+            log_step(record, self.step_log)
+
     @torch.no_grad()
     def collect_batch(self, episodes):
         if episodes != self.n_envs:
@@ -139,6 +152,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
         self.episode_attempts += self.n_envs
         self._allocate_buffers()
         self.prep_rollout()
+        t = 0
         try:
             initial = self.parallel_envs.reset([self.windows[year] for year in years], ids)
             self.worker_pids = [r['pid'] for r in initial]
@@ -156,6 +170,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                     actions.append(_t2n(action)); log_probs.append(_t2n(log_prob))
                 values = self.critic.get_values(cb.share_obs[t])
                 results = self.parallel_envs.step(np.stack(actions, axis=1))
+                self._log_collected_steps(list(enumerate(results)), ids, t)
                 transitions = [r['transition'] for r in results]
                 done = np.array([r['done'] for r in results])
                 if not np.all(done == (t == self.length-1)):
@@ -177,6 +192,7 @@ class CascadeReservoirRunner(OnPolicyHARunner):
                 largest_residual = max(largest_residual,
                     max(float(np.abs(r['residual']).max()) for r in transitions))
         except Exception as exc:
+            self._log_collected_steps(getattr(exc, 'successful_step_results', []), ids, t)
             for record in getattr(exc, 'episode_records', []):
                 self.hard_failed_episodes += 1
                 record.update(failed_episodes_so_far=self.hard_failed_episodes,
@@ -185,9 +201,9 @@ class CascadeReservoirRunner(OnPolicyHARunner):
             self.close()
             raise
         metrics = []
+        self.collected_training_steps += self.length*self.n_envs
         for lane, result in enumerate(results):
             record = result['episode_record']
-            self.collected_training_steps += self.length
             self.completed_episodes += 1
             record.update(parallel_env_index=lane, parallel_envs=self.n_envs,
                 episodes_per_update=self.n_envs, collecting_for_update=self.update_count+1,
@@ -304,7 +320,8 @@ class CascadeReservoirRunner(OnPolicyHARunner):
             with torch.random.fork_rng(devices=[]):
                 row = evaluate_policy(self.actor,self.data,self.physical_config,seed=self.seed,
                     episode=self.completed_episodes,training_steps=self.training_steps,diagnostics=True,
-                    gamma=self.algo_args['algo']['gamma'],source_years=years,episode_days=self.length)
+                    gamma=self.algo_args['algo']['gamma'],source_years=years,episode_days=self.length,
+                    step_log=self.step_log)
         finally:
             for actor,mode in zip(self.actor,modes):
                 actor.actor.train(mode)

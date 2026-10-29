@@ -20,8 +20,8 @@ each row. These values are recorded as reported in the paper.
 ## Interpretation
 
 - Each threshold is constant across days and years, matching the paper's fixed
-  experimental requirements. Flood-season dates and hard seasonal bounds remain
-  separate inputs.
+  experimental requirements. Permitted next-state water levels are supplied
+  separately by the daily water-level envelope table.
 - Guaranteed output is power in MW, not energy in MWh. In the daily simulator it
   will be compared with actual daily mean power; a shortfall energy is the MW
   shortfall multiplied by the step length in hours.
@@ -68,9 +68,11 @@ rewards, shortfall counts, integrated deficits or storage. The 60 source
 years are partitioned into 55 training years and five held-out evaluation
 years; the same requirement table is used in both phases.
 
-Hydraulics, hard seasonal bounds, actor and critic observations, and HAPPO
-updates are unchanged. These requirements are soft penalties, so compliance is
-measured rather than guaranteed by an added hard lower bound.
+Loading this service table does not change hydraulics or the observation
+interface. These requirements remain soft penalties, so compliance is measured
+rather than guaranteed by an added hard release or power lower bound. The daily
+water-level envelopes are applied independently; there is no remaining-horizon
+calculation or fixed-date storage target.
 
 The loader checks one row per reservoir, units through named columns, finite
 nonnegative thresholds, guaranteed output no larger than the configured

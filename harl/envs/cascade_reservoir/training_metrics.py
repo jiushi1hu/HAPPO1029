@@ -1,8 +1,115 @@
 """Read-only accounting of sampled episodes, separate from rewards and updates."""
+import csv
 import json
 import numpy as np
 from harl.envs.cascade_reservoir.data_loader import IDS
 from harl.envs.cascade_reservoir.reward import PENALTY_TERMS, REWARD_AGGREGATION, REWARD_DEFINITION
+
+
+STEP_METRIC_FIELDS = (
+    'phase', 'seed', 'episode', 'episode_step', 'date', 'training_steps',
+    'reward', 'generation_reward', 'guaranteed_output_penalty', 'ecological_flow_penalty',
+    'generation_MWh', 'guaranteed_output_shortfall_MW', 'guaranteed_output_shortfall_MWh',
+    'ecological_flow_shortfall_m3s', 'ecological_flow_deficit_m3',
+)
+_STEP_VALUE_FIELDS = STEP_METRIC_FIELDS[6:]
+_OPTIONAL_STEP_FIELDS = STEP_METRIC_FIELDS[11:]
+
+
+def _step_integer(value, name, minimum=0):
+    if (isinstance(value, (bool, np.bool_)) or
+            not isinstance(value, (int, np.integer)) or value < minimum):
+        raise ValueError(name+' must be an integer >= '+str(minimum))
+    return int(value)
+
+
+def _step_number(value, name):
+    try:
+        number = float(value)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise ValueError(name+' must be a finite scalar') from exc
+    if not np.isfinite(number):
+        raise ValueError(name+' must be a finite scalar')
+    return number
+
+
+def _step_sum(values, name):
+    values = np.asarray(values, dtype=np.float64)
+    if values.shape != (len(IDS),) or not np.isfinite(values).all() or (values < 0.).any():
+        raise ValueError(name+' must be a finite nonnegative five-vector')
+    return _step_number(values.sum(), name)
+
+
+def step_record(transition, *, seed, episode, episode_step, phase, training_steps):
+    """Key team metrics for one executed day, without a physical trajectory.
+
+    Reward and weighted penalty components are the actual undiscounted daily
+    values supplied to learning. Generation and physical shortfalls are sums
+    across the five reservoirs. An unavailable service measurement is None;
+    a measured zero shortfall remains zero, even with reward penalties disabled.
+    Values retain full precision until the CSV writer serializes them.
+    """
+    if phase not in ('training', 'evaluation', 'training_evaluation'):
+        raise ValueError('Unknown daily log phase: '+str(phase))
+    costs = transition.get('reward_penalty_components', {})
+    record = dict(phase=phase, seed=_step_integer(seed, 'seed'),
+        episode=_step_integer(episode, 'episode'),
+        episode_step=_step_integer(episode_step, 'episode_step', 1),
+        date=str(transition['date']), training_steps=_step_integer(training_steps, 'training_steps'),
+        reward=_step_number(transition['reward'], 'reward'),
+        generation_reward=_step_number(transition.get('generation_reward', transition['reward']),
+                                       'generation_reward'),
+        guaranteed_output_penalty=_step_number(costs.get('guaranteed_output', 0.),
+                                               'guaranteed_output_penalty'),
+        ecological_flow_penalty=_step_number(costs.get('ecological_flow', 0.),
+                                             'ecological_flow_penalty'),
+        generation_MWh=_step_sum(transition['energy'], 'generation_MWh'))
+    measurements = (
+        ('guaranteed_output_shortfall_MW', 'service_shortfalls', 'guaranteed_output'),
+        ('guaranteed_output_shortfall_MWh', 'service_shortfall_integrals', 'guaranteed_output'),
+        ('ecological_flow_shortfall_m3s', 'service_shortfalls', 'ecological_flow'),
+        ('ecological_flow_deficit_m3', 'service_shortfall_integrals', 'ecological_flow'),
+    )
+    for name, source, term in measurements:
+        values = transition.get(source, {}).get(term)
+        record[name] = None if values is None else _step_sum(values, name)
+    return record
+
+
+class StepMetricsWriter:
+    """A fixed, scalar CSV table; write one header and flush every daily row.
+
+    Ten significant digits limit storage while preserving useful precision in
+    the logged metrics. Formatting never changes the transition or training.
+    Missing service measurements are empty CSV cells, distinct from zero.
+    """
+
+    def __init__(self, stream):
+        self.stream = stream
+        self.writer = csv.writer(stream, lineterminator='\n')
+        self.writer.writerow(STEP_METRIC_FIELDS)
+        self.stream.flush()
+
+    def write(self, record):
+        if set(record) != set(STEP_METRIC_FIELDS):
+            raise ValueError('Daily CSV rows must contain exactly STEP_METRIC_FIELDS')
+        row = []
+        for name in STEP_METRIC_FIELDS:
+            value = record[name]
+            if name in _STEP_VALUE_FIELDS:
+                if value is None and name in _OPTIONAL_STEP_FIELDS:
+                    value = ''
+                else:
+                    value = format(_step_number(value, name), '.10g')
+            row.append(value)
+        self.writer.writerow(row)
+        self.stream.flush()
+
+
+def log_step(record, writer):
+    """Persist one compact daily row without printing it or retaining history."""
+    if writer is not None:
+        writer.write(record)
 
 
 def episode_record(env, rewards, energy_by_reservoir, seed, episode, gamma,
@@ -56,8 +163,7 @@ def episode_record(env, rewards, energy_by_reservoir, seed, episode, gamma,
         reward_aggregation=REWARD_AGGREGATION, reward_definition=REWARD_DEFINITION,
         **env.observation_metadata(),
         reward_penalties=dict(env.reward_settings), reference_energy_MWh=env.physics.reference_energy,
-        feasibility_uses_actual_future_inflows=bool(env.seasonal is not None or
-                                                   env.terminal_storage_target is not None))
+        release_bounds_scope='current_transition')
 
 
 def log_episode(record, stream=None):

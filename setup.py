@@ -14,7 +14,6 @@ setup(
         "pyyaml>=5.3.1",
         "numpy>=1.20,<2",
         "gym>=0.21,<0.27",
-        "scipy>=1.7",
         "matplotlib>=3.3",
     ],
     classifiers=[

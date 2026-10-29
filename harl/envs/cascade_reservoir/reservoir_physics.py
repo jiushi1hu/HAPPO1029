@@ -108,14 +108,12 @@ class ReservoirPhysics:
                 raise InfeasibleCascade("Empty downstream-compatible release interval")
         return lo, hi
 
-    def transition(self, storage, external, actions, terminal_bounds=None,
-                   storage_lower=None, storage_upper=None, action_selector=None):
-        """Execute within current-day bounds AND remaining-horizon feasibility.
+    def transition(self, storage, external, actions, storage_lower=None, storage_upper=None):
+        """Apply one action using only current inflow and its next-state bounds.
 
-        Starting storage may exceed today's ceiling on a drawdown deadline:
-        that ceiling constrains the state after today's release. Global start
-        bounds still apply, and the environment checks the previous day's
-        seasonal bounds. Storage is never clipped to make a release feasible.
+        Bounds constrain storage after this action. Starting storage can exceed
+        the next-state ceiling; it is checked against the preceding action's
+        bounds by the environment. No future forcing or target state is read.
         """
         storage, external, actions = [np.asarray(x, dtype=np.float64) for x in (storage, external, actions)]
         if any(x.shape != (5,) or not np.isfinite(x).all() for x in (storage, external, actions)):
@@ -133,10 +131,6 @@ class ReservoirPhysics:
             inflow[i] = external[i] + (release[i - 1] if i else 0.)
             low[i] = max(lower[i], inflow[i] + (storage[i] - storage_max[i]) / self.dt)
             high[i] = min(upper[i], inflow[i] + (storage[i] - storage_min[i]) / self.dt)
-            if terminal_bounds is not None:
-                terminal_low, terminal_high = terminal_bounds.interval(i, release)
-                low[i] = max(low[i], terminal_low)
-                high[i] = min(high[i], terminal_high)
             if low[i] > high[i] + 1e-8:
                 raise InfeasibleCascade("Empty feasible release interval at reservoir " + str(i))
             if high[i] - low[i] <= 1e-8:
@@ -147,13 +141,6 @@ class ReservoirPhysics:
                 # storage is still computed from it and checked below.
                 release[i] = min(d.release_cap[i], max(0., 0.5 * (low[i] + high[i])))
             else:
-                if action_selector is not None:
-                    # Rule controllers resolve each action after upstream
-                    # releases have fixed this reservoir's feasible interval.
-                    selected = float(action_selector(i, inflow[i], low[i], high[i]))
-                    if not np.isfinite(selected) or not 0. <= selected <= 1.:
-                        raise ValueError('Selected normalized action must lie in [0, 1]')
-                    executed_actions[i] = selected
                 release[i] = low[i] + executed_actions[i] ** 2 * (high[i] - low[i])
         next_storage = storage + (inflow - release) * self.dt
         residual = next_storage - storage - (inflow - release) * self.dt

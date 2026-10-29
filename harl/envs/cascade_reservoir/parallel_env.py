@@ -46,12 +46,7 @@ def _worker(connection):
                     if done:
                         record = episode_record(env, metrics, energy, seed, episode,
                                                 gamma, trace, 0)
-                        record.update(episode_horizon_days=days,
-                            source_years=list(dict.fromkeys(d.year for d in env.data.dates[env.start:env.stop])),
-                            start_date=env.data.dates[env.start].isoformat(),
-                            end_date=env.data.dates[env.stop-1].isoformat(),
-                            episode_generation_TWh=float(energy.sum()/1e6),
-                            worker_pid=os.getpid())
+                        record['worker_pid'] = os.getpid()
                         result.update(episode_record=record, reward_metrics=metrics.summary())
                 else:
                     raise ValueError('Unknown cascade worker command')
@@ -106,22 +101,29 @@ class ParallelCascadeEnvs:
     def _exchange(self, command, values):
         if self.closed or len(values) != len(self.connections):
             raise ValueError('Commands must match the live parallel environment count')
+        replies = []
         try:
             for connection, value in zip(self.connections, values):
                 connection.send((command, value))
-            replies = []
             for connection in self.connections:
                 if not connection.poll(120):
                     raise RuntimeError('Cascade worker did not respond within 120 seconds')
                 replies.append(connection.recv())
         except (EOFError, BrokenPipeError, OSError, RuntimeError) as exc:
             self.close()
-            raise RuntimeError('Cascade worker disconnected or timed out') from exc
+            error = RuntimeError('Cascade worker disconnected or timed out')
+            error.successful_step_results = [(lane, value) for lane, (ok, value) in enumerate(replies) if ok]
+            error.episode_records = [value['episode_record'] for ok, value in replies
+                                    if not ok and value.get('episode_record') is not None]
+            raise error from exc
         failures = [value for ok, value in replies if not ok]
         if failures:
             error = RuntimeError('Parallel cascade environment failed: '+failures[0]['error']+
                                  '\n'+failures[0]['traceback'])
             error.episode_records = [r['episode_record'] for r in failures if r['episode_record'] is not None]
+            # Other lanes can finish this day's transition before a peer fails.
+            # Let the parent persist those completed steps before stopping.
+            error.successful_step_results = [(lane, value) for lane, (ok, value) in enumerate(replies) if ok]
             self.close()
             raise error
         return [value for _, value in replies]
